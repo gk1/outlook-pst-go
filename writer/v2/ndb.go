@@ -353,6 +353,8 @@ func (n *NDB) ownedBlocks() []BBTEntry {
 		if n.nbtLiveRefs(e.BID)+n.extraLiveRefs(e.BID) == 0 {
 			continue
 		}
+		e.DataRefs = uint16(n.dataTreeRefs[e.BID])
+		e.SubRefs = uint16(n.subnodeRefs[e.BID])
 		out = append(out, e)
 	}
 	sortBBT(out)
@@ -479,6 +481,7 @@ func (n *NDB) Commit() ([]byte, error) {
 		}
 		copy(file[ib:], raw)
 	}
+	n.store.attachBacking(file)
 	return file, nil
 }
 
@@ -821,15 +824,8 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 	}); err != nil {
 		return err
 	}
-	for bid, e := range n.blocks {
-		nbt := n.nbtLiveRefs(bid)
-		extra := int(e.RefCount) - 1 - nbt
-		if extra < 0 {
-			return invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
-		}
-		if extra > 0 {
-			n.dataTreeRefs[bid] = extra
-		}
+	if err := n.applyExtraRefs(); err != nil {
+		return err
 	}
 	pages, err := img.collectPageIBs()
 	if err != nil {
@@ -891,17 +887,35 @@ func LoadTrees(img *TreeImage, ids *SequentialIDs) (*NDB, error) {
 	}); err != nil {
 		return nil, err
 	}
+	if err := n.applyExtraRefs(); err != nil {
+		return nil, err
+	}
+	return n, n.CheckRefCounts()
+}
+
+func (n *NDB) applyExtraRefs() error {
 	for bid, e := range n.blocks {
 		nbt := n.nbtLiveRefs(bid)
 		extra := int(e.RefCount) - 1 - nbt
 		if extra < 0 {
-			return nil, invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
+			return invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
 		}
-		if extra > 0 {
+		data, sub := int(e.DataRefs), int(e.SubRefs)
+		switch {
+		case data+sub == extra:
+			if data > 0 {
+				n.dataTreeRefs[bid] = data
+			}
+			if sub > 0 {
+				n.subnodeRefs[bid] = sub
+			}
+		case data == 0 && sub == 0 && extra > 0:
 			n.dataTreeRefs[bid] = extra
+		default:
+			return invariant(SectionRefCount, "cRef", "BID 0x%x extra kinds data=%d sub=%d leftover=%d", bid, data, sub, extra)
 		}
 	}
-	return n, n.CheckRefCounts()
+	return nil
 }
 
 func (n *NDB) String() string {

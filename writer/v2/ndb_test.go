@@ -682,3 +682,146 @@ func TestPutBlockRejectsUnmappedOverlapAndMetadata(t *testing.T) {
 		t.Fatal("duplicate extent accepted")
 	}
 }
+
+func TestReopenPreservesAllocatedPayload(t *testing.T) {
+	n := NewNDB(nil)
+	blk := mustAlloc(t, n, 16)
+	mustNode(t, n, 0x21, blk.BID, 0, 0)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file[blk.IB] = 0xA5
+	n2, err := OpenNDB(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file2, err := n2.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file2[blk.IB] != 0xA5 {
+		t.Fatalf("reopen commit wiped payload 0x%02x", file2[blk.IB])
+	}
+	other := mustAlloc(t, n2, 16)
+	mustNode(t, n2, 0x61, other.BID, 0, 0)
+	file3, err := n2.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file3[blk.IB] != 0xA5 {
+		t.Fatalf("mutate commit wiped payload 0x%02x", file3[blk.IB])
+	}
+	n3, err := OpenNDB(file3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file4, err := n3.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file4[blk.IB] != 0xA5 {
+		t.Fatalf("second reopen commit wiped payload 0x%02x", file4[blk.IB])
+	}
+	if err := n3.DeleteNode(0x21); err != nil {
+		t.Fatal(err)
+	}
+	file5, err := n3.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n3.Store().allocatedRange(blk.IB, BlockDiskSize(16)) {
+		t.Fatal("reclaimed block still allocated")
+	}
+	if file5[blk.IB] != 0 {
+		t.Fatalf("freed slot kept payload 0x%02x", file5[blk.IB])
+	}
+}
+
+func TestReopenExtraRefOwnershipRelease(t *testing.T) {
+	n := NewNDB(nil)
+	shared := mustAlloc(t, n, 16)
+	onlySub := mustAlloc(t, n, 16)
+	onlyData := mustAlloc(t, n, 16)
+	mustNode(t, n, 0x21, shared.BID, 0, 0)
+	if err := n.AddDataTreeRef(shared.BID); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddSubnodeRef(shared.BID); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddSubnodeRef(onlySub.BID); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(onlyData.BID); err != nil {
+		t.Fatal(err)
+	}
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDB(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := n2.LookupBlock(shared.BID)
+	if !ok || got.RefCount != 4 {
+		t.Fatalf("shared cRef %+v ok=%v", got, ok)
+	}
+	if n2.dataTreeRefs[shared.BID] != 1 || n2.subnodeRefs[shared.BID] != 1 {
+		t.Fatalf("shared extra data=%d sub=%d", n2.dataTreeRefs[shared.BID], n2.subnodeRefs[shared.BID])
+	}
+	if n2.subnodeRefs[onlySub.BID] != 1 || n2.dataTreeRefs[onlySub.BID] != 0 {
+		t.Fatalf("sub-only extra data=%d sub=%d", n2.dataTreeRefs[onlySub.BID], n2.subnodeRefs[onlySub.BID])
+	}
+	if n2.dataTreeRefs[onlyData.BID] != 1 || n2.subnodeRefs[onlyData.BID] != 0 {
+		t.Fatalf("data-only extra data=%d sub=%d", n2.dataTreeRefs[onlyData.BID], n2.subnodeRefs[onlyData.BID])
+	}
+	if err := n2.ReleaseSubnodeRef(onlySub.BID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n2.LookupBlock(onlySub.BID); ok {
+		t.Fatal("subnode-only block not reclaimed after reopen release")
+	}
+	if err := n2.ReleaseDataTreeRef(onlyData.BID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n2.LookupBlock(onlyData.BID); ok {
+		t.Fatal("data-tree-only block not reclaimed after reopen release")
+	}
+	if err := n2.ReleaseSubnodeRef(shared.BID); err != nil {
+		t.Fatal(err)
+	}
+	got, ok = n2.LookupBlock(shared.BID)
+	if !ok || got.RefCount != 3 {
+		t.Fatalf("after sub drop %+v ok=%v", got, ok)
+	}
+	if err := n2.ReleaseDataTreeRef(shared.BID); err != nil {
+		t.Fatal(err)
+	}
+	got, ok = n2.LookupBlock(shared.BID)
+	if !ok || got.RefCount != 2 {
+		t.Fatalf("after data drop %+v ok=%v", got, ok)
+	}
+	file2, err := n2.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n3, err := OpenNDB(file2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n3.LookupBlock(onlySub.BID); ok {
+		t.Fatal("reclaimed subnode block survived second reopen")
+	}
+	if _, ok := n3.LookupBlock(onlyData.BID); ok {
+		t.Fatal("reclaimed data-tree block survived second reopen")
+	}
+	got, ok = n3.LookupBlock(shared.BID)
+	if !ok || got.RefCount != 2 {
+		t.Fatalf("shared after reopen %+v ok=%v", got, ok)
+	}
+	if n3.dataTreeRefs[shared.BID] != 0 || n3.subnodeRefs[shared.BID] != 0 {
+		t.Fatalf("shared extras after typed release data=%d sub=%d", n3.dataTreeRefs[shared.BID], n3.subnodeRefs[shared.BID])
+	}
+}

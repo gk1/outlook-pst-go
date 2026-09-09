@@ -18,6 +18,7 @@ type Store struct {
 	dlistBID      uint64
 	nbtRoot       BREF
 	bbtRoot       BREF
+	backing       []byte
 }
 
 type region struct {
@@ -596,14 +597,48 @@ func (s *Store) encodeDList() ([]byte, error) {
 	return EncodePage(payload, PageDList, s.dlistBID, DListPageOffset)
 }
 
+// attachBacking keeps a copy of the last encoded/loaded image so a later
+// EncodeFile can preserve allocated data payloads.
+func (s *Store) attachBacking(file []byte) {
+	s.backing = append([]byte(nil), file...)
+}
+
+func (s *Store) zeroFreeSlots(buf []byte) {
+	for i := range s.regions {
+		bm := s.regions[i].bitmap[:]
+		for slot := 0; slot < SlotsPerAMap; slot++ {
+			if bitIsSet(bm, slot) {
+				continue
+			}
+			off := slotOffset(uint64(i), slot)
+			if off >= uint64(len(buf)) {
+				continue
+			}
+			end := off + BytesPerSlot
+			if end > uint64(len(buf)) {
+				end = uint64(len(buf))
+			}
+			clear := buf[off:end]
+			for j := range clear {
+				clear[j] = 0
+			}
+		}
+	}
+}
+
 // EncodeFile writes a Unicode PST image: HEADER, DList at 0x4200, and every
-// periodic map page. Data slots are left zero. ROOT matches the maps.
+// periodic map page. Allocated non-metadata payloads from a loaded/previous
+// image are preserved; freed slots are zeroed. ROOT matches the maps.
 func (s *Store) EncodeFile() ([]byte, error) {
 	hdr, err := EncodeUnicodeHeader(s.HeaderDraft())
 	if err != nil {
 		return nil, err
 	}
 	buf := make([]byte, s.FileEOF())
+	if len(s.backing) > 0 {
+		copy(buf, s.backing)
+		s.zeroFreeSlots(buf)
+	}
 	copy(buf, hdr)
 	dlist, err := s.encodeDList()
 	if err != nil {
@@ -622,6 +657,7 @@ func (s *Store) EncodeFile() ([]byte, error) {
 			copy(buf[p.off:], p.raw)
 		}
 	}
+	s.attachBacking(buf)
 	return buf, nil
 }
 
@@ -715,6 +751,7 @@ func LoadStore(file []byte) (*Store, error) {
 	if s.AMapFree() != h.Root.AMapFree {
 		return nil, invariant(SectionRoot, "cbAMapFree", "bitmap free %d != ROOT %d", s.AMapFree(), h.Root.AMapFree)
 	}
+	s.attachBacking(file)
 	return s, nil
 }
 
