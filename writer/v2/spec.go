@@ -1,0 +1,165 @@
+package writer
+
+// MS-PST section citations used by the inspector and error taxonomy.
+const (
+	SectionANSICreate   = "1.3.2"
+	SectionNID          = "2.2.2.1"
+	SectionBID          = "2.2.2.2"
+	SectionRoot         = "2.2.2.5"
+	SectionHeader       = "2.2.2.6"
+	SectionPageTrailer  = "2.2.2.7.1"
+	SectionAMap         = "2.2.2.7.2"
+	SectionBlockTrailer = "2.2.2.8.1"
+	SectionBlockAlign   = "2.2.2.8"
+	SectionHN           = "2.3.1"
+	SectionTCINFO       = "2.3.4.1"
+	SectionTCOLDESC     = "2.3.4.2"
+	SectionRowMatrix    = "2.3.4.4"
+	SectionMinPST       = "2.7.1"
+	SectionCRC          = "5.3"
+	SectionSignature    = "5.5"
+	SectionCrypt        = "5.1"
+)
+
+// Physical sizes for Unicode PST. ANSI is rejected by this writer.
+const (
+	UnicodeHeaderSize   = 564
+	UnicodeRootSize     = 72
+	PageSize            = 512
+	UnicodePageTrailer  = 16
+	UnicodeBlockTrailer = 16
+	BytesPerSlot        = 64
+	FirstAMapPageOffset = 0x4400
+	DListPageOffset     = 0x4200
+	MaxDataBlockCB      = 8176
+	UnicodeWVer         = 23
+	UnicodeWVerMin      = 20
+	ClientVerPST        = 19
+	Sentinel            = 0x80
+	PlatformWin32       = 0x01
+	HeaderPartialCRCLen = 471 // dwCRCPartial covers 471 bytes from wMagicClient
+	HeaderFullCRCLen    = 516 // dwCRCFull covers 516 bytes from wMagicClient
+	TCINFOFixedSize     = 22
+	TCOLDESCSize        = 8
+	HeapSigTC           = 0x7C
+)
+
+// Unicode HEADER field offsets. See MS-PST 2.2.2.6.
+const (
+	OffMagic          = 0
+	OffCRCPartial     = 4
+	OffMagicClient    = 8
+	OffWVer           = 10
+	OffWVerClient     = 12
+	OffPlatformCreate = 14
+	OffPlatformAccess = 15
+	OffBidNextP       = 32
+	OffUnique         = 40
+	OffRgNID          = 44
+	OffQWUnused       = 172
+	OffRoot           = 180
+	OffAlign          = 252
+	OffRgbFM          = 256
+	OffRgbFP          = 384
+	OffSentinel       = 512
+	OffCrypt          = 513
+	OffBidNextB       = 516
+	OffCRCFull        = 524
+)
+
+// ROOT field offsets inside the 72-byte Unicode ROOT. See MS-PST 2.2.2.5.
+const (
+	OffRootFileEOF   = 4
+	OffRootAMapLast  = 12
+	OffRootAMapFree  = 20
+	OffRootPMapFree  = 28
+	OffRootNBTBID    = 36
+	OffRootNBTIB     = 44
+	OffRootBBTBID    = 52
+	OffRootBBTIB     = 60
+	OffRootAMapValid = 68
+)
+
+// fAMapValid values. The legacy library reverses 0 and 1.
+// See MS-PST 2.2.2.5 and 2.6.1.3.7.
+const (
+	AMapInvalid byte = 0x00 // INVALID_AMAP
+	AMapValid1  byte = 0x01 // VALID_AMAP1 (deprecated)
+	AMapValid2  byte = 0x02 // VALID_AMAP2
+)
+
+// Magic numbers. See MS-PST 2.2.2.6.
+const (
+	PSTMagic       = 0x4E444221 // "!BDN"
+	ClientMagicPST = 0x4D53     // "SM"
+	ClientMagicOST = 0x4F53     // "SO"
+)
+
+// Crypt methods. See MS-PST 2.2.2.6 / 5.1. WIP 0x10 is rejected.
+const (
+	CryptNone    byte = 0
+	CryptPermute byte = 1
+	CryptCyclic  byte = 2
+	CryptWIP     byte = 0x10
+)
+
+// Page types. See MS-PST 2.2.2.7.
+const (
+	PageBBT   byte = 0x80
+	PageNBT   byte = 0x81
+	PageFMap  byte = 0x82
+	PagePMap  byte = 0x83
+	PageAMap  byte = 0x84
+	PageFPMap byte = 0x85
+	PageDList byte = 0x86
+)
+
+// Special NIDs. See MS-PST 2.4.1 / 2.7.1.
+const (
+	NIDMessageStore uint32 = 0x21
+	NIDNameToIDMap  uint32 = 0x61
+	NIDRootFolder   uint32 = 0x122
+)
+
+// NID types. See MS-PST 2.2.2.1.
+const (
+	NIDTypeHID                = 0x00
+	NIDTypeInternal           = 0x01
+	NIDTypeNormalFolder       = 0x02
+	NIDTypeSearchFolder       = 0x03
+	NIDTypeNormalMessage      = 0x04
+	NIDTypeAttachment         = 0x05
+	NIDTypeAssocMessage       = 0x08
+	NIDTypeHierarchyTable     = 0x0D
+	NIDTypeContentsTable      = 0x0E
+	NIDTypeAssocContentsTable = 0x0F
+	NIDTypeAttachmentTable    = 0x11
+	NIDTypeRecipientTable     = 0x12
+)
+
+// MakeNID packs a type and index. See MS-PST 2.2.2.1.
+func MakeNID(nidType byte, index uint32) uint32 {
+	return uint32(nidType&0x1F) | (index << 5)
+}
+
+// NIDTypeOf returns the 5-bit nidType.
+func NIDTypeOf(nid uint32) byte {
+	return byte(nid & 0x1F)
+}
+
+// NIDIndexOf returns nidIndex.
+func NIDIndexOf(nid uint32) uint32 {
+	return nid >> 5
+}
+
+// Align64 rounds size up to a multiple of 64. See MS-PST 2.2.2.8.
+func Align64(size uint64) uint64 {
+	return (size + 63) &^ 63
+}
+
+// BlockDiskSize is the on-disk size of a Unicode block with payload cb.
+// Total (cb + BLOCKTRAILER) is rounded up to a 64-byte multiple.
+// See MS-PST 2.2.2.8.1.
+func BlockDiskSize(cb uint64) uint64 {
+	return Align64(cb + UnicodeBlockTrailer)
+}
