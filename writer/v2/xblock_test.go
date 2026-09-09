@@ -6,6 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/grokify/outlook-pst-go/pkg/disk"
@@ -216,31 +219,69 @@ func TestDataTreeHashReopenBounded(t *testing.T) {
 	if _, ok := n.Store().spool.(*FileSink); !ok {
 		t.Fatalf("spool %T, want FileSink", n.Store().spool)
 	}
-	rd, err := n.OpenDataTree(root.BID)
+	mustNode(t, n, 0x21, root.BID, 0, 0)
+	path := filepath.Join(t.TempDir(), "big.pst")
+	dst, err := CreateFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.CommitTo(dst); err != nil {
+		t.Fatal(err)
+	}
+	if n.Store().residentImageBytes() != 0 {
+		t.Fatalf("resident image after CommitTo %d", n.Store().residentImageBytes())
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	if n2.Store().residentImageBytes() != 0 {
+		t.Fatalf("reopen resident image %d", n2.Store().residentImageBytes())
+	}
+	got, ok := n2.LookupNode(0x21)
+	if !ok || got.DataBID != root.BID {
+		t.Fatalf("reopen node %+v ok=%v", got, ok)
+	}
+	rd, err := n2.OpenDataTree(root.BID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rd.leaves)+len(rd.xbs) > MaxXBlockEntries+1 {
 		t.Fatalf("reader materialized %d+%d BIDs", len(rd.leaves), len(rd.xbs))
 	}
-	mustNode(t, n, 0x21, root.BID, 0, 0)
 	h1 := sha256.New()
-	got, err := io.Copy(h1, rd)
+	nread, err := io.Copy(h1, rd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != nBytes {
-		t.Fatalf("read %d want %d", got, nBytes)
+	if nread != nBytes {
+		t.Fatalf("read %d want %d", nread, nBytes)
 	}
 	want := sha256.New()
 	if _, err := io.Copy(want, io.LimitReader(repeatByte(0x7E), nBytes)); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(h1.Sum(nil), want.Sum(nil)) {
-		t.Fatal("stream hash mismatch")
+		t.Fatal("commit/reopen hash mismatch")
 	}
-	if n.Store().residentImageBytes() != 0 {
-		t.Fatalf("resident image after readback %d", n.Store().residentImageBytes())
+	if n2.Store().residentImageBytes() != 0 {
+		t.Fatalf("resident image after readback %d", n2.Store().residentImageBytes())
+	}
+}
+
+func TestRollbackErrSurfacesCleanup(t *testing.T) {
+	op := ioErr("reader", "boom")
+	rb := invariant(SectionAMap, "ib", "cleanup failed")
+	err := rollbackErr(op, rb)
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("cleanup not visible: %v", err)
 	}
 }
 
@@ -479,5 +520,17 @@ func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 	}
 	if n.Store().FileEOF() != beforeEOF {
 		t.Fatalf("eof 0x%x want 0x%x", n.Store().FileEOF(), beforeEOF)
+	}
+	var spoolName string
+	if n.Store().spool != nil {
+		spoolName = n.Store().spool.Name()
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if spoolName != "" {
+		if _, statErr := os.Stat(spoolName); !os.IsNotExist(statErr) {
+			t.Fatalf("leaked spool %s: %v", spoolName, statErr)
+		}
 	}
 }

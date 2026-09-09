@@ -3,6 +3,7 @@ package writer
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 )
@@ -661,6 +662,166 @@ func (s *Store) ensureSpool() error {
 	return nil
 }
 
+func (s *Store) closeOwnedSpool() error {
+	if s.spool == nil {
+		return nil
+	}
+	name := ""
+	tmp := s.spoolTmp
+	if tmp {
+		name = s.spool.Name()
+	}
+	err := s.spool.Close()
+	s.spool = nil
+	s.spoolTmp = false
+	if tmp && name != "" {
+		if rerr := os.Remove(name); rerr != nil && !os.IsNotExist(rerr) {
+			return errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
+		}
+	}
+	return err
+}
+
+// Close releases an owned temp spool (descriptor and file). Shared sinks are closed, not removed.
+func (s *Store) Close() error {
+	return s.closeOwnedSpool()
+}
+
+func errorsJoin(a, b error) error {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return fmt.Errorf("%w; %v", a, b)
+}
+
+func readAtFull(r io.ReaderAt, off int64, n int) ([]byte, error) {
+	buf := make([]byte, n)
+	got := 0
+	for got < n {
+		nr, err := r.ReadAt(buf[got:], off+int64(got))
+		got += nr
+		if got >= n {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if nr == 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+	}
+	return buf, nil
+}
+
+func copyReaderAt(dst io.WriterAt, src io.ReaderAt, n int64) error {
+	const chunk = 64 << 10
+	buf := make([]byte, chunk)
+	for off := int64(0); off < n; off += int64(chunk) {
+		c := chunk
+		if rem := n - off; rem < int64(c) {
+			c = int(rem)
+		}
+		nr, err := src.ReadAt(buf[:c], off)
+		if nr > 0 {
+			if _, werr := dst.WriteAt(buf[:nr], off); werr != nil {
+				return werr
+			}
+		}
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if nr == 0 {
+			break
+		}
+	}
+	return nil
+}
+
+func sinkSize(s Sink) (int64, error) {
+	cur, err := s.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	end, err := s.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.Seek(cur, io.SeekStart); err != nil {
+		return 0, err
+	}
+	return end, nil
+}
+
+func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
+	z := make([]byte, BytesPerSlot)
+	for i := range s.regions {
+		bm := s.regions[i].bitmap[:]
+		for slot := 0; slot < SlotsPerAMap; slot++ {
+			if bitIsSet(bm, slot) {
+				continue
+			}
+			off := slotOffset(uint64(i), slot)
+			if _, err := w.WriteAt(z, int64(off)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// WriteTo materializes HEADER, DList, and map pages onto dst without allocating FileEOF.
+func (s *Store) WriteTo(dst Sink) error {
+	if dst == nil {
+		return invalidArg("sink", "nil commit sink")
+	}
+	eof := int64(s.FileEOF())
+	if s.spool != nil && dst != s.spool {
+		if err := copyReaderAt(dst, s.spool, eof); err != nil {
+			return ioErr("spool", "copy: %v", err)
+		}
+	}
+	if err := s.zeroFreeSlotsAt(dst); err != nil {
+		return ioErr("spool", "zero free slots: %v", err)
+	}
+	hdr, err := EncodeUnicodeHeader(s.HeaderDraft())
+	if err != nil {
+		return err
+	}
+	if _, err := dst.WriteAt(hdr, 0); err != nil {
+		return ioErr("header", "write: %v", err)
+	}
+	dlist, err := s.encodeDList()
+	if err != nil {
+		return err
+	}
+	if _, err := dst.WriteAt(dlist, int64(DListPageOffset)); err != nil {
+		return ioErr("dlist", "write: %v", err)
+	}
+	for i := range s.regions {
+		pages, err := s.encodeRegionPages(uint64(i))
+		if err != nil {
+			return err
+		}
+		for _, p := range pages {
+			if _, err := dst.WriteAt(p.raw, int64(p.off)); err != nil {
+				return ioErr("amap", "write at 0x%x: %v", p.off, err)
+			}
+		}
+	}
+	if tr, ok := dst.(interface{ Truncate(int64) error }); ok {
+		if err := tr.Truncate(eof); err != nil {
+			return ioErr("sink", "truncate: %v", err)
+		}
+	}
+	if err := dst.Sync(); err != nil {
+		return ioErr("sink", "sync: %v", err)
+	}
+	return nil
+}
+
 // residentImageBytes is in-process image memory (backing + MemSink), not FileSink.
 func (s *Store) residentImageBytes() int {
 	n := len(s.backing)
@@ -746,50 +907,35 @@ func (s *Store) zeroFreeSlots(buf []byte) {
 // image are preserved; freed or freshly allocated slots are zeroed so reuse
 // cannot inherit stale bytes. ROOT matches the maps.
 func (s *Store) EncodeFile() ([]byte, error) {
-	hdr, err := EncodeUnicodeHeader(s.HeaderDraft())
-	if err != nil {
+	ms := NewMemSink("encode")
+	if err := s.WriteTo(ms); err != nil {
 		return nil, err
 	}
-	buf := make([]byte, s.FileEOF())
-	if s.spool != nil {
-		_, _ = s.spool.ReadAt(buf, 0)
-	} else if len(s.backing) > 0 {
-		copy(buf, s.backing)
-	}
-	s.zeroFreeSlots(buf)
-	copy(buf, hdr)
-	dlist, err := s.encodeDList()
-	if err != nil {
-		return nil, err
-	}
-	copy(buf[DListPageOffset:], dlist)
-	for i := range s.regions {
-		pages, err := s.encodeRegionPages(uint64(i))
-		if err != nil {
-			return nil, err
-		}
-		for _, p := range pages {
-			if int(p.off)+len(p.raw) > len(buf) {
-				return nil, invariant(SectionAMap, "ib", "map page at 0x%x exceeds ibFileEof", p.off)
-			}
-			copy(buf[p.off:], p.raw)
-		}
-	}
-	s.attachBacking(buf)
-	return buf, nil
+	return ms.Bytes(), nil
 }
 
 // LoadStore reconstructs a Store from a Unicode PST image by reading AMaps.
 func LoadStore(file []byte) (*Store, error) {
-	if len(file) < UnicodeHeaderSize {
-		return nil, invariant(SectionHeader, "size", "file is %d bytes, need header", len(file))
+	return LoadStoreFrom(&MemSink{name: "load", buf: file}, int64(len(file)))
+}
+
+func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
+	if r == nil {
+		return nil, invalidArg("reader", "nil store reader")
 	}
-	h, err := InspectHeader(file[:UnicodeHeaderSize])
+	if size < UnicodeHeaderSize {
+		return nil, invariant(SectionHeader, "size", "file is %d bytes, need header", size)
+	}
+	hdr, err := readAtFull(r, 0, UnicodeHeaderSize)
+	if err != nil {
+		return nil, invariant(SectionHeader, "size", "header read: %v", err)
+	}
+	h, err := InspectHeader(hdr)
 	if err != nil {
 		return nil, err
 	}
-	if uint64(len(file)) != h.Root.FileEOF {
-		return nil, invariant(SectionRoot, "ibFileEof", "file length %d != ibFileEof %d", len(file), h.Root.FileEOF)
+	if uint64(size) != h.Root.FileEOF {
+		return nil, invariant(SectionRoot, "ibFileEof", "file length %d != ibFileEof %d", size, h.Root.FileEOF)
 	}
 	if h.Root.AMapLast < FirstAMapPageOffset || (h.Root.AMapLast-FirstAMapPageOffset)%AMapCoverageBytes != 0 {
 		return nil, invariant(SectionRoot, "ibAMapLast", "0x%x is not an AMap page offset (MS-PST %s)", h.Root.AMapLast, SectionAMap)
@@ -802,10 +948,14 @@ func LoadStore(file []byte) (*Store, error) {
 	if h.Root.PMapFree != 0 {
 		return nil, invariant(SectionRoot, "cbPMapFree", "got %d want 0 for new Unicode PST", h.Root.PMapFree)
 	}
-	if len(file) < int(DListPageOffset)+PageSize {
+	if size < int64(DListPageOffset)+int64(PageSize) {
 		return nil, invariant(SectionDList, "size", "file too small for DList at 0x%x", DListPageOffset)
 	}
-	dl, err := InspectDList(file[DListPageOffset : DListPageOffset+PageSize])
+	dlistRaw, err := readAtFull(r, int64(DListPageOffset), PageSize)
+	if err != nil {
+		return nil, invariant(SectionDList, "size", "DList read: %v", err)
+	}
+	dl, err := InspectDList(dlistRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -836,10 +986,14 @@ func LoadStore(file []byte) (*Store, error) {
 	for i := uint64(0); i <= last; i++ {
 		off := AMapOffset(i)
 		end := off + PageSize
-		if uint64(len(file)) < end {
+		if uint64(size) < end {
 			return nil, invariant(SectionAMap, "size", "truncated AMap at 0x%x", off)
 		}
-		pg, err := InspectPage(file[off:end], off)
+		amapRaw, err := readAtFull(r, int64(off), PageSize)
+		if err != nil {
+			return nil, invariant(SectionAMap, "size", "AMap read at 0x%x: %v", off, err)
+		}
+		pg, err := InspectPage(amapRaw, off)
 		if err != nil {
 			return nil, err
 		}
@@ -851,10 +1005,14 @@ func LoadStore(file []byte) (*Store, error) {
 			return nil, invariant(SectionAMap, "rgbAMap", "AMap at 0x%x does not self-map (first byte 0x%02x want 0xFF)", off, pg.Payload[0])
 		}
 		for _, p := range RegionMapPages(i) {
-			if uint64(len(file)) < p.Offset+PageSize {
+			if uint64(size) < p.Offset+PageSize {
 				return nil, invariant(sectionForPage(p.Type), "size", "truncated %s at 0x%x", pageName(p.Type), p.Offset)
 			}
-			mp, err := InspectPage(file[p.Offset:p.Offset+PageSize], p.Offset)
+			mapRaw, err := readAtFull(r, int64(p.Offset), PageSize)
+			if err != nil {
+				return nil, invariant(sectionForPage(p.Type), "size", "%s read at 0x%x: %v", pageName(p.Type), p.Offset, err)
+			}
+			mp, err := InspectPage(mapRaw, p.Offset)
 			if err != nil {
 				return nil, err
 			}
@@ -869,8 +1027,10 @@ func LoadStore(file []byte) (*Store, error) {
 	if s.AMapFree() != h.Root.AMapFree {
 		return nil, invariant(SectionRoot, "cbAMapFree", "bitmap free %d != ROOT %d", s.AMapFree(), h.Root.AMapFree)
 	}
-	s.attachBacking(file)
-	s.spool = &MemSink{name: "load", buf: append([]byte(nil), file...)}
+	if sk, ok := r.(Sink); ok {
+		s.spool = sk
+		s.spoolTmp = false
+	}
 	return s, nil
 }
 

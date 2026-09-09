@@ -118,37 +118,99 @@ func (n *NDB) assertSLEntryRoles(e SLEntry) error {
 }
 
 func (n *NDB) assertDataTreeBID(bid uint64, field string) error {
-	e, ok := n.LookupBlock(bid)
-	if !ok {
-		return invalidArg(field, "missing data-tree BID 0x%x (MS-PST %s)", bid, SectionSLBlock)
-	}
-	if !BIDIsInternal(bid) {
-		return nil
-	}
-	data, err := n.blockPayload(e)
-	if err != nil {
+	if err := n.validateDataTree(bid); err != nil {
 		return err
-	}
-	if _, err := InspectXBlock(data); err != nil {
-		return invalidArg(field, "BID 0x%x is not a data block or XBLOCK/XXBLOCK (MS-PST %s)", bid, SectionSLBlock)
 	}
 	return nil
 }
 
 func (n *NDB) assertSubnodeTreeBID(bid uint64, field string) error {
+	return n.validateSubnodeTree(bid)
+}
+
+func (n *NDB) validateSubnodeTree(root uint64) error {
+	return n.validateSubnodeTreeAt(root, map[uint64]struct{}{}, 0)
+}
+
+func (n *NDB) validateSubnodeTreeAt(bid uint64, seen map[uint64]struct{}, depth int) error {
+	if bid == 0 {
+		return nil
+	}
+	if depth > 1 {
+		return invariant(SectionSIBlock, "cLevel", "subnode walk exceeded SIBLOCK->SLBLOCK (MS-PST %s)", SectionSIBlock)
+	}
+	if _, ok := seen[bid]; ok {
+		return invariant(SectionSubnode, "bid", "cycle or duplicate subnode BID 0x%x", bid)
+	}
+	seen[bid] = struct{}{}
 	e, ok := n.LookupBlock(bid)
 	if !ok {
-		return invalidArg(field, "missing subnode-tree BID 0x%x (MS-PST %s)", bid, SectionSLBlock)
+		return invalidArg("bidSub", "missing subnode-tree BID 0x%x (MS-PST %s)", bid, SectionSLBlock)
 	}
 	if !BIDIsInternal(bid) {
-		return invalidArg(field, "bidSub 0x%x is an external data block, want SLBLOCK/SIBLOCK (MS-PST %s)", bid, SectionSLBlock)
+		return invalidArg("bidSub", "bidSub 0x%x is an external data block, want SLBLOCK/SIBLOCK (MS-PST %s)", bid, SectionSLBlock)
 	}
 	data, err := n.blockPayload(e)
 	if err != nil {
 		return err
 	}
-	if _, err := InspectSubnodeBlock(data); err != nil {
-		return invalidArg(field, "bidSub 0x%x is not an SLBLOCK/SIBLOCK (MS-PST %s)", bid, SectionSLBlock)
+	v, err := InspectSubnodeBlock(data)
+	if err != nil {
+		return err
+	}
+	if v.Level == 0 {
+		for _, ent := range v.Leaves {
+			if err := checkSLEntry(ent); err != nil {
+				return err
+			}
+			if ent.DataBID != 0 {
+				if err := n.validateDataTree(ent.DataBID); err != nil {
+					return err
+				}
+			}
+			if ent.SubBID != 0 {
+				if err := n.validateSubnodeTreeAt(ent.SubBID, seen, 0); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if v.Level != SIBlockLevel {
+		return invariant(SectionSIBlock, "cLevel", "got %d want 0x01", v.Level)
+	}
+	if depth != 0 {
+		return invariant(SectionSIBlock, "bid", "SIENTRY must point to an SLBLOCK (MS-PST %s)", SectionSIBlock)
+	}
+	for _, k := range v.Kids {
+		if _, dup := seen[k.Ref]; dup {
+			return invariant(SectionSIBlock, "bid", "cycle or duplicate SIENTRY 0x%x", k.Ref)
+		}
+		child, ok := n.LookupBlock(k.Ref)
+		if !ok {
+			return invariant(SectionSIBlock, "bid", "missing child 0x%x", k.Ref)
+		}
+		fk, err := n.subnodeFirstKey(child)
+		if err != nil {
+			return err
+		}
+		if k.Key != fk {
+			return invariant(SectionSIBlock, "nid", "separator 0x%x is not child first key 0x%x", k.Key, fk)
+		}
+		cdata, err := n.blockPayload(child)
+		if err != nil {
+			return err
+		}
+		cv, err := InspectSubnodeBlock(cdata)
+		if err != nil {
+			return err
+		}
+		if cv.Level != 0 {
+			return invariant(SectionSIBlock, "bid", "SIENTRY 0x%x must point to an SLBLOCK (MS-PST %s)", k.Ref, SectionSIBlock)
+		}
+		if err := n.validateSubnodeTreeAt(k.Ref, seen, depth+1); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -242,17 +304,22 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NID < sorted[j].NID })
 	startRegions := n.store.RegionCount()
 	var staged []uint64
-	rollback := func() {
+	rollback := func() error {
+		var rb error
 		for i := len(staged) - 1; i >= 0; i-- {
-			_ = n.dropBlock(staged[i])
+			if err := n.dropBlock(staged[i]); err != nil {
+				rb = rollbackErr(rb, err)
+			}
 		}
-		_ = n.store.ShrinkTrailingEmpty(startRegions)
+		if err := n.store.ShrinkTrailingEmpty(startRegions); err != nil {
+			rb = rollbackErr(rb, err)
+		}
+		return rb
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
 	root, err := n.buildSubnodeTree(sorted, note)
 	if err != nil {
-		rollback()
-		return BBTEntry{}, err
+		return BBTEntry{}, rollbackErr(err, rollback())
 	}
 	return root, nil
 }

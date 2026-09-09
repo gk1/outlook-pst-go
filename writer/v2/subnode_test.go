@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"testing"
@@ -231,11 +232,11 @@ func TestSLEntryRejectsReversedRoles(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: inner.BID}})
-	if !errors.Is(err, ErrInvalidArg) {
+	if !errors.Is(err, ErrInvalidArg) && !errors.Is(err, ErrInvariant) {
 		t.Fatalf("subnode as bidData: %v", err)
 	}
 	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: data.BID, SubBID: data.BID}})
-	if !errors.Is(err, ErrInvalidArg) {
+	if !errors.Is(err, ErrInvalidArg) && !errors.Is(err, ErrInvariant) {
 		t.Fatalf("data as bidSub: %v", err)
 	}
 }
@@ -328,5 +329,151 @@ func TestNestedSubnodeBidSubRoundTrip(t *testing.T) {
 	}
 	if _, ok := n2.LookupBlock(outerData.BID); ok {
 		t.Fatal("outer data leaked")
+	}
+}
+
+func TestPutSubnodeTreeRejectsMalformedDataTree(t *testing.T) {
+	n := NewNDB(nil)
+	leaf := mustAlloc(t, n, 8)
+	if err := n.putPayload(leaf, bytes.Repeat([]byte{1}, 8)); err != nil {
+		t.Fatal(err)
+	}
+	xp, err := EncodeXBlock(XBlockLevel, 8, []uint64{leaf.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xb, err := n.AllocInternalBlock(uint16(len(xp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(xb, xp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(leaf.BID); err != nil {
+		t.Fatal(err)
+	}
+	innerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{xb.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := n.AllocInternalBlock(uint16(len(innerp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(inner, innerp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(xb.BID); err != nil {
+		t.Fatal(err)
+	}
+	outerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{inner.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := n.AllocInternalBlock(uint16(len(outerp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(outer, outerp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(inner.BID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: outer.BID}})
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("xx->xx bidData: %v", err)
+	}
+}
+
+func TestPutSubnodeTreeRejectsCyclicNestedSub(t *testing.T) {
+	n := NewNDB(nil)
+	data := mustAlloc(t, n, 8)
+	if err := n.putPayload(data, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	blk, err := n.AllocInternalBlock(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := EncodeSLBlock([]SLEntry{{NID: 0x21, DataBID: data.BID, SubBID: blk.BID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint16(len(payload)) != blk.CB {
+		_ = n.dropBlock(blk.BID)
+		blk, err = n.AllocInternalBlock(uint16(len(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err = EncodeSLBlock([]SLEntry{{NID: 0x21, DataBID: data.BID, SubBID: blk.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := n.putPayload(blk, payload); err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: data.BID, SubBID: blk.BID}})
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("cyclic bidSub: %v", err)
+	}
+}
+
+func TestOpenNDBRejectsMalformedDataTree(t *testing.T) {
+	n := NewNDB(nil)
+	leaf := mustAlloc(t, n, 8)
+	if err := n.putPayload(leaf, bytes.Repeat([]byte{1}, 8)); err != nil {
+		t.Fatal(err)
+	}
+	xp, err := EncodeXBlock(XBlockLevel, 8, []uint64{leaf.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	xb, err := n.AllocInternalBlock(uint16(len(xp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(xb, xp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(leaf.BID); err != nil {
+		t.Fatal(err)
+	}
+	innerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{xb.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner, err := n.AllocInternalBlock(uint16(len(innerp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(inner, innerp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(xb.BID); err != nil {
+		t.Fatal(err)
+	}
+	outerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{inner.BID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := n.AllocInternalBlock(uint16(len(outerp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(outer, outerp); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.AddDataTreeRef(inner.BID); err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x21, outer.BID, 0, 0)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenNDB(file); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("reopen xx->xx: %v", err)
 	}
 }

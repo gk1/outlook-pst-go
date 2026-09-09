@@ -151,6 +151,16 @@ func invalidArg(field, format string, args ...any) *Error {
 	}
 }
 
+func rollbackErr(op, rb error) error {
+	if op == nil {
+		return rb
+	}
+	if rb == nil {
+		return op
+	}
+	return fmt.Errorf("%w (rollback: %v)", op, rb)
+}
+
 func ioErr(field, format string, args ...any) *Error {
 	return &Error{
 		Code:   CodeIO,

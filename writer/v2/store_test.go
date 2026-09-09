@@ -9,6 +9,20 @@ import (
 	"github.com/grokify/outlook-pst-go/pkg/disk"
 )
 
+func spoolByte(s *Store, ib uint64) byte {
+	var b [1]byte
+	if s.spool != nil {
+		n, _ := s.spool.ReadAt(b[:], int64(ib))
+		if n == 1 {
+			return b[0]
+		}
+	}
+	if uint64(len(s.backing)) > ib {
+		return s.backing[ib]
+	}
+	return 0
+}
+
 func TestGeometryIntervals(t *testing.T) {
 	if AMapCoverageBytes != 496*8*64 {
 		t.Fatalf("AMap coverage %d", AMapCoverageBytes)
@@ -667,14 +681,14 @@ func TestReallocDoesNotInheritFreedBacking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s2.backing[ib] != 0xA5 {
-		t.Fatal("LoadStore dropped payload")
+	if b := spoolByte(s2, ib); b != 0xA5 {
+		t.Fatalf("LoadStore dropped payload 0x%02x", b)
 	}
 	if err := s2.Free(ib, 64); err != nil {
 		t.Fatal(err)
 	}
-	if s2.backing[ib] != 0 {
-		t.Fatalf("Free left backing 0x%02x", s2.backing[ib])
+	if b := spoolByte(s2, ib); b != 0 {
+		t.Fatalf("Free left payload 0x%02x", b)
 	}
 	ib2, err := s2.Allocate(64)
 	if err != nil {

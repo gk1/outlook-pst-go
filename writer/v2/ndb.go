@@ -2,6 +2,8 @@ package writer
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"sort"
 )
 
@@ -526,6 +528,8 @@ type TreeImage struct {
 	BBTRoot BREF
 	Pages   map[uint64][]byte // IB -> 512-byte page
 	File    []byte
+	src     io.ReaderAt
+	srcSize uint64
 }
 
 func metadataPageIB(ib uint64) bool {
@@ -617,35 +621,51 @@ func (n *NDB) Encode() (*TreeImage, error) {
 // Commit writes a Unicode PST: maps, HEADER ROOT BREFNBT/BREFBBT, bidNextP,
 // bidNextB, and the encoded NBT/BBT pages. Reopen with OpenNDB.
 func (n *NDB) Commit() ([]byte, error) {
+	ms := NewMemSink("commit")
+	if err := n.CommitTo(ms); err != nil {
+		return nil, err
+	}
+	return ms.Bytes(), nil
+}
+
+func (n *NDB) CommitTo(dst Sink) error {
+	if dst == nil {
+		return invalidArg("sink", "nil commit sink")
+	}
 	img, err := n.Encode()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	file, err := n.store.EncodeFile()
-	if err != nil {
-		return nil, err
+	if err := n.store.WriteTo(dst); err != nil {
+		return err
 	}
 	for ib, raw := range img.Pages {
-		if ib+uint64(len(raw)) > uint64(len(file)) {
-			return nil, invariant(SectionBTPAGE, "ib", "page at 0x%x exceeds ibFileEof", ib)
+		if _, err := dst.WriteAt(raw, int64(ib)); err != nil {
+			return ioErr("page", "write at 0x%x: %v", ib, err)
 		}
-		copy(file[ib:], raw)
 	}
 	for _, e := range n.blocks {
 		raw, ok, err := n.encodePayloadBlock(e)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !ok {
 			continue
 		}
-		if e.IB+uint64(len(raw)) > uint64(len(file)) {
-			return nil, invariant(SectionBlockTrailer, "ib", "block at 0x%x exceeds ibFileEof", e.IB)
+		if _, err := dst.WriteAt(raw, int64(e.IB)); err != nil {
+			return ioErr("block", "write at 0x%x: %v", e.IB, err)
 		}
-		copy(file[e.IB:], raw)
 	}
-	n.store.attachBacking(file)
-	return file, nil
+	if err := dst.Sync(); err != nil {
+		return ioErr("sink", "sync: %v", err)
+	}
+	if n.store.spool != dst {
+		_ = n.store.closeOwnedSpool()
+		n.store.spool = dst
+		n.store.spoolTmp = false
+	}
+	n.store.backing = nil
+	return nil
 }
 
 func (n *NDB) encodePayloadBlock(e BBTEntry) ([]byte, bool, error) {
@@ -723,6 +743,13 @@ func (img *TreeImage) rawAt(ib uint64) ([]byte, error) {
 	}
 	if img.File != nil && ib+uint64(PageSize) <= uint64(len(img.File)) {
 		return img.File[ib : ib+uint64(PageSize)], nil
+	}
+	if img.src != nil && ib+uint64(PageSize) <= img.srcSize {
+		raw, err := readAtFull(img.src, int64(ib), PageSize)
+		if err != nil {
+			return nil, invariant(SectionBTPAGE, "ib", "read page at 0x%x: %v", ib, err)
+		}
+		return raw, nil
 	}
 	return nil, invariant(SectionBTPAGE, "ib", "missing page at IB 0x%x", ib)
 }
@@ -934,10 +961,21 @@ func (img *TreeImage) RootLevel(root BREF) (byte, error) {
 
 // OpenTrees reconstructs a TreeImage by following HEADER ROOT BREFNBT/BREFBBT.
 func OpenTrees(file []byte) (*TreeImage, error) {
-	if len(file) < UnicodeHeaderSize {
-		return nil, invariant(SectionHeader, "size", "file is %d bytes, need header", len(file))
+	return OpenTreesFrom(&MemSink{name: "trees", buf: file}, int64(len(file)))
+}
+
+func OpenTreesFrom(r io.ReaderAt, size int64) (*TreeImage, error) {
+	if r == nil {
+		return nil, invalidArg("reader", "nil tree reader")
 	}
-	h, err := InspectHeader(file[:UnicodeHeaderSize])
+	if size < UnicodeHeaderSize {
+		return nil, invariant(SectionHeader, "size", "file is %d bytes, need header", size)
+	}
+	hdr, err := readAtFull(r, 0, UnicodeHeaderSize)
+	if err != nil {
+		return nil, invariant(SectionHeader, "size", "header read: %v", err)
+	}
+	h, err := InspectHeader(hdr)
 	if err != nil {
 		return nil, err
 	}
@@ -947,7 +985,8 @@ func OpenTrees(file []byte) (*TreeImage, error) {
 	img := &TreeImage{
 		NBTRoot: BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
 		BBTRoot: BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
-		File:    file,
+		src:     r,
+		srcSize: uint64(size),
 	}
 	if err := img.CheckTrees(); err != nil {
 		return nil, err
@@ -1023,11 +1062,33 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 // Store maps, ROOT BREFs, live tree pages, payloads, and bidNextP/bidNextB
 // are retained. Extra cRef is reconstructed from XBLOCK/SLENTRY when present.
 func OpenNDB(file []byte) (*NDB, error) {
-	store, err := LoadStore(file)
+	return OpenNDBFrom(&MemSink{name: "load", buf: file}, int64(len(file)))
+}
+
+func OpenNDBFile(path string) (*NDB, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, ioErr("file", "open %s: %v", path, err)
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, ioErr("file", "stat %s: %v", path, err)
+	}
+	n, err := OpenNDBFrom(&FileSink{f: f}, st.Size())
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return n, nil
+}
+
+func OpenNDBFrom(r io.ReaderAt, size int64) (*NDB, error) {
+	store, err := LoadStoreFrom(r, size)
 	if err != nil {
 		return nil, err
 	}
-	img, err := OpenTrees(file)
+	img, err := OpenTreesFrom(r, size)
 	if err != nil {
 		return nil, err
 	}
@@ -1045,6 +1106,13 @@ func OpenNDB(file []byte) (*NDB, error) {
 		return nil, err
 	}
 	return n, nil
+}
+
+func (n *NDB) Close() error {
+	if n == nil || n.store == nil {
+		return nil
+	}
+	return n.store.Close()
 }
 
 // LoadTrees reconstructs an NDB from encoded NBT/BBT leaves.
@@ -1094,6 +1162,9 @@ func (n *NDB) reconstructTreeRefs() error {
 		case BlockTypeXBlock:
 			xb, err := InspectXBlock(data)
 			if err != nil {
+				return err
+			}
+			if err := n.validateDataTree(bid); err != nil {
 				return err
 			}
 			for _, child := range xb.BIDs {

@@ -247,7 +247,8 @@ func (m *MemSink) Truncate(n int64) error {
 	if n < 0 {
 		return invalidArg("size", "negative Truncate %d", n)
 	}
-	if n >= int64(len(m.buf)) {
+	if n > int64(len(m.buf)) {
+		m.grow(n)
 		return nil
 	}
 	m.buf = m.buf[:n]
