@@ -3,6 +3,7 @@ package writer
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
 	"sort"
 )
 
@@ -19,6 +20,8 @@ type Store struct {
 	nbtRoot       BREF
 	bbtRoot       BREF
 	backing       []byte
+	spool         Sink
+	spoolTmp      bool
 }
 
 type region struct {
@@ -321,19 +324,22 @@ func (s *Store) mark(ib, size uint64, alloc bool) error {
 }
 
 func (s *Store) clearBacking(ib, size uint64) {
-	if len(s.backing) == 0 || size == 0 {
+	if size == 0 {
 		return
 	}
-	if ib >= uint64(len(s.backing)) {
-		return
+	if len(s.backing) > 0 && ib < uint64(len(s.backing)) {
+		end := ib + size
+		if end > uint64(len(s.backing)) {
+			end = uint64(len(s.backing))
+		}
+		region := s.backing[ib:end]
+		for i := range region {
+			region[i] = 0
+		}
 	}
-	end := ib + size
-	if end > uint64(len(s.backing)) {
-		end = uint64(len(s.backing))
-	}
-	region := s.backing[ib:end]
-	for i := range region {
-		region[i] = 0
+	if s.spool != nil {
+		z := make([]byte, size)
+		_, _ = s.spool.WriteAt(z, int64(ib))
 	}
 }
 
@@ -630,13 +636,86 @@ func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if end > s.FileEOF() {
 		return invariant(SectionAMap, "ib", "write 0x%x+%d exceeds ibFileEof 0x%x", ib, len(raw), s.FileEOF())
 	}
-	if uint64(len(s.backing)) < s.FileEOF() {
-		nb := make([]byte, s.FileEOF())
-		copy(nb, s.backing)
-		s.backing = nb
+	// Never grow backing to FileEOF: that is O(PST). In-place update only
+	// when a loaded image already covers the extent.
+	if uint64(len(s.backing)) >= end {
+		copy(s.backing[ib:], raw)
 	}
-	copy(s.backing[ib:], raw)
+	if err := s.ensureSpool(); err != nil {
+		return err
+	}
+	_, err := s.spool.WriteAt(raw, int64(ib))
+	return err
+}
+
+func (s *Store) ensureSpool() error {
+	if s.spool != nil {
+		return nil
+	}
+	f, err := os.CreateTemp("", "pst-v2-*.spool")
+	if err != nil {
+		return ioErr("spool", "create: %v", err)
+	}
+	s.spool = &FileSink{f: f}
+	s.spoolTmp = true
 	return nil
+}
+
+// residentImageBytes is in-process image memory (backing + MemSink), not FileSink.
+func (s *Store) residentImageBytes() int {
+	n := len(s.backing)
+	if m, ok := s.spool.(*MemSink); ok && len(m.buf) > n {
+		n = len(m.buf)
+	}
+	return n
+}
+
+func (s *Store) ShrinkTrailingEmpty(minRegions int) error {
+	if minRegions < 1 {
+		minRegions = 1
+	}
+	for len(s.regions) > minRegions {
+		idx := len(s.regions) - 1
+		if s.regionHasUserAlloc(idx) {
+			break
+		}
+		s.regions = s.regions[:idx]
+	}
+	if uint32(len(s.regions)) > 0 && s.lastAllocAMap >= uint32(len(s.regions)) {
+		s.lastAllocAMap = uint32(len(s.regions) - 1)
+	}
+	if tr, ok := s.spool.(interface{ Truncate(int64) error }); ok {
+		if err := tr.Truncate(int64(s.FileEOF())); err != nil {
+			return ioErr("spool", "truncate: %v", err)
+		}
+	}
+	if uint64(len(s.backing)) > s.FileEOF() {
+		s.backing = s.backing[:s.FileEOF()]
+	}
+	return nil
+}
+
+func (s *Store) regionHasUserAlloc(idx int) bool {
+	if idx < 0 || idx >= len(s.regions) {
+		return false
+	}
+	meta := make(map[uint64]struct{})
+	for _, p := range RegionMapPages(uint64(idx)) {
+		for off := p.Offset; off < p.Offset+PageSize; off += BytesPerSlot {
+			meta[off] = struct{}{}
+		}
+	}
+	bm := s.regions[idx].bitmap[:]
+	for slot := 0; slot < SlotsPerAMap; slot++ {
+		if !bitIsSet(bm, slot) {
+			continue
+		}
+		off := slotOffset(uint64(idx), slot)
+		if _, ok := meta[off]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) zeroFreeSlots(buf []byte) {
@@ -672,10 +751,12 @@ func (s *Store) EncodeFile() ([]byte, error) {
 		return nil, err
 	}
 	buf := make([]byte, s.FileEOF())
-	if len(s.backing) > 0 {
+	if s.spool != nil {
+		_, _ = s.spool.ReadAt(buf, 0)
+	} else if len(s.backing) > 0 {
 		copy(buf, s.backing)
-		s.zeroFreeSlots(buf)
 	}
+	s.zeroFreeSlots(buf)
 	copy(buf, hdr)
 	dlist, err := s.encodeDList()
 	if err != nil {
@@ -789,6 +870,7 @@ func LoadStore(file []byte) (*Store, error) {
 		return nil, invariant(SectionRoot, "cbAMapFree", "bitmap free %d != ROOT %d", s.AMapFree(), h.Root.AMapFree)
 	}
 	s.attachBacking(file)
+	s.spool = &MemSink{name: "load", buf: append([]byte(nil), file...)}
 	return s, nil
 }
 

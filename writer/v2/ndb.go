@@ -140,10 +140,23 @@ func (n *NDB) blockPayload(e BBTEntry) ([]byte, error) {
 		}
 	}
 	size := BlockDiskSize(uint64(e.CB))
-	if n.store == nil || e.IB == 0 || uint64(len(n.store.backing)) < e.IB+size {
+	raw := make([]byte, size)
+	got := false
+	if n.store != nil && n.store.spool != nil && e.IB != 0 {
+		nr, err := n.store.spool.ReadAt(raw, int64(e.IB))
+		if err != nil && nr < int(size) {
+			return nil, invariant(SectionBlockTrailer, "ib", "spool read BID 0x%x at 0x%x: %v", e.BID, e.IB, err)
+		}
+		got = nr >= int(size)
+	}
+	if !got && n.store != nil && e.IB != 0 && uint64(len(n.store.backing)) >= e.IB+size {
+		copy(raw, n.store.backing[e.IB:e.IB+size])
+		got = true
+	}
+	if !got {
 		return nil, invariant(SectionBlockTrailer, "ib", "missing payload for BID 0x%x at 0x%x", e.BID, e.IB)
 	}
-	v, err := InspectBlock(n.store.backing[e.IB:e.IB+size], e.IB)
+	v, err := InspectBlock(raw, e.IB)
 	if err != nil {
 		return nil, err
 	}
@@ -1093,6 +1106,9 @@ func (n *NDB) reconstructTreeRefs() error {
 			}
 			if sn.Level == 0 {
 				for _, ent := range sn.Leaves {
+					if err := n.assertSLEntryRoles(ent); err != nil {
+						return err
+					}
 					if ent.DataBID != 0 {
 						n.subnodeRefs[ent.DataBID]++
 					}

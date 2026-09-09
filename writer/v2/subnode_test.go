@@ -219,3 +219,114 @@ func TestPutSubnodeTreeRollsBackOnMissingChild(t *testing.T) {
 		t.Fatalf("leaked %d blocks", len(n.blocks))
 	}
 }
+
+func TestSLEntryRejectsReversedRoles(t *testing.T) {
+	n := NewNDB(nil)
+	data := mustAlloc(t, n, 8)
+	if err := n.putPayload(data, make([]byte, 8)); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: data.BID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: inner.BID}})
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("subnode as bidData: %v", err)
+	}
+	_, err = n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: data.BID, SubBID: data.BID}})
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("data as bidSub: %v", err)
+	}
+}
+
+func TestNestedSubnodeBidSubRoundTrip(t *testing.T) {
+	n := NewNDB(nil)
+	innerData := mustAlloc(t, n, 8)
+	if err := n.putPayload(innerData, []byte("innersub")); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: innerData.BID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outerData := mustAlloc(t, n, 8)
+	if err := n.putPayload(outerData, []byte("outerdat")); err != nil {
+		t.Fatal(err)
+	}
+	outer, err := n.PutSubnodeTree([]SLEntry{{NID: 0x41, DataBID: outerData.BID, SubBID: inner.BID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x61, outerData.BID, outer.BID, 0)
+	var kids []SLEntry
+	if err := n.WalkSubnodes(outer.BID, func(e SLEntry) error {
+		kids = append(kids, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(kids) != 1 || kids[0].SubBID != inner.BID || kids[0].DataBID != outerData.BID {
+		t.Fatalf("outer walk %+v", kids)
+	}
+	var innerKids []SLEntry
+	if err := n.WalkSubnodes(inner.BID, func(e SLEntry) error {
+		innerKids = append(innerKids, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(innerKids) != 1 || innerKids[0].DataBID != innerData.BID {
+		t.Fatalf("inner walk %+v", innerKids)
+	}
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDB(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := n2.LookupNode(0x61)
+	if !ok || got.SubBID != outer.BID {
+		t.Fatalf("reopen node %+v ok=%v", got, ok)
+	}
+	var kids2 []SLEntry
+	if err := n2.WalkSubnodes(got.SubBID, func(e SLEntry) error {
+		kids2 = append(kids2, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(kids2) != 1 || kids2[0].SubBID != inner.BID {
+		t.Fatalf("reopen walk %+v", kids2)
+	}
+	var inner2 []SLEntry
+	if err := n2.WalkSubnodes(kids2[0].SubBID, func(e SLEntry) error {
+		inner2 = append(inner2, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(inner2) != 1 || inner2[0].DataBID != innerData.BID {
+		t.Fatalf("reopen nested %+v", inner2)
+	}
+	if n2.subnodeRefs[inner.BID] < 1 || n2.subnodeRefs[innerData.BID] < 1 {
+		t.Fatalf("typed nested refs inner=%d data=%d", n2.subnodeRefs[inner.BID], n2.subnodeRefs[innerData.BID])
+	}
+	if err := n2.DeleteNode(0x61); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n2.LookupBlock(outer.BID); ok {
+		t.Fatal("outer subnode tree leaked")
+	}
+	if _, ok := n2.LookupBlock(inner.BID); ok {
+		t.Fatal("inner subnode tree leaked")
+	}
+	if _, ok := n2.LookupBlock(innerData.BID); ok {
+		t.Fatal("inner data leaked")
+	}
+	if _, ok := n2.LookupBlock(outerData.BID); ok {
+		t.Fatal("outer data leaked")
+	}
+}

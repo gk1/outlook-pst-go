@@ -201,42 +201,46 @@ func TestXXBlockTransition(t *testing.T) {
 }
 
 func TestDataTreeHashReopenBounded(t *testing.T) {
-	const nBytes = int64(4 << 20) // 4 MiB: large enough to catch O(n) payload retention
+	const nBytes = int64(16 << 20)
 	n := NewNDB(nil)
 	root, err := n.PutDataTree(io.LimitReader(repeatByte(0x7E), nBytes), nBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if held := payloadBytes(n); held != 0 {
-		t.Fatalf("PutDataTree retained %d payload bytes; want stream-to-backing only", held)
+		t.Fatalf("PutDataTree retained %d payload bytes", held)
+	}
+	if n.Store().residentImageBytes() != 0 {
+		t.Fatalf("resident image %d; want FileSink spool only", n.Store().residentImageBytes())
+	}
+	if _, ok := n.Store().spool.(*FileSink); !ok {
+		t.Fatalf("spool %T, want FileSink", n.Store().spool)
+	}
+	rd, err := n.OpenDataTree(root.BID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rd.leaves)+len(rd.xbs) > MaxXBlockEntries+1 {
+		t.Fatalf("reader materialized %d+%d BIDs", len(rd.leaves), len(rd.xbs))
 	}
 	mustNode(t, n, 0x21, root.BID, 0, 0)
-	r1, err := n.OpenDataTree(root.BID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	h1 := sha256.New()
-	if _, err := io.Copy(h1, r1); err != nil {
-		t.Fatal(err)
-	}
-	file, err := n.Commit()
+	got, err := io.Copy(h1, rd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n2, err := OpenNDB(file)
-	if err != nil {
+	if got != nBytes {
+		t.Fatalf("read %d want %d", got, nBytes)
+	}
+	want := sha256.New()
+	if _, err := io.Copy(want, io.LimitReader(repeatByte(0x7E), nBytes)); err != nil {
 		t.Fatal(err)
 	}
-	r2, err := n2.OpenDataTree(root.BID)
-	if err != nil {
-		t.Fatal(err)
+	if !bytes.Equal(h1.Sum(nil), want.Sum(nil)) {
+		t.Fatal("stream hash mismatch")
 	}
-	h2 := sha256.New()
-	if _, err := io.Copy(h2, r2); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(h1.Sum(nil), h2.Sum(nil)) {
-		t.Fatal("reopen hash mismatch")
+	if n.Store().residentImageBytes() != 0 {
+		t.Fatalf("resident image after readback %d", n.Store().residentImageBytes())
 	}
 }
 
@@ -457,4 +461,23 @@ func TestXXBlockMalformedChildCycleDuplicate(t *testing.T) {
 			t.Fatal("shared leaf leaked")
 		}
 	})
+}
+
+func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
+	n := NewNDB(nil)
+	beforeR := n.Store().RegionCount()
+	beforeEOF := n.Store().FileEOF()
+	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("got %v", err)
+	}
+	if len(n.blocks) != 0 {
+		t.Fatalf("leaked %d blocks", len(n.blocks))
+	}
+	if n.Store().RegionCount() != beforeR {
+		t.Fatalf("regions %d want %d", n.Store().RegionCount(), beforeR)
+	}
+	if n.Store().FileEOF() != beforeEOF {
+		t.Fatalf("eof 0x%x want 0x%x", n.Store().FileEOF(), beforeEOF)
+	}
 }

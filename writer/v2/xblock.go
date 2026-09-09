@@ -112,12 +112,14 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	if expected > int64(^uint32(0)) {
 		return BBTEntry{}, limitErr("lcbTotal", "logical size %d exceeds uint32 lcbTotal (MS-PST %s)", expected, SectionXBlock)
 	}
+	startRegions := n.store.RegionCount()
 	var staged []uint64
 	var fail error
 	rollback := func() {
 		for i := len(staged) - 1; i >= 0; i-- {
 			_ = n.dropBlock(staged[i])
 		}
+		_ = n.store.ShrinkTrailingEmpty(startRegions)
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
 
@@ -127,19 +129,18 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	for {
 		nr, err := io.ReadFull(r, buf)
 		if nr > 0 {
-			chunk := append([]byte(nil), buf[:nr]...)
-			e, aerr := n.AllocBlock(uint16(len(chunk)))
+			e, aerr := n.AllocBlock(uint16(nr))
 			if aerr != nil {
 				fail = aerr
 				break
 			}
 			note(e)
-			if err := n.putPayload(e, chunk); err != nil {
+			if err := n.putPayload(e, buf[:nr]); err != nil {
 				fail = err
 				break
 			}
 			leaves = append(leaves, e)
-			total += uint64(len(chunk))
+			total += uint64(nr)
 			if total > uint64(^uint32(0)) {
 				fail = limitErr("lcbTotal", "logical size exceeds uint32 lcbTotal (MS-PST %s)", SectionXBlock)
 				break
@@ -239,24 +240,96 @@ func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32, note func(BBTEntry)
 }
 
 // DataTreeReader streams a data tree's leaf bytes in order.
+// At most one XXBLOCK rgbid, one XBLOCK rgbid, and one leaf payload are resident.
 type DataTreeReader struct {
-	n     *NDB
-	leaf  []byte
-	off   int
-	bids  []uint64
-	idx   int
-	total uint64
-	read  uint64
-	err   error
+	n       *NDB
+	leaf    []byte
+	off     int
+	leaves  []uint64
+	leafIdx int
+	xbs     []uint64
+	xbIdx   int
+	total   uint64
+	read    uint64
+	err     error
 }
 
-// OpenDataTree returns a reader over root's logical bytes. Memory is one leaf.
+// OpenDataTree returns a reader over root's logical bytes. Walk is lazy over
+// XXBLOCK -> XBLOCK -> data; it does not materialize every leaf BID.
 func (n *NDB) OpenDataTree(root uint64) (*DataTreeReader, error) {
-	total, bids, err := n.flattenDataTree(root)
+	r := &DataTreeReader{n: n}
+	if root == 0 {
+		return r, nil
+	}
+	e, ok := n.LookupBlock(root)
+	if !ok {
+		return nil, invalidArg("bid", "missing data-tree root 0x%x", root)
+	}
+	if !BIDIsInternal(root) {
+		r.total = uint64(e.CB)
+		r.leaves = []uint64{root}
+		return r, nil
+	}
+	data, err := n.blockPayload(e)
 	if err != nil {
 		return nil, err
 	}
-	return &DataTreeReader{n: n, bids: bids, total: total}, nil
+	xb, err := InspectXBlock(data)
+	if err != nil {
+		return nil, err
+	}
+	r.total = uint64(xb.Total)
+	if xb.Level == XBlockLevel {
+		r.leaves = xb.BIDs
+		return r, nil
+	}
+	r.xbs = xb.BIDs
+	return r, nil
+}
+
+func (r *DataTreeReader) nextLeaf() error {
+	for {
+		if r.leafIdx < len(r.leaves) {
+			bid := r.leaves[r.leafIdx]
+			r.leafIdx++
+			if BIDIsInternal(bid) {
+				return invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
+			}
+			e, ok := r.n.LookupBlock(bid)
+			if !ok {
+				return invariant(SectionXBlock, "rgbid", "missing leaf BID 0x%x", bid)
+			}
+			data, err := r.n.blockPayload(e)
+			if err != nil {
+				return err
+			}
+			r.leaf = data
+			r.off = 0
+			return nil
+		}
+		if r.xbIdx >= len(r.xbs) {
+			return io.EOF
+		}
+		bid := r.xbs[r.xbIdx]
+		r.xbIdx++
+		child, ok := r.n.LookupBlock(bid)
+		if !ok {
+			return invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
+		}
+		data, err := r.n.blockPayload(child)
+		if err != nil {
+			return err
+		}
+		xb, err := InspectXBlock(data)
+		if err != nil {
+			return err
+		}
+		if xb.Level != XBlockLevel {
+			return invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, xb.Level)
+		}
+		r.leaves = xb.BIDs
+		r.leafIdx = 0
+	}
 }
 
 func (r *DataTreeReader) Read(p []byte) (int, error) {
@@ -264,26 +337,19 @@ func (r *DataTreeReader) Read(p []byte) (int, error) {
 		return 0, r.err
 	}
 	if r.off >= len(r.leaf) {
-		if r.idx >= len(r.bids) {
+		err := r.nextLeaf()
+		if err == io.EOF {
 			if r.read != r.total {
 				r.err = invariant(SectionXBlock, "lcbTotal", "read %d bytes, lcbTotal %d", r.read, r.total)
 				return 0, r.err
 			}
+			r.err = io.EOF
 			return 0, io.EOF
 		}
-		e, ok := r.n.LookupBlock(r.bids[r.idx])
-		if !ok {
-			r.err = invariant(SectionXBlock, "rgbid", "missing leaf BID 0x%x", r.bids[r.idx])
-			return 0, r.err
-		}
-		data, err := r.n.blockPayload(e)
 		if err != nil {
 			r.err = err
 			return 0, err
 		}
-		r.leaf = data
-		r.off = 0
-		r.idx++
 	}
 	n := copy(p, r.leaf[r.off:])
 	r.off += n

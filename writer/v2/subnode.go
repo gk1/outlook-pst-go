@@ -98,6 +98,61 @@ func checkSLEntry(e SLEntry) error {
 	return nil
 }
 
+// assertSLEntryRoles enforces MS-PST 2.2.2.8.3.3.1.1:
+// bidData is a data block or data-tree; nonzero bidSub is a subnode B-tree.
+func (n *NDB) assertSLEntryRoles(e SLEntry) error {
+	if err := checkSLEntry(e); err != nil {
+		return err
+	}
+	if e.DataBID != 0 {
+		if err := n.assertDataTreeBID(e.DataBID, "bidData"); err != nil {
+			return err
+		}
+	}
+	if e.SubBID != 0 {
+		if err := n.assertSubnodeTreeBID(e.SubBID, "bidSub"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n *NDB) assertDataTreeBID(bid uint64, field string) error {
+	e, ok := n.LookupBlock(bid)
+	if !ok {
+		return invalidArg(field, "missing data-tree BID 0x%x (MS-PST %s)", bid, SectionSLBlock)
+	}
+	if !BIDIsInternal(bid) {
+		return nil
+	}
+	data, err := n.blockPayload(e)
+	if err != nil {
+		return err
+	}
+	if _, err := InspectXBlock(data); err != nil {
+		return invalidArg(field, "BID 0x%x is not a data block or XBLOCK/XXBLOCK (MS-PST %s)", bid, SectionSLBlock)
+	}
+	return nil
+}
+
+func (n *NDB) assertSubnodeTreeBID(bid uint64, field string) error {
+	e, ok := n.LookupBlock(bid)
+	if !ok {
+		return invalidArg(field, "missing subnode-tree BID 0x%x (MS-PST %s)", bid, SectionSLBlock)
+	}
+	if !BIDIsInternal(bid) {
+		return invalidArg(field, "bidSub 0x%x is an external data block, want SLBLOCK/SIBLOCK (MS-PST %s)", bid, SectionSLBlock)
+	}
+	data, err := n.blockPayload(e)
+	if err != nil {
+		return err
+	}
+	if _, err := InspectSubnodeBlock(data); err != nil {
+		return invalidArg(field, "bidSub 0x%x is not an SLBLOCK/SIBLOCK (MS-PST %s)", bid, SectionSLBlock)
+	}
+	return nil
+}
+
 // InspectSubnodeBlock validates a Unicode SLBLOCK or SIBLOCK payload.
 func InspectSubnodeBlock(data []byte) (*SubnodeView, error) {
 	if len(data) < 4 {
@@ -185,11 +240,13 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	}
 	sorted := append([]SLEntry(nil), entries...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NID < sorted[j].NID })
+	startRegions := n.store.RegionCount()
 	var staged []uint64
 	rollback := func() {
 		for i := len(staged) - 1; i >= 0; i-- {
 			_ = n.dropBlock(staged[i])
 		}
+		_ = n.store.ShrinkTrailingEmpty(startRegions)
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
 	root, err := n.buildSubnodeTree(sorted, note)
@@ -221,6 +278,9 @@ func (n *NDB) buildSubnodeTree(entries []SLEntry, note func(BBTEntry)) (BBTEntry
 			return BBTEntry{}, err
 		}
 		for _, e := range chunk {
+			if err := n.assertSLEntryRoles(e); err != nil {
+				return BBTEntry{}, err
+			}
 			if e.DataBID != 0 {
 				if err := n.AddSubnodeRef(e.DataBID); err != nil {
 					return BBTEntry{}, err

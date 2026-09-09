@@ -175,6 +175,7 @@ func (l Limits) withDefaults() Limits {
 type Sink interface {
 	io.Writer
 	io.WriterAt
+	io.ReaderAt
 	io.Seeker
 	Sync() error
 	Close() error
@@ -228,6 +229,34 @@ func (m *MemSink) WriteAt(p []byte, off int64) (int, error) {
 	return len(p), nil
 }
 
+func (m *MemSink) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, invalidArg("offset", "negative ReadAt offset %d", off)
+	}
+	if off >= int64(len(m.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.buf[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (m *MemSink) Truncate(n int64) error {
+	if n < 0 {
+		return invalidArg("size", "negative Truncate %d", n)
+	}
+	if n >= int64(len(m.buf)) {
+		return nil
+	}
+	m.buf = m.buf[:n]
+	if m.off > n {
+		m.off = n
+	}
+	return nil
+}
+
 func (m *MemSink) Seek(offset int64, whence int) (int64, error) {
 	var n int64
 	switch whence {
@@ -263,10 +292,12 @@ func CreateFileSink(path string) (*FileSink, error) {
 
 func (s *FileSink) Write(p []byte) (int, error)                  { return s.f.Write(p) }
 func (s *FileSink) WriteAt(p []byte, off int64) (int, error)     { return s.f.WriteAt(p, off) }
+func (s *FileSink) ReadAt(p []byte, off int64) (int, error)      { return s.f.ReadAt(p, off) }
 func (s *FileSink) Seek(offset int64, whence int) (int64, error) { return s.f.Seek(offset, whence) }
 func (s *FileSink) Sync() error                                  { return s.f.Sync() }
 func (s *FileSink) Close() error                                 { return s.f.Close() }
 func (s *FileSink) Name() string                                 { return s.f.Name() }
+func (s *FileSink) Truncate(n int64) error                       { return s.f.Truncate(n) }
 
 // Options configure a v2 exporter.
 type Options struct {
