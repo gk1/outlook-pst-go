@@ -34,8 +34,10 @@ func NewStore() *Store {
 // takePageBID assigns the next page BID from bidNextP. Page BIDs use all
 // bits and increment by 1 (MS-PST 2.2.2.2). Block BIDs still advance by 4.
 func (s *Store) takePageBID() uint64 {
-	bid := s.bidNextP
-	s.bidNextP += PageBIDIncrement
+	bid, err := takeMonotonic(&s.bidNextP, PageBIDIncrement)
+	if err != nil {
+		panic(err)
+	}
 	return bid
 }
 

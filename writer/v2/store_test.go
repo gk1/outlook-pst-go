@@ -648,6 +648,6 @@ func TestDListLoadMutations(t *testing.T) {
 		page := mut[DListPageOffset : DListPageOffset+PageSize]
 		resignDList(page, 0)
 		_, err := LoadStore(mut)
-		mustInvariant(t, err, SectionDList, "bid")
+		mustInvariant(t, err, SectionBID, "bid")
 	})
 }

@@ -52,6 +52,8 @@ const (
 	MaxAllocBytes                = 8192 // MS-PST max on-disk page/block size
 	PageBIDIncrement      uint64 = 1    // page BIDs use all bits (MS-PST 2.2.2.2)
 	BlockBIDIncrement     uint64 = 4    // block BIDs keep reserved/internal bits clear
+	BIDReserved           uint64 = 1    // bid.r MUST be 0
+	BIDInternal           uint64 = 2    // bidInternal; internal (XBLOCK/SLBLOCK) blocks
 	UnicodeWVer                  = 23
 	UnicodeWVerMin               = 23
 	UnicodeWVerMax               = 23 // existing reader (disk.ReadHeader) accepts 20-23

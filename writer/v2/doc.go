@@ -4,8 +4,10 @@
 // the legacy Create / BeginWrite APIs in the root module. PST-002 implements
 // the 564-byte HEADER and 72-byte ROOT codecs. PST-003 implements AMap
 // coverage from 0x4400, periodic PMap/FMap/FPMap/DList pages, and
-// allocate/free/reserve on 64-byte slots. Finalize currently returns
-// ErrNotImplemented until later NDB cards land.
+// allocate/free/reserve on 64-byte slots. PST-004 implements Unicode page
+// and external/internal block codecs (trailer, CRC, signature, BID, crypt
+// boundaries). Finalize currently returns ErrNotImplemented until later
+// NDB cards land.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only

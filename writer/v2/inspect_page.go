@@ -23,6 +23,14 @@ func EncodePage(payload []byte, pageType byte, bid, offset uint64) ([]byte, erro
 	if !knownPageType(pageType) {
 		return nil, invalidArg("ptype", "unknown page type 0x%02x", pageType)
 	}
+	if allocatedPageBID(pageType) {
+		if bid == 0 {
+			return nil, invalidArg("bid", "NBT/BBT/DList page BID must be allocated from bidNextP, not null (MS-PST %s)", SectionBID)
+		}
+		if BIDHasReserved(bid) {
+			return nil, invalidArg("bid", "reserved bit must be 0 (MS-PST %s)", SectionBID)
+		}
+	}
 	buf := make([]byte, PageSize)
 	copy(buf, payload)
 	crc := crc32PST(buf[:max])
@@ -74,6 +82,9 @@ func InspectPage(raw []byte, offset uint64) (*PageView, error) {
 			return nil, invariant(SectionPageTrailer, "bid", "map page bid 0x%x want IB 0x%x (MS-PST %s)", bid, offset, SectionPageTrailer)
 		}
 	} else {
+		if bid == 0 {
+			return nil, invariant(SectionBID, "bid", "NBT/BBT/DList page BID is null; allocate from bidNextP")
+		}
 		wantSig := signature(bid, offset)
 		if gotSig != wantSig {
 			return nil, invariant(SectionSignature, "wSig", "got 0x%04x want 0x%04x for bid=0x%x ib=0x%x", gotSig, wantSig, bid, offset)

@@ -84,14 +84,18 @@ func (s *SequentialIDs) NextNID(nidType byte) uint32 {
 }
 
 func (s *SequentialIDs) NextBlockBID() uint64 {
-	id := s.nextBlock
-	s.nextBlock += 4 // data BIDs stay multiple of 4, low bits clear
+	id, err := s.TakeBlockBID()
+	if err != nil {
+		return 0
+	}
 	return id
 }
 
 func (s *SequentialIDs) NextPageBID() uint64 {
-	id := s.nextPage
-	s.nextPage += 4
+	id, err := s.TakePageBID()
+	if err != nil {
+		return 0
+	}
 	return id
 }
 
