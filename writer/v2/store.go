@@ -14,6 +14,7 @@ type Store struct {
 	lastAllocAMap uint32
 	valid         byte
 	bidNextP      uint64
+	bidNextB      uint64
 	dlistBID      uint64
 	nbtRoot       BREF
 	bbtRoot       BREF
@@ -27,7 +28,7 @@ type region struct {
 // PMap at 0x4600, and a DList at 0x4200. Header/DList live in the unmapped
 // prefix before 0x4400.
 func NewStore() *Store {
-	s := &Store{valid: AMapValid2, bidNextP: FirstAllocBID}
+	s := &Store{valid: AMapValid2, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}
 	s.dlistBID = s.takePageBID()
 	s.mustGrow()
 	return s
@@ -104,7 +105,25 @@ func (s *Store) HeaderDraft() HeaderDraft {
 	d.Root.BBTBID = s.bbtRoot.BID
 	d.Root.BBTIB = s.bbtRoot.IB
 	d.BidNextP = s.bidNextP
+	d.BidNextB = s.bidNextB
 	return d
+}
+
+// takeBlockBID assigns the next data-block BID from bidNextB (increment 4).
+func (s *Store) takeBlockBID() (uint64, error) {
+	return takeMonotonic(&s.bidNextB, BlockBIDIncrement)
+}
+
+// noteBlockBID raises bidNextB so it stays strictly beyond bid.
+func (s *Store) noteBlockBID(bid uint64) error {
+	if bid == 0 || BIDHasReserved(bid) {
+		return invalidArg("bid", "invalid block BID 0x%x (MS-PST %s)", bid, SectionBID)
+	}
+	next := (bid &^ BIDInternal) + BlockBIDIncrement
+	if next > s.bidNextB {
+		s.bidNextB = next
+	}
+	return nil
 }
 
 // SetTreeRoots records ROOT BREFNBT/BREFBBT for the next header encode.
@@ -647,11 +666,17 @@ func LoadStore(file []byte) (*Store, error) {
 	if uint64(dl.Current) > last {
 		return nil, invariant(SectionDList, "ulCurrentPage", "current AMap %d is beyond last AMap %d", dl.Current, last)
 	}
+	if h.BidNextB < FirstAllocBID || h.BidNextB&3 != 0 {
+		return nil, invariant(SectionBID, "bidNextB", "got %d, want >= %d and 4-aligned (MS-PST %s)", h.BidNextB, FirstAllocBID, SectionBID)
+	}
 	s := &Store{
 		valid:         h.Root.AMapValid,
 		lastAllocAMap: dl.Current,
 		bidNextP:      h.BidNextP,
+		bidNextB:      h.BidNextB,
 		dlistBID:      dl.Page.BID,
+		nbtRoot:       BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
+		bbtRoot:       BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
 	}
 	s.regions = make([]region, last+1)
 	for i := uint64(0); i <= last; i++ {

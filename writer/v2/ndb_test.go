@@ -169,6 +169,9 @@ func TestRefCountOwnershipAndReclaim(t *testing.T) {
 	if _, ok := n.LookupBlock(4); ok {
 		t.Fatal("block 4 should be reclaimed at cRef==1")
 	}
+	if n.Store().allocatedRange(0x5000, BlockDiskSize(16)) {
+		t.Fatal("reclaimed PutBlock extent still allocated")
+	}
 	mustNode(t, n, 0x122, 8, 0, 0)
 	if err := n.AddDataTreeRef(8); err != nil {
 		t.Fatal(err)
@@ -211,12 +214,12 @@ func TestRandomizedTreeRoundTrip(t *testing.T) {
 	n := NewNDB(NewSequentialIDs())
 	const N = 80
 	nids := rng.Perm(N)
+	blocks := make([]uint64, 17)
+	for i := range blocks {
+		blocks[i] = mustAlloc(t, n, 24).BID
+	}
 	for i, p := range nids {
-		bid := uint64(4 + 4*(p%17))
-		if _, ok := n.LookupBlock(bid); !ok {
-			mustBlock(t, n, bid, 0x4000+bid, 24)
-		}
-		mustNode(t, n, uint64(p+1), bid, 0, uint32(i))
+		mustNode(t, n, uint64(p+1), blocks[p%17], 0, uint32(i))
 	}
 	if err := n.CheckRefCounts(); err != nil {
 		t.Fatal(err)
@@ -250,12 +253,12 @@ func TestRandomizedTreeRoundTrip(t *testing.T) {
 	}
 	for _, nid := range []uint64{1, 7, 40} {
 		e, _ := n.LookupNode(nid)
-		alt := e.DataBID + 4
-		if alt > 4+4*16 {
-			alt = 4
-		}
-		if _, ok := n.LookupBlock(alt); !ok {
-			mustBlock(t, n, alt, 0x4000+alt, 24)
+		var alt uint64
+		for _, bid := range blocks {
+			if bid != e.DataBID {
+				alt = bid
+				break
+			}
 		}
 		mustNode(t, n, nid, alt, 0, e.ParentNID)
 	}
@@ -402,6 +405,10 @@ func TestPersistedReopenFollowsHeaderBREFs(t *testing.T) {
 	if h.BidNextP <= h.Root.NBTBID || h.BidNextP <= h.Root.BBTBID {
 		t.Fatalf("bidNextP %d not beyond roots nbt=%d bbt=%d", h.BidNextP, h.Root.NBTBID, h.Root.BBTBID)
 	}
+	wantB := FirstAllocBID + uint64(MaxNBTLeafEntries+1)*BlockBIDIncrement
+	if h.BidNextB != wantB {
+		t.Fatalf("bidNextB %d want %d", h.BidNextB, wantB)
+	}
 	img, err := OpenTrees(file)
 	if err != nil {
 		t.Fatal(err)
@@ -517,4 +524,161 @@ func walkLegacyNBT(t *testing.T, file []byte, root BREF) []uint64 {
 	}
 	rec(root)
 	return nids
+}
+
+func TestCommitPersistsBidNextB(t *testing.T) {
+	n := NewNDB(nil)
+	var last uint64
+	for i := 0; i < 3; i++ {
+		blk := mustAlloc(t, n, 16)
+		mustNode(t, n, uint64(0x21+i*0x20), blk.BID, 0, 0)
+		last = blk.BID
+	}
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := InspectHeader(file[:UnicodeHeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := last + BlockBIDIncrement
+	if h.BidNextB != want {
+		t.Fatalf("bidNextB %d want %d (last block %d)", h.BidNextB, want, last)
+	}
+	st, err := LoadStore(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.bidNextB != want || st.HeaderDraft().BidNextB != want {
+		t.Fatalf("loaded bidNextB %d want %d", st.bidNextB, want)
+	}
+}
+
+func TestOpenNDBMutateCommitReopen(t *testing.T) {
+	n := NewNDB(nil)
+	a := mustAlloc(t, n, 16)
+	mustNode(t, n, 0x21, a.BID, 0, 0)
+	file1, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h1, err := InspectHeader(file1[:UnicodeHeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDB(file1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n2.Store().nbtRoot.BID != h1.Root.NBTBID || n2.Store().bbtRoot.BID != h1.Root.BBTBID {
+		t.Fatalf("reopen lost header roots store=%+v header=%+v", n2.Store().HeaderDraft().Root, h1.Root)
+	}
+	if n2.ids.nextBlock != h1.BidNextB || n2.Store().bidNextB != h1.BidNextB {
+		t.Fatalf("reopen bidNextB ids=%d store=%d header=%d", n2.ids.nextBlock, n2.Store().bidNextB, h1.BidNextB)
+	}
+	if _, ok := n2.LookupNode(0x21); !ok {
+		t.Fatal("reopen missing nid 0x21")
+	}
+	b := mustAlloc(t, n2, 16)
+	if b.BID < h1.BidNextB {
+		t.Fatalf("continuation reused block BID %d < bidNextB %d", b.BID, h1.BidNextB)
+	}
+	mustNode(t, n2, 0x61, b.BID, 0, 0)
+	if err := n2.DeleteNode(0x21); err != nil {
+		t.Fatal(err)
+	}
+	file2, err := n2.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckAllocation(file2); err != nil {
+		t.Fatal(err)
+	}
+	n3, err := OpenNDB(file2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n3.LookupNode(0x21); ok {
+		t.Fatal("deleted nid 0x21 survived reopen")
+	}
+	got, ok := n3.LookupNode(0x61)
+	if !ok || got.DataBID != b.BID {
+		t.Fatalf("nid 0x61 %+v ok=%v", got, ok)
+	}
+	if _, ok := n3.LookupBlock(a.BID); ok {
+		t.Fatal("unreferenced block a survived reopen")
+	}
+	if n3.Store().allocatedRange(a.IB, BlockDiskSize(16)) {
+		t.Fatal("deleted block a still allocated after reopen")
+	}
+	c := mustAlloc(t, n3, 16)
+	if c.BID == a.BID || c.BID == b.BID {
+		t.Fatalf("reopened catalog reused BID %d", c.BID)
+	}
+	file3, err := n3.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3, err := InspectHeader(file3[:UnicodeHeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h3.BidNextB != c.BID+BlockBIDIncrement {
+		t.Fatalf("final bidNextB %d want %d", h3.BidNextB, c.BID+BlockBIDIncrement)
+	}
+}
+
+func TestPutBlockReservesAndReclaims(t *testing.T) {
+	n := NewNDB(nil)
+	const ib uint64 = 0x5000
+	mustBlock(t, n, 4, ib, 16)
+	if !n.Store().allocatedRange(ib, BlockDiskSize(16)) {
+		t.Fatal("PutBlock did not reserve Store extent")
+	}
+	mustNode(t, n, 0x21, 4, 0, 0)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckAllocation(file); err != nil {
+		t.Fatal(err)
+	}
+	img, err := OpenTrees(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := img.LookupBlock(4); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.DeleteNode(0x21); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n.LookupBlock(4); ok {
+		t.Fatal("final owner did not reclaim PutBlock record")
+	}
+	if n.Store().allocatedRange(ib, BlockDiskSize(16)) {
+		t.Fatal("final owner did not free PutBlock extent")
+	}
+}
+
+func TestPutBlockRejectsUnmappedOverlapAndMetadata(t *testing.T) {
+	n := NewNDB(nil)
+	if err := n.PutBlock(BBTEntry{BID: 4, IB: 0x1000, CB: 16}); err == nil {
+		t.Fatal("unmapped IB accepted")
+	}
+	if err := n.PutBlock(BBTEntry{BID: 4, IB: FirstAMapPageOffset, CB: 16}); err == nil {
+		t.Fatal("metadata IB accepted")
+	}
+	if err := n.PutBlock(BBTEntry{BID: 4, IB: 0x5001, CB: 16}); err == nil {
+		t.Fatal("unaligned IB accepted")
+	}
+	live := mustAlloc(t, n, 16)
+	if err := n.PutBlock(BBTEntry{BID: live.BID + 8, IB: live.IB, CB: 16}); err == nil {
+		t.Fatal("overlapping IB accepted")
+	}
+	mustBlock(t, n, live.BID+16, 0x5200, 16)
+	if err := n.PutBlock(BBTEntry{BID: live.BID + 24, IB: 0x5200, CB: 16}); err == nil {
+		t.Fatal("duplicate extent accepted")
+	}
 }

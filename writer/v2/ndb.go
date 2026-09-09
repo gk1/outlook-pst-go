@@ -48,12 +48,17 @@ func (n *NDB) Store() *Store { return n.store }
 
 // PutBlock registers a data/internal block. cRef starts at 1 (the BBTENTRY).
 // The block may be staged with no external owner; Encode/Commit reclaim it.
+// IB/CB must name an aligned, non-overlapping Store extent; PutBlock
+// Reserves it when free so reclamation can Free it later.
 func (n *NDB) PutBlock(e BBTEntry) error {
 	if e.BID == 0 || BIDHasReserved(e.BID) {
 		return invalidArg("bid", "invalid block BID 0x%x (MS-PST %s)", e.BID, SectionBID)
 	}
 	if _, exists := n.blocks[e.BID]; exists {
 		return invalidArg("bid", "duplicate BBT BID 0x%x", e.BID)
+	}
+	if err := n.occupyExtent(e); err != nil {
+		return err
 	}
 	e.RefCount = 1
 	n.blocks[e.BID] = e
@@ -72,9 +77,54 @@ func (n *NDB) AllocBlock(cb uint16) (BBTEntry, error) {
 		_ = n.store.Free(ib, size)
 		return BBTEntry{}, err
 	}
+	if err := n.store.noteBlockBID(bid); err != nil {
+		_ = n.store.Free(ib, size)
+		return BBTEntry{}, err
+	}
+	n.ids.nextBlock = n.store.bidNextB
 	e := BBTEntry{BID: bid, IB: ib, CB: cb, RefCount: 1}
 	n.blocks[bid] = e
 	return e, nil
+}
+
+func (n *NDB) occupyExtent(e BBTEntry) error {
+	if e.IB == 0 {
+		return invalidArg("ib", "block IB is null (MS-PST %s)", SectionBBTENTRY)
+	}
+	if e.IB%BytesPerSlot != 0 {
+		return invalidArg("ib", "offset 0x%x is not %d-byte aligned", e.IB, BytesPerSlot)
+	}
+	size := BlockDiskSize(uint64(e.CB))
+	if size == 0 || size > MaxAllocBytes {
+		return invalidArg("cb", "block disk size %d is invalid (cb=%d)", size, e.CB)
+	}
+	if n.store.coversMetadata(e.IB, size) {
+		return invalidArg("ib", "block at 0x%x overlaps metadata (MS-PST %s)", e.IB, SectionAMap)
+	}
+	for _, p := range n.livePages {
+		if e.IB < p+uint64(PageSize) && e.IB+size > p {
+			return invalidArg("ib", "block at 0x%x overlaps tree page 0x%x", e.IB, p)
+		}
+	}
+	for bid, other := range n.blocks {
+		if bid == e.BID {
+			continue
+		}
+		osize := BlockDiskSize(uint64(other.CB))
+		if e.IB < other.IB+osize && e.IB+size > other.IB {
+			return invalidArg("ib", "block 0x%x at 0x%x overlaps BID 0x%x at 0x%x", e.BID, e.IB, other.BID, other.IB)
+		}
+	}
+	if !n.store.allocatedRange(e.IB, size) {
+		if err := n.store.Reserve(e.IB, size); err != nil {
+			return err
+		}
+	}
+	if err := n.store.noteBlockBID(e.BID); err != nil {
+		return err
+	}
+	n.ids.nextBlock = n.store.bidNextB
+	return nil
 }
 
 // PutNode inserts or replaces an NBT entry and adjusts BBT reference counts.
@@ -240,8 +290,11 @@ func (n *NDB) freeBlockIB(e BBTEntry) error {
 		return nil
 	}
 	size := BlockDiskSize(uint64(e.CB))
-	if size == 0 || !n.store.allocatedRange(e.IB, size) {
+	if size == 0 {
 		return nil
+	}
+	if !n.store.allocatedRange(e.IB, size) {
+		return invariant(SectionAMap, "ib", "reclaim of BID 0x%x at 0x%x+%d is not allocated", e.BID, e.IB, size)
 	}
 	return n.store.Free(e.IB, size)
 }
@@ -409,8 +462,8 @@ func (n *NDB) Encode() (*TreeImage, error) {
 	return img, nil
 }
 
-// Commit writes a Unicode PST: maps, HEADER ROOT BREFNBT/BREFBBT and bidNextP,
-// and the encoded NBT/BBT pages. Reopen with OpenTrees.
+// Commit writes a Unicode PST: maps, HEADER ROOT BREFNBT/BREFBBT, bidNextP,
+// bidNextB, and the encoded NBT/BBT pages. Reopen with OpenNDB.
 func (n *NDB) Commit() ([]byte, error) {
 	img, err := n.Encode()
 	if err != nil {
@@ -720,13 +773,113 @@ func OpenTrees(file []byte) (*TreeImage, error) {
 	return img, nil
 }
 
+func (img *TreeImage) collectPageIBs() ([]uint64, error) {
+	var ibs []uint64
+	var rec func(BREF) error
+	rec = func(ref BREF) error {
+		v, err := img.page(ref)
+		if err != nil {
+			return err
+		}
+		ibs = append(ibs, ref.IB)
+		if v.Level == 0 {
+			return nil
+		}
+		for _, k := range v.Kids {
+			if err := rec(k.Ref); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := rec(img.NBTRoot); err != nil {
+		return nil, err
+	}
+	if err := rec(img.BBTRoot); err != nil {
+		return nil, err
+	}
+	return ibs, nil
+}
+
+func idsFromStore(s *Store) *SequentialIDs {
+	ids := NewSequentialIDs()
+	ids.nextBlock = s.bidNextB
+	ids.nextPage = s.bidNextP
+	return ids
+}
+
+func hydrateNDB(n *NDB, img *TreeImage) error {
+	if err := img.WalkBBT(func(e BBTEntry) error {
+		n.blocks[e.BID] = e
+		return n.store.noteBlockBID(e.BID)
+	}); err != nil {
+		return err
+	}
+	if err := img.WalkNBT(func(e NBTEntry) error {
+		n.nodes[e.NID] = e
+		return nil
+	}); err != nil {
+		return err
+	}
+	for bid, e := range n.blocks {
+		nbt := n.nbtLiveRefs(bid)
+		extra := int(e.RefCount) - 1 - nbt
+		if extra < 0 {
+			return invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
+		}
+		if extra > 0 {
+			n.dataTreeRefs[bid] = extra
+		}
+	}
+	pages, err := img.collectPageIBs()
+	if err != nil {
+		return err
+	}
+	n.livePages = pages
+	n.ids.nextBlock = n.store.bidNextB
+	n.ids.nextPage = n.store.bidNextP
+	return n.CheckRefCounts()
+}
+
+// OpenNDB reopens a committed Unicode PST for continued mutation.
+// Store maps, ROOT BREFs, live tree pages, and bidNextP/bidNextB are retained.
+func OpenNDB(file []byte) (*NDB, error) {
+	store, err := LoadStore(file)
+	if err != nil {
+		return nil, err
+	}
+	img, err := OpenTrees(file)
+	if err != nil {
+		return nil, err
+	}
+	n := &NDB{
+		store:        store,
+		ids:          idsFromStore(store),
+		nodes:        make(map[uint64]NBTEntry),
+		blocks:       make(map[uint64]BBTEntry),
+		dataTreeRefs: make(map[uint64]int),
+		subnodeRefs:  make(map[uint64]int),
+	}
+	if err := hydrateNDB(n, img); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
 // LoadTrees reconstructs an NDB from encoded NBT/BBT leaves.
+// A persisted img.File reopens through OpenNDB so Store maps survive.
 func LoadTrees(img *TreeImage, ids *SequentialIDs) (*NDB, error) {
+	if img != nil && img.File != nil {
+		return OpenNDB(img.File)
+	}
 	if err := img.CheckTrees(); err != nil {
 		return nil, err
 	}
 	n := NewNDB(ids)
 	if err := img.WalkBBT(func(e BBTEntry) error {
+		if err := n.occupyExtent(e); err != nil {
+			return err
+		}
 		n.blocks[e.BID] = e
 		return nil
 	}); err != nil {
@@ -738,7 +891,6 @@ func LoadTrees(img *TreeImage, ids *SequentialIDs) (*NDB, error) {
 	}); err != nil {
 		return nil, err
 	}
-	// Extra refs are whatever cRef remains after BBTENTRY + NBT refs.
 	for bid, e := range n.blocks {
 		nbt := n.nbtLiveRefs(bid)
 		extra := int(e.RefCount) - 1 - nbt
@@ -749,7 +901,7 @@ func LoadTrees(img *TreeImage, ids *SequentialIDs) (*NDB, error) {
 			n.dataTreeRefs[bid] = extra
 		}
 	}
-	return n, nil
+	return n, n.CheckRefCounts()
 }
 
 func (n *NDB) String() string {
