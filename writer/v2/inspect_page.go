@@ -26,13 +26,21 @@ func EncodePage(payload []byte, pageType byte, bid, offset uint64) ([]byte, erro
 	buf := make([]byte, PageSize)
 	copy(buf, payload)
 	crc := crc32PST(buf[:max])
-	sig := signature(bid, offset)
+	pageBID := bid
+	var sig uint16
+	if zeroSigPageType(pageType) {
+		// AMap/PMap/FMap/FPMap: wSig is 0 and BID equals IB. MS-PST 2.2.2.7.1.
+		pageBID = offset
+		sig = 0
+	} else {
+		sig = signature(bid, offset)
+	}
 	tr := buf[max:]
 	tr[0] = pageType
 	tr[1] = pageType
 	binary.LittleEndian.PutUint16(tr[2:4], sig)
 	binary.LittleEndian.PutUint32(tr[4:8], crc)
-	binary.LittleEndian.PutUint64(tr[8:16], bid)
+	binary.LittleEndian.PutUint64(tr[8:16], pageBID)
 	return buf, nil
 }
 
@@ -58,9 +66,18 @@ func InspectPage(raw []byte, offset uint64) (*PageView, error) {
 	}
 	bid := binary.LittleEndian.Uint64(tr[8:16])
 	gotSig := binary.LittleEndian.Uint16(tr[2:4])
-	wantSig := signature(bid, offset)
-	if gotSig != wantSig {
-		return nil, invariant(SectionSignature, "wSig", "got 0x%04x want 0x%04x for bid=0x%x ib=0x%x", gotSig, wantSig, bid, offset)
+	if zeroSigPageType(ptype) {
+		if gotSig != 0 {
+			return nil, invariant(SectionPageTrailer, "wSig", "map page wSig 0x%04x want 0 (MS-PST %s)", gotSig, SectionPageTrailer)
+		}
+		if bid != offset {
+			return nil, invariant(SectionPageTrailer, "bid", "map page bid 0x%x want IB 0x%x (MS-PST %s)", bid, offset, SectionPageTrailer)
+		}
+	} else {
+		wantSig := signature(bid, offset)
+		if gotSig != wantSig {
+			return nil, invariant(SectionSignature, "wSig", "got 0x%04x want 0x%04x for bid=0x%x ib=0x%x", gotSig, wantSig, bid, offset)
+		}
 	}
 	return &PageView{
 		Type:    ptype,

@@ -9,6 +9,11 @@ const (
 	SectionHeader       = "2.2.2.6"
 	SectionPageTrailer  = "2.2.2.7.1"
 	SectionAMap         = "2.2.2.7.2"
+	SectionPMap         = "2.2.2.7.3"
+	SectionDList        = "2.2.2.7.4"
+	SectionFMap         = "2.2.2.7.5"
+	SectionFPMap        = "2.2.2.7.6"
+	SectionGrow         = "2.6.1.1.2"
 	SectionBlockTrailer = "2.2.2.8.1"
 	SectionBlockAlign   = "2.2.2.8"
 	SectionHN           = "2.3.1"
@@ -30,8 +35,19 @@ const (
 	UnicodePageTrailer           = 16
 	UnicodeBlockTrailer          = 16
 	BytesPerSlot                 = 64
+	AMapBitmapBytes              = 496
+	SlotsPerAMap                 = AMapBitmapBytes * 8         // 3968
+	AMapCoverageBytes            = SlotsPerAMap * BytesPerSlot // 253952
+	PMapCoverageBytes            = SlotsPerAMap * PageSize     // 2031616; one PMap per 8 AMaps
+	AMapsPerPMap                 = PMapCoverageBytes / AMapCoverageBytes
+	FMapHeaderAMaps              = 128 // HEADER.rgbFM; extra FMaps start at AMap 128
+	FMapPageAMaps                = AMapBitmapBytes
+	FPMapHeaderPMaps             = 128 * 8 // HEADER.rgbFP bits
+	FPMapPagePMaps               = AMapBitmapBytes * 8
 	FirstAMapPageOffset          = 0x4400
+	FirstPMapPageOffset          = 0x4600
 	DListPageOffset              = 0x4200
+	DListMaxEntries              = 119 // Unicode: 476 bytes of 4-byte entries
 	MaxDataBlockCB               = 8176
 	UnicodeWVer                  = 23
 	UnicodeWVerMin               = 23
@@ -139,6 +155,9 @@ const (
 	PageFPMap byte = 0x85
 	PageDList byte = 0x86
 )
+
+// DList flags. See MS-PST 2.2.2.7.4.2.
+const DFLBackfillComplete byte = 0x01
 
 // Special NIDs. See MS-PST 2.4.1 / 2.7.1.
 const (

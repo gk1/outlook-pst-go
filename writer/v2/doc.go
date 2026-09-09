@@ -2,7 +2,9 @@
 //
 // This package is the isolated Unicode PST writer seam. It does not replace
 // the legacy Create / BeginWrite APIs in the root module. PST-002 implements
-// the 564-byte HEADER and 72-byte ROOT codecs. Finalize currently returns
+// the 564-byte HEADER and 72-byte ROOT codecs. PST-003 implements AMap
+// coverage from 0x4400, periodic PMap/FMap/FPMap/DList pages, and
+// allocate/free/reserve on 64-byte slots. Finalize currently returns
 // ErrNotImplemented until later NDB cards land.
 //
 // Target (locked by this package):
