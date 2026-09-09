@@ -1,6 +1,9 @@
 package writer
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"sort"
+)
 
 // ColumnView is one TCOLDESC. See MS-PST 2.3.4.2.
 type ColumnView struct {
@@ -9,6 +12,11 @@ type ColumnView struct {
 	Offset   uint16
 	Size     byte
 	Bit      byte
+}
+
+// Tag is the 32-bit property tag (propID << 16 | propType).
+func (c ColumnView) Tag() uint32 {
+	return uint32(c.PropType) | uint32(c.PropID)<<16
 }
 
 // TableView is a decoded TCINFO with inline rgTCOLDESC. See MS-PST 2.3.4.1.
@@ -23,9 +31,10 @@ type TableView struct {
 	Raw       []byte
 }
 
-// TableDraft is the input to EncodeTCINFO. Columns may be in any order;
-// the encoder groups them 8-byte, then 4-byte, then 2-byte, then 1-byte
-// and assigns ibData / iBit. Invalid sizes are rejected.
+// TableDraft is the input to EncodeTCINFO. Columns may be in any order.
+// ibData is assigned from the 8/4, 2, then 1-byte row-data groups (with
+// PidTagLtpRowId / PidTagLtpRowVer fixed when present); rgTCOLDESC is then
+// serialized sorted by the 32-bit property tag (MS-PST 2.3.4.1).
 type TableDraft struct {
 	Columns  []ColumnView
 	RowIndex uint32
@@ -47,33 +56,96 @@ func columnGroup(size byte) (int, bool) {
 	}
 }
 
-func groupColumns(cols []ColumnView) ([]ColumnView, [4]uint16, error) {
-	var groups [4][]ColumnView
-	for i, c := range cols {
-		g, ok := columnGroup(c.Size)
-		if !ok {
+func isLtpRowID(c ColumnView) bool  { return c.PropID == PidTagLtpRowId }
+func isLtpRowVer(c ColumnView) bool { return c.PropID == PidTagLtpRowVer }
+
+// assignColumnLayout copies cols, assigns ibData / iBit from row-data groups,
+// and returns the slice still in assignment order (not tag order).
+func assignColumnLayout(cols []ColumnView) ([]ColumnView, [4]uint16, error) {
+	out := append([]ColumnView(nil), cols...)
+	var rowID, rowVer int = -1, -1
+	var groups [4][]int
+	for i, c := range out {
+		if _, ok := columnGroup(c.Size); !ok {
 			return nil, [4]uint16{}, invalidArg("cbData", "column %d has invalid cbData %d (MS-PST %s allows 1,2,4,8)", i, c.Size, SectionTCOLDESC)
 		}
-		groups[g] = append(groups[g], c)
-	}
-	out := make([]ColumnView, 0, len(cols))
-	var off uint16
-	var rgib [4]uint16
-	appendGroup := func(g int) {
-		for _, c := range groups[g] {
-			c.Offset = off
-			c.Bit = byte(len(out))
-			off += uint16(c.Size)
-			out = append(out, c)
+		switch {
+		case isLtpRowID(c):
+			if rowID >= 0 {
+				return nil, [4]uint16{}, invalidArg("tag", "duplicate PidTagLtpRowId")
+			}
+			if c.Size != 4 {
+				return nil, [4]uint16{}, invalidArg("cbData", "PidTagLtpRowId cbData must be 4 (MS-PST %s)", SectionTCRowID)
+			}
+			rowID = i
+		case isLtpRowVer(c):
+			if rowVer >= 0 {
+				return nil, [4]uint16{}, invalidArg("tag", "duplicate PidTagLtpRowVer")
+			}
+			if c.Size != 4 {
+				return nil, [4]uint16{}, invalidArg("cbData", "PidTagLtpRowVer cbData must be 4 (MS-PST %s)", SectionTCRowID)
+			}
+			rowVer = i
+		default:
+			g, _ := columnGroup(c.Size)
+			groups[g] = append(groups[g], i)
 		}
 	}
-	appendGroup(0) // 8-byte
-	appendGroup(1) // 4-byte
-	rgib[0] = off  // TCI_4b
-	appendGroup(2) // 2-byte
-	rgib[1] = off  // TCI_2b
-	appendGroup(3) // 1-byte
-	rgib[2] = off  // TCI_1b
+
+	reserved := map[byte]bool{}
+	if rowID >= 0 {
+		reserved[0] = true
+	}
+	if rowVer >= 0 {
+		reserved[1] = true
+	}
+	nextBit := byte(0)
+	nextFreeBit := func() byte {
+		for reserved[nextBit] {
+			nextBit++
+		}
+		b := nextBit
+		nextBit++
+		return b
+	}
+
+	if rowID >= 0 {
+		out[rowID].Offset = 0
+		out[rowID].Bit = 0
+	}
+	if rowVer >= 0 {
+		out[rowVer].Offset = 4
+		out[rowVer].Bit = 1
+	}
+
+	off := uint16(0)
+	if rowID >= 0 || rowVer >= 0 {
+		off = 8
+	}
+	for _, i := range groups[0] { // 8-byte
+		out[i].Offset = off
+		out[i].Bit = nextFreeBit()
+		off += 8
+	}
+	for _, i := range groups[1] { // remaining 4-byte
+		out[i].Offset = off
+		out[i].Bit = nextFreeBit()
+		off += 4
+	}
+	var rgib [4]uint16
+	rgib[0] = off
+	for _, i := range groups[2] { // 2-byte
+		out[i].Offset = off
+		out[i].Bit = nextFreeBit()
+		off += 2
+	}
+	rgib[1] = off
+	for _, i := range groups[3] { // 1-byte
+		out[i].Offset = off
+		out[i].Bit = nextFreeBit()
+		off += 1
+	}
+	rgib[2] = off
 	ceb := uint16(0)
 	if n := len(out); n > 0 {
 		ceb = uint16((n + 7) / 8)
@@ -82,10 +154,27 @@ func groupColumns(cols []ColumnView) ([]ColumnView, [4]uint16, error) {
 	return out, rgib, nil
 }
 
-// EncodeTCINFO writes bType, spec-correct rgib, and inline rgTCOLDESC.
+func sortColumnsByTag(cols []ColumnView) error {
+	seen := make(map[uint32]struct{}, len(cols))
+	for _, c := range cols {
+		t := c.Tag()
+		if _, ok := seen[t]; ok {
+			return invalidArg("tag", "duplicate property tag 0x%08x", t)
+		}
+		seen[t] = struct{}{}
+	}
+	sort.Slice(cols, func(i, j int) bool { return cols[i].Tag() < cols[j].Tag() })
+	return nil
+}
+
+// EncodeTCINFO writes bType, spec-correct rgib, and inline rgTCOLDESC sorted
+// by 32-bit property tag. ibData follows the 8/4, 2, 1-byte row groups.
 func EncodeTCINFO(d TableDraft) ([]byte, error) {
-	cols, rgib, err := groupColumns(d.Columns)
+	cols, rgib, err := assignColumnLayout(d.Columns)
 	if err != nil {
+		return nil, err
+	}
+	if err := sortColumnsByTag(cols); err != nil {
 		return nil, err
 	}
 	n := len(cols)
@@ -109,8 +198,9 @@ func EncodeTCINFO(d TableDraft) ([]byte, error) {
 	return buf, nil
 }
 
-// InspectTable validates TCINFO including the inline rgTCOLDESC array,
-// descriptor grouping (8,4,2,1), ibData packing, and rgib geometry.
+// InspectTable validates TCINFO including the inline rgTCOLDESC array.
+// Descriptors MUST be sorted by 32-bit property tag (MS-PST 2.3.4.1).
+// ibData packing is checked by size group, not by descriptor order.
 func InspectTable(raw []byte) (*TableView, error) {
 	if len(raw) < TCINFOFixedSize {
 		return nil, invariant(SectionTCINFO, "size", "TCINFO is %d bytes, need at least %d", len(raw), TCINFOFixedSize)
@@ -167,60 +257,137 @@ func InspectTable(raw []byte) (*TableView, error) {
 }
 
 func validateColumnLayout(cols []ColumnView, rgib [4]uint16) error {
-	var lastGroup = -1
 	for i, c := range cols {
-		g, ok := columnGroup(c.Size)
-		if !ok {
+		if _, ok := columnGroup(c.Size); !ok {
 			return invariant(SectionTCOLDESC, "cbData", "column %d cbData %d is not 1, 2, 4, or 8", i, c.Size)
 		}
-		if g < lastGroup {
-			return invariant(SectionTCOLDESC, "order", "column %d size %d is out of 8/4/2/1 group order (MS-PST %s)", i, c.Size, SectionRowMatrix)
-		}
-		lastGroup = g
 	}
-	var packed uint16
-	var sum8, sum4, sum2, sum1 uint16
+	for i := 1; i < len(cols); i++ {
+		if cols[i].Tag() <= cols[i-1].Tag() {
+			return invariant(SectionTCINFO, "tag", "rgTCOLDESC not strictly sorted by 32-bit property tag at column %d (0x%08x then 0x%08x; MS-PST %s)", i, cols[i-1].Tag(), cols[i].Tag(), SectionTCINFO)
+		}
+	}
+	if err := validateSpecialColumns(cols); err != nil {
+		return err
+	}
+	return validateIbDataGroups(cols, rgib)
+}
+
+func validateSpecialColumns(cols []ColumnView) error {
 	for i, c := range cols {
-		g, _ := columnGroup(c.Size)
-		if c.Offset != packed {
-			return invariant(SectionTCOLDESC, "ibData", "column %d ibData %d, packed offset %d", i, c.Offset, packed)
-		}
-		packed += uint16(c.Size)
-		switch g {
-		case 0:
-			sum8 += uint16(c.Size)
-		case 1:
-			sum4 += uint16(c.Size)
-		case 2:
-			sum2 += uint16(c.Size)
-		case 3:
-			sum1 += uint16(c.Size)
-		}
-		switch g {
-		case 0, 1:
-			if c.Offset >= rgib[0] && rgib[0] != packed && c.Offset+uint16(c.Size) > rgib[0] {
-				return invariant(SectionTCINFO, "rgib", "column %d (size %d) extends past TCI_4b=%d", i, c.Size, rgib[0])
+		switch {
+		case isLtpRowID(c):
+			if c.Size != 4 || c.Offset != 0 || c.Bit != 0 {
+				return invariant(SectionTCRowID, "PidTagLtpRowId", "column %d PidTagLtpRowId must have iBit=0 ibData=0 cbData=4 (got iBit=%d ibData=%d cbData=%d)", i, c.Bit, c.Offset, c.Size)
 			}
-		case 2:
-			if c.Offset < rgib[0] || c.Offset >= rgib[1] {
-				return invariant(SectionTCINFO, "rgib", "2-byte column %d ibData %d not in [%d,%d)", i, c.Offset, rgib[0], rgib[1])
+		case isLtpRowVer(c):
+			if c.Size != 4 || c.Offset != 4 || c.Bit != 1 {
+				return invariant(SectionTCRowID, "PidTagLtpRowVer", "column %d PidTagLtpRowVer must have iBit=1 ibData=4 cbData=4 (got iBit=%d ibData=%d cbData=%d)", i, c.Bit, c.Offset, c.Size)
 			}
-		case 3:
-			if c.Offset < rgib[1] || c.Offset >= rgib[2] {
-				return invariant(SectionTCINFO, "rgib", "1-byte column %d ibData %d not in [%d,%d)", i, c.Offset, rgib[1], rgib[2])
+		default:
+			if c.Bit == 0 && hasPropID(cols, PidTagLtpRowId) {
+				return invariant(SectionTCRowID, "iBit", "column %d reuses PidTagLtpRowId iBit 0", i)
+			}
+			if c.Bit == 1 && hasPropID(cols, PidTagLtpRowVer) {
+				return invariant(SectionTCRowID, "iBit", "column %d reuses PidTagLtpRowVer iBit 1", i)
 			}
 		}
 	}
-	want4 := sum8 + sum4
-	want2 := want4 + sum2
-	want1 := want2 + sum1
+	return nil
+}
+
+func hasPropID(cols []ColumnView, id uint16) bool {
+	for _, c := range cols {
+		if c.PropID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func packedOffsets(start uint16, width, n int) []uint16 {
+	out := make([]uint16, n)
+	off := start
+	for i := 0; i < n; i++ {
+		out[i] = off
+		off += uint16(width)
+	}
+	return out
+}
+
+func sortedOffsets(cols []ColumnView) []uint16 {
+	out := make([]uint16, len(cols))
+	for i, c := range cols {
+		out[i] = c.Offset
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func sameOffsets(got, want []uint16) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateIbDataGroups(cols []ColumnView, rgib [4]uint16) error {
+	var eights, fours, twos, ones []ColumnView
+	hasID, hasVer := false, false
+	for _, c := range cols {
+		switch {
+		case isLtpRowID(c):
+			hasID = true
+		case isLtpRowVer(c):
+			hasVer = true
+		default:
+			switch c.Size {
+			case 8:
+				eights = append(eights, c)
+			case 4:
+				fours = append(fours, c)
+			case 2:
+				twos = append(twos, c)
+			case 1:
+				ones = append(ones, c)
+			}
+		}
+	}
+	start := uint16(0)
+	if hasID || hasVer {
+		start = 8
+	}
+	want8 := packedOffsets(start, 8, len(eights))
+	if !sameOffsets(sortedOffsets(eights), want8) {
+		return invariant(SectionTCOLDESC, "ibData", "8-byte ibData %v want packed %v (MS-PST %s)", sortedOffsets(eights), want8, SectionRowMatrix)
+	}
+	want4 := packedOffsets(start+uint16(8*len(eights)), 4, len(fours))
+	if !sameOffsets(sortedOffsets(fours), want4) {
+		return invariant(SectionTCOLDESC, "ibData", "4-byte ibData %v want packed %v (MS-PST %s)", sortedOffsets(fours), want4, SectionRowMatrix)
+	}
+	want4b := start + uint16(8*len(eights)+4*len(fours))
+	want2 := packedOffsets(want4b, 2, len(twos))
+	if !sameOffsets(sortedOffsets(twos), want2) {
+		return invariant(SectionTCOLDESC, "ibData", "2-byte ibData %v want packed %v (MS-PST %s)", sortedOffsets(twos), want2, SectionRowMatrix)
+	}
+	want2b := want4b + uint16(2*len(twos))
+	want1 := packedOffsets(want2b, 1, len(ones))
+	if !sameOffsets(sortedOffsets(ones), want1) {
+		return invariant(SectionTCOLDESC, "ibData", "1-byte ibData %v want packed %v (MS-PST %s)", sortedOffsets(ones), want1, SectionRowMatrix)
+	}
+	want1b := want2b + uint16(len(ones))
 	ceb := uint16(0)
 	if n := len(cols); n > 0 {
 		ceb = uint16((n + 7) / 8)
 	}
-	wantBM := want1 + ceb
-	if rgib[0] != want4 || rgib[1] != want2 || rgib[2] != want1 || rgib[3] != wantBM {
-		return invariant(SectionTCINFO, "rgib", "rgib=%v want TCI_4b=%d TCI_2b=%d TCI_1b=%d TCI_bm=%d (MS-PST %s)", rgib, want4, want2, want1, wantBM, SectionRowMatrix)
+	wantBM := want1b + ceb
+	if rgib[0] != want4b || rgib[1] != want2b || rgib[2] != want1b || rgib[3] != wantBM {
+		return invariant(SectionTCINFO, "rgib", "rgib=%v want TCI_4b=%d TCI_2b=%d TCI_1b=%d TCI_bm=%d (MS-PST %s)", rgib, want4b, want2b, want1b, wantBM, SectionRowMatrix)
 	}
 	return nil
 }

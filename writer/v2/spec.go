@@ -15,6 +15,7 @@ const (
 	SectionTCINFO       = "2.3.4.1"
 	SectionTCOLDESC     = "2.3.4.2"
 	SectionRowMatrix    = "2.3.4.4"
+	SectionTCRowID      = "2.3.4.4.1"
 	SectionMinPST       = "2.7.1"
 	SectionCRC          = "5.3"
 	SectionSignature    = "5.5"
@@ -42,6 +43,10 @@ const (
 	TCINFOFixedSize     = 22
 	TCOLDESCSize        = 8
 	HeapSigTC           = 0x7C
+
+	// PidTagLtpRowId / PidTagLtpRowVer. See MS-PST 2.3.4.4.1.
+	PidTagLtpRowId  uint16 = 0x67F2
+	PidTagLtpRowVer uint16 = 0x67F3
 )
 
 // Unicode HEADER field offsets. See MS-PST 2.2.2.6.
