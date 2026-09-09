@@ -1,0 +1,18 @@
+{
+  "case": "one-message",
+  "folders": 3,
+  "messages": 1,
+  "plan_sha256": "ed68eb3bfee3afdf2d60640992b4af9779efa41eafaf6b6ab8975f67bbf466a8",
+  "subjects": [
+    "Hello"
+  ],
+  "importance": [
+    1
+  ],
+  "sensitivity": [
+    0
+  ],
+  "body_text_sha256": [
+    "90aa29738b78cfd6b4baaea7e40652fc79a95bf2f92a0981d444ebb8bc49de0f"
+  ]
+}

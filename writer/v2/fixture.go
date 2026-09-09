@@ -49,6 +49,8 @@ func Generate(c Case, opts Options) (Plan, []byte, error) {
 			From:              Recipient{Name: "Alice", Email: "alice@example.com", Type: RecipTo},
 			To:                []Recipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
 			InternetMessageID: "<hello@example.com>",
+			Importance:        ImportanceNormal,
+			Sensitivity:       SensitivityNormal,
 		})
 		if err != nil {
 			return Plan{}, nil, err
@@ -60,10 +62,12 @@ func Generate(c Case, opts Options) (Plan, []byte, error) {
 		}
 		payload := []byte("attachment-bytes")
 		_, err = exp.CreateMessage(inbox, MessageSpec{
-			Subject:  "with attachment",
-			BodyText: "see attached",
-			From:     Recipient{Name: "Alice", Email: "alice@example.com"},
-			To:       []Recipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
+			Subject:     "with attachment",
+			BodyText:    "see attached",
+			From:        Recipient{Name: "Alice", Email: "alice@example.com"},
+			To:          []Recipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
+			Importance:  ImportanceNormal,
+			Sensitivity: SensitivityNormal,
 			Attachments: []AttachmentSpec{{
 				Filename: "note.txt",
 				MIMEType: "text/plain",
@@ -81,10 +85,12 @@ func Generate(c Case, opts Options) (Plan, []byte, error) {
 		}
 		body := strings.Repeat("A", MaxDataBlockCB+64) // forces XBLOCK in later codecs
 		_, err = exp.CreateMessage(inbox, MessageSpec{
-			Subject:  "large",
-			BodyText: body,
-			From:     Recipient{Name: "Alice", Email: "alice@example.com"},
-			To:       []Recipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
+			Subject:     "large",
+			BodyText:    body,
+			From:        Recipient{Name: "Alice", Email: "alice@example.com"},
+			To:          []Recipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
+			Importance:  ImportanceHigh,
+			Sensitivity: SensitivityPrivate,
 		})
 		if err != nil {
 			return Plan{}, nil, err

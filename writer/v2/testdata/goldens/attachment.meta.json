@@ -1,0 +1,21 @@
+{
+  "case": "attachment",
+  "folders": 3,
+  "messages": 1,
+  "plan_sha256": "673a0aa5c3c89d3894d9bcfc5fcfe0d3084ab37df8ec17a58e8f128ffa38f2be",
+  "subjects": [
+    "with attachment"
+  ],
+  "importance": [
+    1
+  ],
+  "sensitivity": [
+    0
+  ],
+  "body_text_sha256": [
+    "dd4ab899cfe2c06dd591274b4dbbb253cec7d4799eba446892770419e2921c29"
+  ],
+  "attachment_sha256": [
+    "0e22a93c611048eae817350dbce895ca674555e54a921a7f90d36f3e14cd005c"
+  ]
+}

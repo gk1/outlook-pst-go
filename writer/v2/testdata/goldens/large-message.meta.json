@@ -1,0 +1,18 @@
+{
+  "case": "large-message",
+  "folders": 3,
+  "messages": 1,
+  "plan_sha256": "416a2ee4e265f02f4e41b1e41b510b0b52269279e5c7c8c757efde741a1be17b",
+  "subjects": [
+    "large"
+  ],
+  "importance": [
+    2
+  ],
+  "sensitivity": [
+    2
+  ],
+  "body_text_sha256": [
+    "47f100ebbf9f1e5f4bfbe388411c323fba51836a3861c2a75ee22039c8908264"
+  ]
+}

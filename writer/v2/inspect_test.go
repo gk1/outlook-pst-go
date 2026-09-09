@@ -155,8 +155,17 @@ func diskAlignPlusTrailer(data []byte) []byte {
 	return buf
 }
 
+func mustEncodeTC(t *testing.T, d TableDraft) []byte {
+	t.Helper()
+	raw, err := EncodeTCINFO(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 func TestInspectTableMalformedSignature(t *testing.T) {
-	raw := EncodeTCINFO(TableDraft{Columns: []ColumnView{
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
 		{PropType: 0x001F, PropID: 0x0037, Offset: 0, Size: 4, Bit: 0},
 	}})
 	_, err := InspectTable(raw)
@@ -169,7 +178,7 @@ func TestInspectTableMalformedSignature(t *testing.T) {
 }
 
 func TestInspectTableMissingColumnArray(t *testing.T) {
-	raw := EncodeTCINFO(TableDraft{Columns: []ColumnView{
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
 		{PropType: 0x001F, PropID: 0x0037, Size: 4, Bit: 0},
 		{PropType: 0x0040, PropID: 0x0E06, Size: 8, Bit: 1},
 	}})
@@ -178,7 +187,7 @@ func TestInspectTableMissingColumnArray(t *testing.T) {
 }
 
 func TestInspectTableRgIBNotMonotonic(t *testing.T) {
-	raw := EncodeTCINFO(TableDraft{Columns: []ColumnView{
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
 		{PropType: 0x0003, PropID: 0x0E08, Size: 4, Bit: 0},
 	}})
 	raw[2] = 8
@@ -187,6 +196,86 @@ func TestInspectTableRgIBNotMonotonic(t *testing.T) {
 	raw[5] = 0
 	_, err := InspectTable(raw)
 	mustInvariant(t, err, SectionTCINFO, "rgib")
+}
+
+func TestInspectTableRejectsUnsortedDescriptors(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0040, PropID: 0x0E06, Size: 8},
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+	}})
+	// Swap the two TCOLDESC records so 4-byte precedes 8-byte.
+	a, b := TCINFOFixedSize, TCINFOFixedSize+TCOLDESCSize
+	tmp := append([]byte(nil), raw[a:b]...)
+	copy(raw[a:b], raw[b:b+TCOLDESCSize])
+	copy(raw[b:b+TCOLDESCSize], tmp)
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCOLDESC, "order")
+}
+
+func TestInspectTableRejectsSimplifiedRgIB(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+		{PropType: 0x0002, PropID: 0x0E17, Size: 2},
+	}})
+	view, err := InspectTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.RgIB != ([4]uint16{4, 6, 6, 7}) {
+		t.Fatalf("grouped rgib=%v", view.RgIB)
+	}
+	// Old simplified encoder set TCI_4b=TCI_2b=TCI_1b=data-end.
+	raw[2], raw[3] = 6, 0
+	_, err = InspectTable(raw)
+	mustInvariant(t, err, SectionTCINFO, "rgib")
+}
+
+func TestInspectTableRejectsInvalidColumnSize(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+	}})
+	raw[TCINFOFixedSize+6] = 3
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCOLDESC, "cbData")
+}
+
+func TestInspectTableRejectsUnpackedIbData(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 1, Size: 4},
+		{PropType: 0x0003, PropID: 2, Size: 4},
+	}})
+	off := TCINFOFixedSize + TCOLDESCSize + 4
+	raw[off] = 0
+	raw[off+1] = 0
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCOLDESC, "ibData")
+}
+
+func TestEncodeTCINFORejectsInvalidSize(t *testing.T) {
+	_, err := EncodeTCINFO(TableDraft{Columns: []ColumnView{{Size: 3, PropID: 1}}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestEncodeTCINFOGroupsEightBeforeFour(t *testing.T) {
+	raw, err := EncodeTCINFO(TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0001, Size: 4},
+		{PropType: 0x0040, PropID: 0x0002, Size: 8},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := InspectTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Columns[0].Size != 8 || view.Columns[1].Size != 4 {
+		t.Fatalf("order %+v", view.Columns)
+	}
+	if view.Columns[0].Offset != 0 || view.Columns[1].Offset != 8 {
+		t.Fatalf("offsets %+v", view.Columns)
+	}
 }
 
 func mustInvariant(t *testing.T, err error, section, field string) {

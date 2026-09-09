@@ -1,8 +1,10 @@
 package writer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -17,6 +19,7 @@ type session struct {
 	nextFold FolderRef
 	nextMsg  MessageRef
 	folders  map[FolderRef]PlannedFolder
+	content  map[MessageRef]MessageContent
 	plan     Plan
 }
 
@@ -35,6 +38,7 @@ func New(opts Options) (Exporter, error) {
 		nextFold: IPMSubtreeRef + 1,
 		nextMsg:  1,
 		folders:  make(map[FolderRef]PlannedFolder),
+		content:  make(map[MessageRef]MessageContent),
 		plan: Plan{
 			Version:     1,
 			DisplayName: opts.DisplayName,
@@ -133,6 +137,12 @@ func (s *session) CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, 
 	if err := rejectUnsupportedMessage(msg); err != nil {
 		return 0, err
 	}
+	if err := validateImportance(msg.Importance); err != nil {
+		return 0, err
+	}
+	if err := validateSensitivity(msg.Sensitivity); err != nil {
+		return 0, err
+	}
 	class := msg.Class
 	if class == "" {
 		class = "IPM.Note"
@@ -144,11 +154,14 @@ func (s *session) CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, 
 	if len(msg.Attachments) > s.opts.Limits.MaxAttachmentsPerMessage {
 		return 0, limitErr("MaxAttachmentsPerMessage", "%d attachments exceeds %d", len(msg.Attachments), s.opts.Limits.MaxAttachmentsPerMessage)
 	}
-	atts, attBytes, err := snapshotAttachments(msg.Attachments, s.opts.Limits)
+	bodyBytes := int64(len(msg.BodyText) + len(msg.BodyHTML) + len(msg.InternetHeaders))
+	if bodyBytes > s.opts.Limits.MaxMessageBytes {
+		return 0, limitErr("MaxMessageBytes", "message body %d exceeds %d", bodyBytes, s.opts.Limits.MaxMessageBytes)
+	}
+	atts, stored, attBytes, err := snapshotAttachments(msg.Attachments, s.opts.Limits, s.opts.Limits.MaxMessageBytes-bodyBytes)
 	if err != nil {
 		return 0, err
 	}
-	bodyBytes := int64(len(msg.BodyText) + len(msg.BodyHTML) + len(msg.InternetHeaders))
 	if bodyBytes+attBytes > s.opts.Limits.MaxMessageBytes {
 		return 0, limitErr("MaxMessageBytes", "message payload %d exceeds %d", bodyBytes+attBytes, s.opts.Limits.MaxMessageBytes)
 	}
@@ -162,30 +175,41 @@ func (s *session) CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, 
 	ref := s.nextMsg
 	s.nextMsg++
 	pm := PlannedMessage{
-		Ref:          ref,
-		NID:          s.opts.IDs.NextNID(NIDTypeNormalMessage),
-		Folder:       folder,
-		Subject:      msg.Subject,
-		Class:        class,
-		BodyTextLen:  len(msg.BodyText),
-		BodyHTMLLen:  len(msg.BodyHTML),
-		From:         planRecip(msg.From),
-		To:           planRecips(msg.To),
-		Cc:           planRecips(msg.Cc),
-		Bcc:          planRecips(msg.Bcc),
-		SentNano:     ts(msg.Sent),
-		RecvNano:     ts(msg.Received),
-		CreatedNano:  ts(msg.Created),
-		ModifiedNano: ts(msg.Modified),
-		Read:         msg.Read,
-		Draft:        msg.Draft,
-		Importance:   msg.Importance,
-		InternetID:   msg.InternetMessageID,
-		SearchKey:    keyHex(s.opts.IDs.NextSearchKey()),
-		RecordKey:    keyHex(s.opts.IDs.NextRecordKey()),
-		Attachments:  atts,
+		Ref:            ref,
+		NID:            s.opts.IDs.NextNID(NIDTypeNormalMessage),
+		Folder:         folder,
+		Subject:        msg.Subject,
+		Class:          class,
+		BodyTextLen:    len(msg.BodyText),
+		BodyHTMLLen:    len(msg.BodyHTML),
+		HeadersLen:     len(msg.InternetHeaders),
+		BodyTextSHA256: sha256Hex(msg.BodyText),
+		BodyHTMLSHA256: sha256Hex(msg.BodyHTML),
+		HeadersSHA256:  sha256Hex(msg.InternetHeaders),
+		From:           planRecip(msg.From),
+		To:             planRecips(msg.To),
+		Cc:             planRecips(msg.Cc),
+		Bcc:            planRecips(msg.Bcc),
+		SentNano:       ts(msg.Sent),
+		RecvNano:       ts(msg.Received),
+		CreatedNano:    ts(msg.Created),
+		ModifiedNano:   ts(msg.Modified),
+		Read:           msg.Read,
+		Draft:          msg.Draft,
+		Importance:     msg.Importance,
+		Sensitivity:    msg.Sensitivity,
+		InternetID:     msg.InternetMessageID,
+		SearchKey:      keyHex(s.opts.IDs.NextSearchKey()),
+		RecordKey:      keyHex(s.opts.IDs.NextRecordKey()),
+		Attachments:    atts,
 	}
 	s.plan.Messages = append(s.plan.Messages, pm)
+	s.content[ref] = MessageContent{
+		BodyText:        msg.BodyText,
+		BodyHTML:        msg.BodyHTML,
+		InternetHeaders: msg.InternetHeaders,
+		Attachments:     stored,
+	}
 	return ref, nil
 }
 
@@ -204,33 +228,77 @@ func planRecips(in []Recipient) []PlannedRecipient {
 	return out
 }
 
-func snapshotAttachments(in []AttachmentSpec, lim Limits) ([]PlannedAttachment, int64, error) {
+func validateImportance(v Importance) error {
+	switch v {
+	case ImportanceLow, ImportanceNormal, ImportanceHigh:
+		return nil
+	default:
+		return invalidArg("importance", "PidTagImportance must be 0=low, 1=normal, or 2=high; got %d", v)
+	}
+}
+
+func validateSensitivity(v Sensitivity) error {
+	switch v {
+	case SensitivityNormal, SensitivityPersonal, SensitivityPrivate, SensitivityConfidential:
+		return nil
+	default:
+		return invalidArg("sensitivity", "PidTagSensitivity must be 0=normal, 1=personal, 2=private, or 3=confidential; got %d", v)
+	}
+}
+
+func snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]PlannedAttachment, []AttachmentContent, int64, error) {
 	if len(in) == 0 {
-		return []PlannedAttachment{}, 0, nil
+		return []PlannedAttachment{}, []AttachmentContent{}, 0, nil
 	}
 	out := make([]PlannedAttachment, 0, len(in))
+	stored := make([]AttachmentContent, 0, len(in))
 	var total int64
 	for i, a := range in {
 		if a.OLE {
-			return nil, 0, unsupported(FeatureOLE, fmt.Sprintf("attachment %d", i))
+			return nil, nil, 0, unsupported(FeatureOLE, fmt.Sprintf("attachment %d", i))
 		}
 		if a.Embedded != nil {
-			return nil, 0, unsupported(FeatureEmbeddedMessage, fmt.Sprintf("attachment %d", i))
+			return nil, nil, 0, unsupported(FeatureEmbeddedMessage, fmt.Sprintf("attachment %d", i))
 		}
 		if a.Body == nil {
-			return nil, 0, invalidArg("body", "attachment %d has nil Body", i)
+			return nil, nil, 0, invalidArg("body", "attachment %d has nil Body", i)
 		}
-		sum := sha256.New()
-		n, err := io.Copy(sum, a.Body)
+		budget := lim.MaxAttachmentBytes
+		left := remain - total
+		if left < budget {
+			budget = left
+		}
+		if budget < 0 {
+			budget = 0
+		}
+		if a.Size > 0 {
+			if a.Size > lim.MaxAttachmentBytes {
+				return nil, nil, 0, limitErr("MaxAttachmentBytes", "attachment %d declared size %d exceeds %d", i, a.Size, lim.MaxAttachmentBytes)
+			}
+			if a.Size > left {
+				return nil, nil, 0, limitErr("MaxMessageBytes", "attachment %d declared size %d exceeds remaining %d", i, a.Size, left)
+			}
+			budget = a.Size
+		}
+		data, err := readBounded(a.Body, budget)
 		if err != nil {
-			return nil, 0, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+			if errors.Is(err, ErrLimit) {
+				if a.Size > 0 {
+					return nil, nil, 0, invalidArg("size", "attachment %d read more than declared size %d", i, a.Size)
+				}
+				if left < lim.MaxAttachmentBytes {
+					return nil, nil, 0, limitErr("MaxMessageBytes", "attachment %d exceeds remaining message budget %d", i, left)
+				}
+				return nil, nil, 0, limitErr("MaxAttachmentBytes", "attachment %d exceeds %d bytes (stopped after %d)", i, lim.MaxAttachmentBytes, budget+1)
+			}
+			return nil, nil, 0, err
 		}
+		n := int64(len(data))
 		if a.Size > 0 && n != a.Size {
-			return nil, 0, invalidArg("size", "attachment %d size %d != read %d", i, a.Size, n)
+			return nil, nil, 0, invalidArg("size", "attachment %d size %d != read %d", i, a.Size, n)
 		}
-		if n > lim.MaxAttachmentBytes {
-			return nil, 0, limitErr("MaxAttachmentBytes", "attachment %d is %d bytes", i, n)
-		}
+		sum := sha256.Sum256(data)
+		hex := fmt.Sprintf("%x", sum[:])
 		total += n
 		out = append(out, PlannedAttachment{
 			Filename:  a.Filename,
@@ -238,10 +306,35 @@ func snapshotAttachments(in []AttachmentSpec, lim Limits) ([]PlannedAttachment, 
 			ContentID: a.ContentID,
 			Inline:    a.Inline,
 			Size:      n,
-			SHA256:    fmt.Sprintf("%x", sum.Sum(nil)),
+			SHA256:    hex,
+		})
+		stored = append(stored, AttachmentContent{
+			Filename:  a.Filename,
+			MIMEType:  a.MIMEType,
+			ContentID: a.ContentID,
+			Inline:    a.Inline,
+			SHA256:    hex,
+			Bytes:     data,
 		})
 	}
-	return out, total, nil
+	return out, stored, total, nil
+}
+
+// readBounded copies at most cap bytes. Reading cap+1 bytes is a limit error
+// so a huge/unbounded stream is not consumed to EOF.
+func readBounded(r io.Reader, capn int64) ([]byte, error) {
+	if capn < 0 {
+		capn = 0
+	}
+	var buf bytes.Buffer
+	n, err := buf.ReadFrom(io.LimitReader(r, capn+1))
+	if err != nil {
+		return nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+	}
+	if n > capn {
+		return nil, limitErr("read", "payload exceeds %d bytes", capn)
+	}
+	return buf.Bytes(), nil
 }
 
 func rejectUnsupportedMessage(msg MessageSpec) error {
@@ -267,6 +360,17 @@ func (s *session) Plan() Plan { return s.plan }
 
 func (s *session) EncodePlan() ([]byte, error) { return EncodePlan(s.plan) }
 
+func (s *session) MessageContent(ref MessageRef) (MessageContent, error) {
+	if err := s.check(); err != nil {
+		return MessageContent{}, err
+	}
+	c, ok := s.content[ref]
+	if !ok {
+		return MessageContent{}, invalidArg("ref", "unknown message ref %d", ref)
+	}
+	return c, nil
+}
+
 func (s *session) Finalize(ctx context.Context) error {
 	if err := s.check(); err != nil {
 		return err
@@ -276,7 +380,7 @@ func (s *session) Finalize(ctx context.Context) error {
 	}
 	return &Error{
 		Code:   CodeNotImplemented,
-		Detail: "Unicode PST codecs are implemented by PST-002 and later; this card only locks the contract and oracle",
+		Detail: "Unicode PST codecs are implemented by PST-002 and later; message content is retained on the exporter for that materialization",
 		Err:    ErrNotImplemented,
 	}
 }

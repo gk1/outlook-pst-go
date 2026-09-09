@@ -28,6 +28,27 @@ const (
 	RecipBcc RecipType = 3
 )
 
+// Importance is PidTagImportance (MS-OXCMSG / MS-OXPROPS).
+// These are the on-wire MAPI values: 0=low, 1=normal, 2=high.
+type Importance int
+
+const (
+	ImportanceLow    Importance = 0
+	ImportanceNormal Importance = 1
+	ImportanceHigh   Importance = 2
+)
+
+// Sensitivity is PidTagSensitivity, a distinct MAPI property from Importance.
+// On-wire: 0=normal, 1=personal, 2=private, 3=confidential.
+type Sensitivity int
+
+const (
+	SensitivityNormal       Sensitivity = 0
+	SensitivityPersonal     Sensitivity = 1
+	SensitivityPrivate      Sensitivity = 2
+	SensitivityConfidential Sensitivity = 3
+)
+
 // Mailbox is the top-level export description.
 type Mailbox struct {
 	DisplayName string
@@ -46,7 +67,8 @@ type Recipient struct {
 	Type  RecipType
 }
 
-// AttachmentSpec is a by-value attachment. Body is read once during CreateMessage.
+// AttachmentSpec is a by-value attachment. Body is read once during CreateMessage
+// with a bounded LimitReader; bytes are retained for Finalize.
 // Size, if > 0, is the expected byte count; a mismatch is ErrInvalidArg.
 type AttachmentSpec struct {
 	Filename  string
@@ -78,19 +100,41 @@ type MessageSpec struct {
 	Modified          time.Time
 	Read              bool
 	Draft             bool
-	Importance        int // 0=normal, 1=personal, 2=private, 3=confidential — stored as-is
+	Importance        Importance
+	Sensitivity       Sensitivity
 	Class             string
 	Attachments       []AttachmentSpec
 }
 
+// AttachmentContent is the retained by-value payload for later codecs.
+type AttachmentContent struct {
+	Filename  string
+	MIMEType  string
+	ContentID string
+	Inline    bool
+	SHA256    string
+	Bytes     []byte
+}
+
+// MessageContent is the retained body/headers/attachments for a message.
+// CreateMessage stores this so Finalize (PST-002+) can materialize PST bytes.
+type MessageContent struct {
+	BodyText        string
+	BodyHTML        string
+	InternetHeaders string
+	Attachments     []AttachmentContent
+}
+
 // Exporter is the minimal email-export contract. It records a deterministic
-// Plan; PST codecs (PST-002+) materialize bytes on Finalize.
+// Plan and retains message content for the write lifecycle. PST codecs
+// (PST-002+) materialize bytes on Finalize.
 type Exporter interface {
 	CreateMailbox(Mailbox) error
 	CreateFolder(FolderSpec) (FolderRef, error)
 	CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, error)
 	Plan() Plan
 	EncodePlan() ([]byte, error)
+	MessageContent(MessageRef) (MessageContent, error)
 	Finalize(ctx context.Context) error
 	Close() error
 }

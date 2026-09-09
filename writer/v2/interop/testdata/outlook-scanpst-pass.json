@@ -1,0 +1,23 @@
+{
+  "file": "qualification/sample.pst",
+  "when": "2026-09-08T00:00:00Z",
+  "goos": "windows",
+  "results": [
+    {
+      "tool": "outlook",
+      "available": true,
+      "status": "pass",
+      "version": "Outlook 16",
+      "log": "Outlook opened the file; no repair prompt",
+      "source": "imported"
+    },
+    {
+      "tool": "scanpst",
+      "available": true,
+      "status": "pass",
+      "version": "SCANPST.EXE",
+      "log": "scanpst.exe /n reported no errors",
+      "source": "imported"
+    }
+  ]
+}

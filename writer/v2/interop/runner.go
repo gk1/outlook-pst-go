@@ -4,6 +4,7 @@
 package interop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,12 @@ const (
 	StatusSkipped Status = "skipped"
 )
 
+// How a Result was produced.
+const (
+	SourceProbe    = "probe"    // this process looked up / executed the tool
+	SourceImported = "imported" // recorded from an actual Outlook/scanpst run
+)
+
 // Result is one tool's record.
 type Result struct {
 	Tool      string `json:"tool"`
@@ -43,6 +50,7 @@ type Result struct {
 	Version   string `json:"version,omitempty"`
 	Path      string `json:"path,omitempty"`
 	Log       string `json:"log,omitempty"`
+	Source    string `json:"source,omitempty"`
 }
 
 // Manifest is the interoperability report for one file.
@@ -54,12 +62,16 @@ type Manifest struct {
 }
 
 // Options control Lookups. All fields optional.
+// Imported and ImportPath overlay probe results so actual Outlook/scanpst
+// pass/fail evidence can be checked in without requiring Windows here.
 type Options struct {
 	Now          time.Time
 	LookPath     func(string) (string, error)
 	LibpffNames  []string
 	OutlookNames []string
 	ScanpstNames []string
+	Imported     []Result
+	ImportPath   string
 }
 
 func (o Options) withDefaults() Options {
@@ -92,10 +104,15 @@ func Run(ctx context.Context, path string, opts Options) (Manifest, error) {
 		abs = path
 	}
 	m := Manifest{File: abs, When: opts.Now.UTC(), GOOS: runtime.GOOS}
-	m.Results = append(m.Results, runSelf(path))
-	m.Results = append(m.Results, runExternal(ctx, opts, ToolLibpff, opts.LibpffNames, path)...)
-	m.Results = append(m.Results, skipOrFound(opts, ToolOutlook, opts.OutlookNames))
-	m.Results = append(m.Results, skipOrFound(opts, ToolScanPST, opts.ScanpstNames))
+	m.Results = append(m.Results, withSource(runSelf(path), SourceProbe))
+	for _, r := range runExternal(ctx, opts, ToolLibpff, opts.LibpffNames, path) {
+		m.Results = append(m.Results, withSource(r, SourceProbe))
+	}
+	m.Results = append(m.Results, withSource(skipOrFound(opts, ToolOutlook, opts.OutlookNames), SourceProbe))
+	m.Results = append(m.Results, withSource(skipOrFound(opts, ToolScanPST, opts.ScanpstNames), SourceProbe))
+	if err := m.applyImports(opts); err != nil {
+		return Manifest{}, err
+	}
 	return m, nil
 }
 
@@ -175,4 +192,101 @@ func trimLog(s string) string {
 		return s[:max] + "…"
 	}
 	return s
+}
+
+func withSource(r Result, src string) Result {
+	if r.Source == "" {
+		r.Source = src
+	}
+	return r
+}
+
+// Record stores an actual tool outcome, replacing any earlier result for the
+// same tool. Empty Source is treated as imported (Outlook/scanpst evidence).
+func (m *Manifest) Record(r Result) {
+	if r.Source == "" {
+		r.Source = SourceImported
+	}
+	for i := range m.Results {
+		if m.Results[i].Tool == r.Tool {
+			m.Results[i] = r
+			return
+		}
+	}
+	m.Results = append(m.Results, r)
+}
+
+// Merge overlays other.Results onto m by tool name.
+func (m *Manifest) Merge(other Manifest) {
+	for _, r := range other.Results {
+		m.Record(r)
+	}
+	if m.File == "" {
+		m.File = other.File
+	}
+}
+
+func (m *Manifest) applyImports(opts Options) error {
+	for _, r := range opts.Imported {
+		m.Record(r)
+	}
+	if opts.ImportPath == "" {
+		return nil
+	}
+	other, err := LoadManifest(opts.ImportPath)
+	if err != nil {
+		return err
+	}
+	m.Merge(other)
+	return nil
+}
+
+// DecodeManifest parses a Manifest object or a bare []Result array.
+func DecodeManifest(raw []byte) (Manifest, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return Manifest{}, fmt.Errorf("empty interop manifest")
+	}
+	if raw[0] == '[' {
+		var results []Result
+		if err := json.Unmarshal(raw, &results); err != nil {
+			return Manifest{}, err
+		}
+		m := Manifest{Results: results}
+		for i := range m.Results {
+			if m.Results[i].Source == "" {
+				m.Results[i].Source = SourceImported
+			}
+		}
+		return m, nil
+	}
+	var m Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return Manifest{}, err
+	}
+	for i := range m.Results {
+		if m.Results[i].Source == "" {
+			m.Results[i].Source = SourceImported
+		}
+	}
+	return m, nil
+}
+
+// LoadManifest reads a checked-in Outlook/scanpst evidence file.
+func LoadManifest(path string) (Manifest, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Manifest{}, err
+	}
+	return DecodeManifest(raw)
+}
+
+// WriteManifest records a manifest as indented JSON for later ImportPath use.
+func WriteManifest(path string, m Manifest) error {
+	raw, err := EncodeManifest(m)
+	if err != nil {
+		return err
+	}
+	raw = append(raw, '\n')
+	return os.WriteFile(path, raw, 0o644)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -110,5 +111,165 @@ func TestMemSinkSeekWriteAt(t *testing.T) {
 	got := s.Bytes()
 	if len(got) != 14 || string(got[10:]) != "abcd" {
 		t.Fatalf("%q", got)
+	}
+}
+
+func TestImportanceSplitFromSensitivity(t *testing.T) {
+	exp, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = exp.CreateMessage(inbox, MessageSpec{
+		Subject:     "prio",
+		Importance:  ImportanceHigh,
+		Sensitivity: SensitivityConfidential,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := exp.Plan()
+	if p.Messages[0].Importance != ImportanceHigh {
+		t.Fatalf("importance=%d", p.Messages[0].Importance)
+	}
+	if p.Messages[0].Sensitivity != SensitivityConfidential {
+		t.Fatalf("sensitivity=%d", p.Messages[0].Sensitivity)
+	}
+	_, err = exp.CreateMessage(inbox, MessageSpec{Subject: "bad-imp", Importance: Importance(9)})
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("importance: %v", err)
+	}
+	_, err = exp.CreateMessage(inbox, MessageSpec{Subject: "bad-sens", Sensitivity: Sensitivity(9)})
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("sensitivity: %v", err)
+	}
+}
+
+func TestMessageContentRetainedForFinalize(t *testing.T) {
+	exp, err := New(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("attach-body")
+	ref, err := exp.CreateMessage(inbox, MessageSpec{
+		Subject:         "keep",
+		BodyText:        "plain body",
+		BodyHTML:        "<p>html</p>",
+		InternetHeaders: "X-Test: 1\r\n",
+		Importance:      ImportanceNormal,
+		Sensitivity:     SensitivityPersonal,
+		Attachments: []AttachmentSpec{{
+			Filename: "note.txt",
+			MIMEType: "text/plain",
+			Size:     int64(len(payload)),
+			Body:     bytes.NewReader(payload),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exp.MessageContent(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BodyText != "plain body" || got.BodyHTML != "<p>html</p>" || got.InternetHeaders != "X-Test: 1\r\n" {
+		t.Fatalf("content %+v", got)
+	}
+	if len(got.Attachments) != 1 || !bytes.Equal(got.Attachments[0].Bytes, payload) {
+		t.Fatalf("attachment %+v", got.Attachments)
+	}
+	p := exp.Plan()
+	if p.Messages[0].BodyTextSHA256 == "" || p.Messages[0].HeadersSHA256 == "" {
+		t.Fatal("plan missing content hashes")
+	}
+	if err := exp.Finalize(context.Background()); !errors.Is(err, ErrNotImplemented) {
+		t.Fatalf("finalize: %v", err)
+	}
+	still, err := exp.MessageContent(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if still.BodyText != got.BodyText {
+		t.Fatal("Finalize discarded retained content")
+	}
+}
+
+type countingReader struct {
+	n, max int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.max > 0 && c.n >= c.max {
+		return 0, io.EOF
+	}
+	for i := range p {
+		if c.max > 0 && c.n >= c.max {
+			return i, io.EOF
+		}
+		p[i] = 'x'
+		c.n++
+	}
+	return len(p), nil
+}
+
+func TestAttachmentLimitStopsBeforeEOF(t *testing.T) {
+	exp, err := New(Options{Limits: Limits{MaxAttachmentBytes: 32}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &countingReader{}
+	_, err = exp.CreateMessage(inbox, MessageSpec{
+		Subject: "huge",
+		Attachments: []AttachmentSpec{{
+			Filename: "big.bin",
+			Body:     r,
+		}},
+	})
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("got %v", err)
+	}
+	if r.n != 33 {
+		t.Fatalf("read %d bytes, want 33 (cap+1); must not consume to EOF", r.n)
+	}
+}
+
+func TestDeclaredAttachmentSizeCheckedBeforeRead(t *testing.T) {
+	exp, err := New(Options{Limits: Limits{MaxAttachmentBytes: 32}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &countingReader{}
+	_, err = exp.CreateMessage(inbox, MessageSpec{
+		Subject: "declared",
+		Attachments: []AttachmentSpec{{
+			Filename: "big.bin",
+			Size:     1000,
+			Body:     r,
+		}},
+	})
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("got %v", err)
+	}
+	if r.n != 0 {
+		t.Fatalf("declared oversize should fail before read, read %d", r.n)
 	}
 }

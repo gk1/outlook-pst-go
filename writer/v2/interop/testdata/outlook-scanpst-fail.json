@@ -1,0 +1,16 @@
+[
+  {
+    "tool": "outlook",
+    "available": true,
+    "status": "fail",
+    "log": "Outlook refused to open the file",
+    "source": "imported"
+  },
+  {
+    "tool": "scanpst",
+    "available": true,
+    "status": "fail",
+    "log": "scanpst.exe reported errors that require repair",
+    "source": "imported"
+  }
+]
