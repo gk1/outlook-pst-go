@@ -6,7 +6,9 @@
 // coverage from 0x4400, periodic PMap/FMap/FPMap/DList pages, and
 // allocate/free/reserve on 64-byte slots. PST-004 implements Unicode page
 // and external/internal block codecs (trailer, CRC, signature, BID, crypt
-// boundaries). Finalize currently returns ErrNotImplemented until later
+// boundaries). PST-005 implements Unicode NBT/BBT construction: first-key
+// BTENTRY separators, page BIDs from bidNextP, and BBT reference-count
+// ownership. Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //
 // Target (locked by this package):

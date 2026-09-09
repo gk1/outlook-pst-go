@@ -13,6 +13,11 @@ const (
 	SectionDList        = "2.2.2.7.4"
 	SectionFMap         = "2.2.2.7.5"
 	SectionFPMap        = "2.2.2.7.6"
+	SectionBTPAGE       = "2.2.2.7.7.1"
+	SectionBTENTRY      = "2.2.2.7.7.2"
+	SectionBBTENTRY     = "2.2.2.7.7.3"
+	SectionRefCount     = "2.2.2.7.7.3.1"
+	SectionNBTENTRY     = "2.2.2.7.7.4"
 	SectionGrow         = "2.6.1.1.2"
 	SectionBlockTrailer = "2.2.2.8.1"
 	SectionBlockAlign   = "2.2.2.8"
@@ -73,6 +78,16 @@ const (
 	HeapSigTC                    = 0x7C
 	PtypInteger32                = 0x0003
 	MaxTCColumns                 = 255 // TCINFO.cCols is a BYTE (MS-PST 2.3.4.1)
+
+	UnicodeBTEntriesBytes = 488 // rgentries before cEnt (MS-PST 2.2.2.7.7.1)
+	UnicodeBTHeaderOff    = 488
+	UnicodeBTPaddingOff   = 492
+	NBTLeafEntrySize      = 32
+	BBTLeafEntrySize      = 24
+	BTNonleafEntrySize    = 24
+	MaxNBTLeafEntries     = UnicodeBTEntriesBytes / NBTLeafEntrySize   // 15
+	MaxBBTLeafEntries     = UnicodeBTEntriesBytes / BBTLeafEntrySize   // 20
+	MaxBTNonleafEntries   = UnicodeBTEntriesBytes / BTNonleafEntrySize // 20
 
 	// PidTagLtpRowId / PidTagLtpRowVer complete tags. See MS-PST 2.3.4.4.1.
 	PidTagLtpRowId  uint16 = 0x67F2
