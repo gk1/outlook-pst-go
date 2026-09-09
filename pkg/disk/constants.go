@@ -35,7 +35,7 @@ type PSTFormat int
 const (
 	FormatUnknown PSTFormat = iota
 	FormatANSI              // 32-bit addresses, 512-byte header. See [MS-PST] Section 2.2.2.6.
-	FormatUnicode           // 64-bit addresses, 568-byte header. See [MS-PST] Section 2.2.2.6.
+	FormatUnicode           // 64-bit addresses, 564-byte header. See [MS-PST] Section 2.2.2.6.
 )
 
 func (f PSTFormat) String() string {
@@ -150,7 +150,7 @@ const (
 // Header size constants.
 const (
 	HeaderSizeANSI    = 512 // ANSI header size in bytes
-	HeaderSizeUnicode = 568 // Unicode header size in bytes
+	HeaderSizeUnicode = 564 // Unicode header size in bytes (MS-PST 2.2.2.6)
 )
 
 // Trailer size constants.

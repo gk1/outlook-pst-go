@@ -15,7 +15,9 @@ func SerializeHeader(h *Header) ([]byte, error) {
 	return SerializeHeaderANSI(h)
 }
 
-// SerializeHeaderUnicode serializes a Unicode format header (568 bytes).
+// SerializeHeaderUnicode serializes a Unicode format header.
+// The buffer is HeaderSizeUnicode (564) bytes; field offsets in this
+// function remain the pre-v2 layout and are rejected by writer/v2.
 func SerializeHeaderUnicode(h *Header) ([]byte, error) {
 	buf := make([]byte, HeaderSizeUnicode)
 

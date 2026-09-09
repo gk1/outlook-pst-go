@@ -1,0 +1,164 @@
+{
+  "size": 564,
+  "sha256": "1110e16b94c4c7d4a4267d8a1927e42397283b7a01aa91854a2a623d7ef88665",
+  "crc_partial": "7ea2336e",
+  "crc_full": "9e55a2ab",
+  "offsets": [
+    {
+      "name": "dwMagic",
+      "off": 0,
+      "size": 4,
+      "hex": "2142444e"
+    },
+    {
+      "name": "dwCRCPartial",
+      "off": 4,
+      "size": 4,
+      "hex": "7ea2336e"
+    },
+    {
+      "name": "wMagicClient",
+      "off": 8,
+      "size": 2,
+      "hex": "534d"
+    },
+    {
+      "name": "wVer",
+      "off": 10,
+      "size": 2,
+      "hex": "1700"
+    },
+    {
+      "name": "wVerClient",
+      "off": 12,
+      "size": 2,
+      "hex": "1300"
+    },
+    {
+      "name": "bPlatformCreate",
+      "off": 14,
+      "size": 1,
+      "hex": "01"
+    },
+    {
+      "name": "bPlatformAccess",
+      "off": 15,
+      "size": 1,
+      "hex": "01"
+    },
+    {
+      "name": "dwReserved1",
+      "off": 16,
+      "size": 4,
+      "hex": "00000000"
+    },
+    {
+      "name": "dwReserved2",
+      "off": 20,
+      "size": 4,
+      "hex": "00000000"
+    },
+    {
+      "name": "bidUnused",
+      "off": 24,
+      "size": 8,
+      "hex": "0000000000000000"
+    },
+    {
+      "name": "bidNextP",
+      "off": 32,
+      "size": 8,
+      "hex": "0400000000000000"
+    },
+    {
+      "name": "dwUnique",
+      "off": 40,
+      "size": 4,
+      "hex": "01000000"
+    },
+    {
+      "name": "rgnid",
+      "off": 44,
+      "size": 128,
+      "hex": "0004000000040000000400000040000000000100000400000004000000040000008000000004000000040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000040000000400000004000000040000"
+    },
+    {
+      "name": "qwUnused",
+      "off": 172,
+      "size": 8,
+      "hex": "0000000000000000"
+    },
+    {
+      "name": "root",
+      "off": 180,
+      "size": 72,
+      "hex": "000000000046000000000000004400000000000000000000000000000000000000000000040000000000000000200000000000000800000000000000002200000000000002000000"
+    },
+    {
+      "name": "dwAlign",
+      "off": 252,
+      "size": 4,
+      "hex": "00000000"
+    },
+    {
+      "name": "rgbFM",
+      "off": 256,
+      "size": 128,
+      "hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "name": "rgbFP",
+      "off": 384,
+      "size": 128,
+      "hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "name": "bSentinel",
+      "off": 512,
+      "size": 1,
+      "hex": "80"
+    },
+    {
+      "name": "bCryptMethod",
+      "off": 513,
+      "size": 1,
+      "hex": "00"
+    },
+    {
+      "name": "rgbReserved",
+      "off": 514,
+      "size": 2,
+      "hex": "0000"
+    },
+    {
+      "name": "bidNextB",
+      "off": 516,
+      "size": 8,
+      "hex": "0400000000000000"
+    },
+    {
+      "name": "dwCRCFull",
+      "off": 524,
+      "size": 4,
+      "hex": "9e55a2ab"
+    },
+    {
+      "name": "rgbReserved2",
+      "off": 528,
+      "size": 3,
+      "hex": "000000"
+    },
+    {
+      "name": "bReserved",
+      "off": 531,
+      "size": 1,
+      "hex": "00"
+    },
+    {
+      "name": "rgbReserved3",
+      "off": 532,
+      "size": 32,
+      "hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

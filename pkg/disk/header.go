@@ -30,7 +30,7 @@ type Root struct {
 
 // Header represents the PST file header.
 // See [MS-PST] Section 2.2.2.6 - HEADER structure.
-// The header structure differs between ANSI (512 bytes) and Unicode (568 bytes) formats.
+// The header structure differs between ANSI (512 bytes) and Unicode (564 bytes) formats.
 type Header struct {
 	// Common fields - See [MS-PST] Section 2.2.2.6
 	DWMagic         uint32 // dwMagic - Magic number (should be PSTMagic "!BDN")

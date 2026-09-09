@@ -24,27 +24,32 @@ const (
 
 // Physical sizes for Unicode PST. ANSI is rejected by this writer.
 const (
-	UnicodeHeaderSize   = 564
-	UnicodeRootSize     = 72
-	PageSize            = 512
-	UnicodePageTrailer  = 16
-	UnicodeBlockTrailer = 16
-	BytesPerSlot        = 64
-	FirstAMapPageOffset = 0x4400
-	DListPageOffset     = 0x4200
-	MaxDataBlockCB      = 8176
-	UnicodeWVer         = 23
-	UnicodeWVerMin      = 20
-	ClientVerPST        = 19
-	Sentinel            = 0x80
-	PlatformWin32       = 0x01
-	HeaderPartialCRCLen = 471 // dwCRCPartial covers 471 bytes from wMagicClient
-	HeaderFullCRCLen    = 516 // dwCRCFull covers 516 bytes from wMagicClient
-	TCINFOFixedSize     = 22
-	TCOLDESCSize        = 8
-	HeapSigTC           = 0x7C
-	PtypInteger32       = 0x0003
-	MaxTCColumns        = 255 // TCINFO.cCols is a BYTE (MS-PST 2.3.4.1)
+	UnicodeHeaderSize            = 564
+	UnicodeRootSize              = 72
+	PageSize                     = 512
+	UnicodePageTrailer           = 16
+	UnicodeBlockTrailer          = 16
+	BytesPerSlot                 = 64
+	FirstAMapPageOffset          = 0x4400
+	DListPageOffset              = 0x4200
+	MaxDataBlockCB               = 8176
+	UnicodeWVer                  = 23
+	UnicodeWVerMin               = 23
+	UnicodeWVerWIP               = 37
+	ClientVerPST                 = 19
+	NIDIndexDefault       uint32 = 0x400
+	NIDIndexSearchFolder  uint32 = 0x4000
+	NIDIndexNormalMessage uint32 = 0x10000
+	NIDIndexAssocMessage  uint32 = 0x8000
+	Sentinel                     = 0x80
+	PlatformWin32                = 0x01
+	HeaderPartialCRCLen          = 471 // dwCRCPartial covers 471 bytes from wMagicClient
+	HeaderFullCRCLen             = 516 // dwCRCFull covers 516 bytes from wMagicClient
+	TCINFOFixedSize              = 22
+	TCOLDESCSize                 = 8
+	HeapSigTC                    = 0x7C
+	PtypInteger32                = 0x0003
+	MaxTCColumns                 = 255 // TCINFO.cCols is a BYTE (MS-PST 2.3.4.1)
 
 	// PidTagLtpRowId / PidTagLtpRowVer complete tags. See MS-PST 2.3.4.4.1.
 	PidTagLtpRowId  uint16 = 0x67F2
@@ -62,6 +67,9 @@ const (
 	OffWVerClient     = 12
 	OffPlatformCreate = 14
 	OffPlatformAccess = 15
+	OffReserved1      = 16
+	OffReserved2      = 20
+	OffBidUnused      = 24
 	OffBidNextP       = 32
 	OffUnique         = 40
 	OffRgNID          = 44
@@ -72,12 +80,17 @@ const (
 	OffRgbFP          = 384
 	OffSentinel       = 512
 	OffCrypt          = 513
+	OffRgbReserved    = 514
 	OffBidNextB       = 516
 	OffCRCFull        = 524
+	OffRgbReserved2   = 528
+	OffBReserved      = 531
+	OffRgbReserved3   = 532
 )
 
 // ROOT field offsets inside the 72-byte Unicode ROOT. See MS-PST 2.2.2.5.
 const (
+	OffRootReserved  = 0
 	OffRootFileEOF   = 4
 	OffRootAMapLast  = 12
 	OffRootAMapFree  = 20
@@ -87,6 +100,8 @@ const (
 	OffRootBBTBID    = 52
 	OffRootBBTIB     = 60
 	OffRootAMapValid = 68
+	OffRootARVec     = 69
+	OffRootCARVec    = 70
 )
 
 // fAMapValid values. The legacy library reverses 0 and 1.

@@ -2,14 +2,31 @@ package writer
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"testing"
 
 	"github.com/grokify/outlook-pst-go/pkg/disk"
 )
 
+func mustHeader(t *testing.T, d HeaderDraft) []byte {
+	t.Helper()
+	raw, err := EncodeUnicodeHeader(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func recrcHeader(buf []byte) {
+	full := crc32PST(buf[OffMagicClient : OffMagicClient+HeaderFullCRCLen])
+	binary.LittleEndian.PutUint32(buf[OffCRCFull:], full)
+	partial := crc32PST(buf[OffMagicClient : OffMagicClient+HeaderPartialCRCLen])
+	binary.LittleEndian.PutUint32(buf[OffCRCPartial:], partial)
+}
+
 func TestInspectHeaderAcceptsSpecEncoding(t *testing.T) {
-	raw := EncodeUnicodeHeader(DefaultHeaderDraft())
+	raw := mustHeader(t, DefaultHeaderDraft())
 	if len(raw) != UnicodeHeaderSize {
 		t.Fatalf("header size %d, want %d", len(raw), UnicodeHeaderSize)
 	}
@@ -20,8 +37,8 @@ func TestInspectHeaderAcceptsSpecEncoding(t *testing.T) {
 	if h.WVer != UnicodeWVer {
 		t.Fatalf("wVer=%d", h.WVer)
 	}
-	if h.AMapValid != AMapValid2 {
-		t.Fatalf("fAMapValid=%d", h.AMapValid)
+	if h.Root.AMapValid != AMapValid2 {
+		t.Fatalf("fAMapValid=%d", h.Root.AMapValid)
 	}
 	if h.Sentinel != Sentinel {
 		t.Fatalf("sentinel=%d", h.Sentinel)
@@ -29,23 +46,23 @@ func TestInspectHeaderAcceptsSpecEncoding(t *testing.T) {
 }
 
 func TestInspectHeaderMalformedMagic(t *testing.T) {
-	raw := EncodeUnicodeHeader(DefaultHeaderDraft())
+	raw := mustHeader(t, DefaultHeaderDraft())
 	raw[0] ^= 0xFF
 	_, err := InspectHeader(raw)
 	mustInvariant(t, err, SectionHeader, "dwMagic")
 }
 
 func TestInspectHeaderMalformedCRC(t *testing.T) {
-	raw := EncodeUnicodeHeader(DefaultHeaderDraft())
+	raw := mustHeader(t, DefaultHeaderDraft())
 	raw[OffWVerClient] ^= 0x01 // covered by both CRC spans; recompute not done
 	_, err := InspectHeader(raw)
 	mustInvariant(t, err, SectionHeader, "dwCRCPartial")
 }
 
 func TestInspectHeaderANSIRejected(t *testing.T) {
-	d := DefaultHeaderDraft()
-	d.WVer = 15
-	raw := EncodeUnicodeHeader(d)
+	raw := mustHeader(t, DefaultHeaderDraft())
+	binary.LittleEndian.PutUint16(raw[OffWVer:], 15)
+	recrcHeader(raw)
 	_, err := InspectHeader(raw)
 	if !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("got %v, want ErrUnsupported", err)
@@ -57,9 +74,9 @@ func TestInspectHeaderANSIRejected(t *testing.T) {
 }
 
 func TestInspectHeaderInvalidAMapStatus(t *testing.T) {
-	d := DefaultHeaderDraft()
-	d.AMapValid = AMapInvalid
-	raw := EncodeUnicodeHeader(d)
+	raw := mustHeader(t, DefaultHeaderDraft())
+	raw[OffRoot+OffRootAMapValid] = AMapInvalid
+	recrcHeader(raw)
 	_, err := InspectHeader(raw)
 	mustInvariant(t, err, SectionRoot, "fAMapValid")
 }
