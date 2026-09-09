@@ -43,10 +43,13 @@ const (
 	TCINFOFixedSize     = 22
 	TCOLDESCSize        = 8
 	HeapSigTC           = 0x7C
+	PtypInteger32       = 0x0003
 
-	// PidTagLtpRowId / PidTagLtpRowVer. See MS-PST 2.3.4.4.1.
+	// PidTagLtpRowId / PidTagLtpRowVer complete tags. See MS-PST 2.3.4.4.1.
 	PidTagLtpRowId  uint16 = 0x67F2
 	PidTagLtpRowVer uint16 = 0x67F3
+	TagLtpRowId            = uint32(PtypInteger32) | uint32(PidTagLtpRowId)<<16  // 0x67F20003
+	TagLtpRowVer           = uint32(PtypInteger32) | uint32(PidTagLtpRowVer)<<16 // 0x67F30003
 )
 
 // Unicode HEADER field offsets. See MS-PST 2.2.2.6.

@@ -242,8 +242,8 @@ func TestInspectTableAcceptsMixedWidthTagOrder(t *testing.T) {
 	if view.Columns[1].Size != 8 || view.Columns[2].Size != 2 {
 		t.Fatalf("mixed-width tag order %+v", view.Columns)
 	}
-	if view.Columns[0].Offset != 8 || view.Columns[1].Offset != 0 || view.Columns[2].Offset != 12 {
-		t.Fatalf("ibData not assigned by 8/4 then 2-byte groups: %+v", view.Columns)
+	if view.Columns[0].Offset != 16 || view.Columns[1].Offset != 8 || view.Columns[2].Offset != 20 {
+		t.Fatalf("ibData not assigned by 8/4 then 2-byte groups after LTP pair: %+v", view.Columns)
 	}
 	if view.Columns[0].Offset <= view.Columns[1].Offset {
 		t.Fatal("ibData must not be required to increase in descriptor order")
@@ -259,7 +259,7 @@ func TestInspectTableRejectsSimplifiedRgIB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.RgIB != ([4]uint16{4, 6, 6, 7}) {
+	if view.RgIB != ([4]uint16{12, 14, 14, 15}) {
 		t.Fatalf("grouped rgib=%v", view.RgIB)
 	}
 	// Old simplified encoder set TCI_4b=TCI_2b=TCI_1b=data-end.
@@ -283,8 +283,8 @@ func TestInspectTableRejectsUnpackedIbData(t *testing.T) {
 		{PropType: 0x0003, PropID: 2, Size: 4},
 	}})
 	off := TCINFOFixedSize + TCOLDESCSize + 4
-	raw[off] = 0
-	raw[off+1] = 0
+	raw[off] = 16
+	raw[off+1] = 0 // ibData=16, not packed 12
 	_, err := InspectTable(raw)
 	mustInvariant(t, err, SectionTCOLDESC, "ibData")
 }
@@ -312,8 +312,10 @@ func TestEncodeTCINFOGroupsEightBeforeFour(t *testing.T) {
 	for _, c := range view.Columns {
 		bySize[c.Size] = c
 	}
-	if bySize[8].Offset != 0 || bySize[4].Offset != 8 {
-		t.Fatalf("8-byte ibData must precede 4-byte in row data: %+v", view.Columns)
+	eight := colByID(t, view.Columns, 0x0002)
+	four := colByID(t, view.Columns, 0x0001)
+	if eight.Offset != 8 || four.Offset != 16 {
+		t.Fatalf("8-byte ibData must precede remaining 4-byte after LTP pair: 8=%d 4=%d", eight.Offset, four.Offset)
 	}
 }
 
@@ -327,13 +329,16 @@ func TestEncodeTCINFOSortsByPropertyTag(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(view.Columns) != 3 {
-		t.Fatalf("cols=%d", len(view.Columns))
+	if len(view.Columns) != 5 {
+		t.Fatalf("cols=%d want 3 ordinary + 2 required LTP", len(view.Columns))
 	}
 	if view.Columns[0].PropID != 0x0E06 || view.Columns[1].PropID != 0x0E08 || view.Columns[2].PropID != 0x0E17 {
 		t.Fatalf("encoder did not sort rgTCOLDESC by tag: %+v", view.Columns)
 	}
-	if view.Columns[0].Offset != 0 || view.Columns[1].Offset != 8 || view.Columns[2].Offset != 12 {
+	if view.Columns[3].Tag() != TagLtpRowId || view.Columns[4].Tag() != TagLtpRowVer {
+		t.Fatalf("required specials last by tag: %+v", view.Columns)
+	}
+	if view.Columns[0].Offset != 8 || view.Columns[1].Offset != 16 || view.Columns[2].Offset != 20 {
 		t.Fatalf("ibData %+v", view.Columns)
 	}
 }
@@ -382,6 +387,83 @@ func TestEncodeInspectLtpRowIdAndRowVer(t *testing.T) {
 	}
 	if view.RgIB != ([4]uint16{20, 22, 22, 23}) {
 		t.Fatalf("rgib=%v", view.RgIB)
+	}
+}
+
+func TestEncodeTCINFOInjectsSpecialPair(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+	}})
+	view, err := InspectTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := colByID(t, view.Columns, PidTagLtpRowId)
+	ver := colByID(t, view.Columns, PidTagLtpRowVer)
+	if id.Tag() != TagLtpRowId || id.Bit != 0 || id.Offset != 0 {
+		t.Fatalf("injected RowId %+v", id)
+	}
+	if ver.Tag() != TagLtpRowVer || ver.Bit != 1 || ver.Offset != 4 {
+		t.Fatalf("injected RowVer %+v", ver)
+	}
+	if view.NumCols != 3 {
+		t.Fatalf("cCols=%d want 3 (CEB is cCols-based)", view.NumCols)
+	}
+	if view.RgIB[3]-view.RgIB[2] != 1 {
+		t.Fatalf("CEB width %d, want 1 for cCols=3", view.RgIB[3]-view.RgIB[2])
+	}
+}
+
+func TestInspectTableRejectsMissingSpecialColumns(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+	}})
+	n := int(raw[1])
+	raw[1] = byte(n - 2)
+	raw = append([]byte(nil), raw[:TCINFOFixedSize+TCOLDESCSize*(n-2)]...)
+	// Remaining ordinary used iBit 2; clamp so parse does not fail iBit>=cCols
+	// before the required-pair check.
+	raw[TCINFOFixedSize+7] = 0
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCRowID, "PidTagLtpRowId")
+}
+
+func TestInspectTableRejectsOrdinarySlotReuse(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+	}})
+	// Ordinary is first by tag; iBit was 2. Steal reserved iBit 0 and
+	// move RowId (second descriptor) to iBit 2 so bits stay unique.
+	raw[TCINFOFixedSize+7] = 0
+	raw[TCINFOFixedSize+TCOLDESCSize+7] = 2
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCRowID, "iBit")
+}
+
+func TestInspectTableRejectsWrongTypeSpecialTags(t *testing.T) {
+	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
+		{PropType: 0x0003, PropID: 0x0E08, Size: 4},
+		{PropType: PtypInteger32, PropID: PidTagLtpRowId, Size: 4},
+		{PropType: PtypInteger32, PropID: PidTagLtpRowVer, Size: 4},
+	}})
+	// RowId is the second-to-last descriptor; smash wPropType to PtypString.
+	rowID := TCINFOFixedSize + TCOLDESCSize*int(raw[1]-2)
+	raw[rowID] = 0x1F
+	raw[rowID+1] = 0
+	_, err := InspectTable(raw)
+	mustInvariant(t, err, SectionTCRowID, "tag")
+}
+
+func TestEncodeTCINFORejectsWrongTypeSpecialTags(t *testing.T) {
+	_, err := EncodeTCINFO(TableDraft{Columns: []ColumnView{
+		{PropType: 0x001F, PropID: PidTagLtpRowId, Size: 4},
+		{PropType: PtypInteger32, PropID: PidTagLtpRowVer, Size: 4},
+	}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("got %v, want ErrInvalidArg", err)
 	}
 }
 
