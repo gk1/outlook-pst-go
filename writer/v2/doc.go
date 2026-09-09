@@ -9,8 +9,8 @@
 // boundaries). PST-005 implements Unicode NBT/BBT construction: first-key
 // BTENTRY separators, page BIDs from bidNextP, and BBT reference-count
 // ownership, Store-backed page allocation, persist via ROOT BREFs and
-// bidNextB, and reopen that retains Store maps, allocated payloads, and
-// extra-ref kinds for continued mutation.
+// bidNextB, and reopen that retains Store maps and allocated payloads.
+// Extra BBT refs reopen as opaque until PST-006 reconstructs XBLOCK/SLENTRY.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

@@ -651,3 +651,43 @@ func TestDListLoadMutations(t *testing.T) {
 		mustInvariant(t, err, SectionBID, "bid")
 	})
 }
+
+func TestReallocDoesNotInheritFreedBacking(t *testing.T) {
+	s := NewStore()
+	ib, err := s.Allocate(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw[ib] = 0xA5
+	s2, err := LoadStore(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.backing[ib] != 0xA5 {
+		t.Fatal("LoadStore dropped payload")
+	}
+	if err := s2.Free(ib, 64); err != nil {
+		t.Fatal(err)
+	}
+	if s2.backing[ib] != 0 {
+		t.Fatalf("Free left backing 0x%02x", s2.backing[ib])
+	}
+	ib2, err := s2.Allocate(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ib2 != ib {
+		t.Fatalf("first-fit reuse want 0x%x got 0x%x", ib, ib2)
+	}
+	out, err := s2.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out[ib] != 0 {
+		t.Fatalf("reused IB inherited 0x%02x", out[ib])
+	}
+}

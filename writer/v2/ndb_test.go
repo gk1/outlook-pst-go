@@ -738,11 +738,10 @@ func TestReopenPreservesAllocatedPayload(t *testing.T) {
 	}
 }
 
-func TestReopenExtraRefOwnershipRelease(t *testing.T) {
+func TestReopenExtraRefsAreOpaque(t *testing.T) {
 	n := NewNDB(nil)
 	shared := mustAlloc(t, n, 16)
 	onlySub := mustAlloc(t, n, 16)
-	onlyData := mustAlloc(t, n, 16)
 	mustNode(t, n, 0x21, shared.BID, 0, 0)
 	if err := n.AddDataTreeRef(shared.BID); err != nil {
 		t.Fatal(err)
@@ -753,9 +752,6 @@ func TestReopenExtraRefOwnershipRelease(t *testing.T) {
 	if err := n.AddSubnodeRef(onlySub.BID); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.AddDataTreeRef(onlyData.BID); err != nil {
-		t.Fatal(err)
-	}
 	file, err := n.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -764,64 +760,109 @@ func TestReopenExtraRefOwnershipRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if n2.dataTreeRefs[shared.BID] != 0 || n2.subnodeRefs[shared.BID] != 0 {
+		t.Fatalf("typed extras after reopen data=%d sub=%d", n2.dataTreeRefs[shared.BID], n2.subnodeRefs[shared.BID])
+	}
+	if n2.opaqueRefs[shared.BID] != 2 {
+		t.Fatalf("shared opaque %d want 2", n2.opaqueRefs[shared.BID])
+	}
+	if n2.opaqueRefs[onlySub.BID] != 1 {
+		t.Fatalf("sub-only opaque %d want 1", n2.opaqueRefs[onlySub.BID])
+	}
+	err = n2.ReleaseSubnodeRef(onlySub.BID)
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("typed subnode release after reopen: %v", err)
+	}
+	if _, ok := n2.LookupBlock(onlySub.BID); !ok {
+		t.Fatal("opaque extra must keep the block until PST-006")
+	}
+	err = n2.ReleaseDataTreeRef(shared.BID)
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("typed data-tree release after reopen: %v", err)
+	}
 	got, ok := n2.LookupBlock(shared.BID)
 	if !ok || got.RefCount != 4 {
-		t.Fatalf("shared cRef %+v ok=%v", got, ok)
+		t.Fatalf("shared after refused release %+v ok=%v", got, ok)
 	}
-	if n2.dataTreeRefs[shared.BID] != 1 || n2.subnodeRefs[shared.BID] != 1 {
-		t.Fatalf("shared extra data=%d sub=%d", n2.dataTreeRefs[shared.BID], n2.subnodeRefs[shared.BID])
-	}
-	if n2.subnodeRefs[onlySub.BID] != 1 || n2.dataTreeRefs[onlySub.BID] != 0 {
-		t.Fatalf("sub-only extra data=%d sub=%d", n2.dataTreeRefs[onlySub.BID], n2.subnodeRefs[onlySub.BID])
-	}
-	if n2.dataTreeRefs[onlyData.BID] != 1 || n2.subnodeRefs[onlyData.BID] != 0 {
-		t.Fatalf("data-only extra data=%d sub=%d", n2.dataTreeRefs[onlyData.BID], n2.subnodeRefs[onlyData.BID])
-	}
-	if err := n2.ReleaseSubnodeRef(onlySub.BID); err != nil {
+	if err := n2.AddSubnodeRef(shared.BID); err != nil {
 		t.Fatal(err)
-	}
-	if _, ok := n2.LookupBlock(onlySub.BID); ok {
-		t.Fatal("subnode-only block not reclaimed after reopen release")
-	}
-	if err := n2.ReleaseDataTreeRef(onlyData.BID); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := n2.LookupBlock(onlyData.BID); ok {
-		t.Fatal("data-tree-only block not reclaimed after reopen release")
 	}
 	if err := n2.ReleaseSubnodeRef(shared.BID); err != nil {
 		t.Fatal(err)
 	}
 	got, ok = n2.LookupBlock(shared.BID)
-	if !ok || got.RefCount != 3 {
-		t.Fatalf("after sub drop %+v ok=%v", got, ok)
+	if !ok || got.RefCount != 4 || n2.opaqueRefs[shared.BID] != 2 {
+		t.Fatalf("session extra must not consume opaque %+v opaque=%d", got, n2.opaqueRefs[shared.BID])
 	}
-	if err := n2.ReleaseDataTreeRef(shared.BID); err != nil {
+}
+
+func TestCommittedBBTEntryPaddingIsZero(t *testing.T) {
+	n := NewNDB(nil)
+	blk := mustAlloc(t, n, 16)
+	mustNode(t, n, 0x21, blk.BID, 0, 0)
+	if err := n.AddSubnodeRef(blk.BID); err != nil {
 		t.Fatal(err)
 	}
-	got, ok = n2.LookupBlock(shared.BID)
-	if !ok || got.RefCount != 2 {
-		t.Fatalf("after data drop %+v ok=%v", got, ok)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
 	}
+	img, err := OpenTrees(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec func(BREF)
+	rec = func(ref BREF) {
+		t.Helper()
+		raw := file[ref.IB : ref.IB+uint64(PageSize)]
+		v, err := InspectBTPage(raw, ref.IB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if v.Level == 0 && v.Type == PageBBT {
+			for i := range v.BBT {
+				off := i * BBTLeafEntrySize
+				pad := uint32(raw[off+20]) | uint32(raw[off+21])<<8 | uint32(raw[off+22])<<16 | uint32(raw[off+23])<<24
+				if pad != 0 {
+					t.Fatalf("BBTENTRY[%d] dwPadding 0x%08x want 0", i, pad)
+				}
+			}
+			return
+		}
+		for _, k := range v.Kids {
+			rec(k.Ref)
+		}
+	}
+	rec(img.BBTRoot)
+}
+
+func TestReallocDoesNotInheritFreedPayload(t *testing.T) {
+	n := NewNDB(nil)
+	blk := mustAlloc(t, n, 16)
+	ib := blk.IB
+	mustNode(t, n, 0x21, blk.BID, 0, 0)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	file[ib] = 0xA5
+	n2, err := OpenNDB(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n2.DeleteNode(0x21); err != nil {
+		t.Fatal(err)
+	}
+	rep := mustAlloc(t, n2, 16)
+	if rep.IB != ib {
+		t.Fatalf("first-fit reuse want 0x%x got 0x%x", ib, rep.IB)
+	}
+	mustNode(t, n2, 0x61, rep.BID, 0, 0)
 	file2, err := n2.Commit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	n3, err := OpenNDB(file2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := n3.LookupBlock(onlySub.BID); ok {
-		t.Fatal("reclaimed subnode block survived second reopen")
-	}
-	if _, ok := n3.LookupBlock(onlyData.BID); ok {
-		t.Fatal("reclaimed data-tree block survived second reopen")
-	}
-	got, ok = n3.LookupBlock(shared.BID)
-	if !ok || got.RefCount != 2 {
-		t.Fatalf("shared after reopen %+v ok=%v", got, ok)
-	}
-	if n3.dataTreeRefs[shared.BID] != 0 || n3.subnodeRefs[shared.BID] != 0 {
-		t.Fatalf("shared extras after typed release data=%d sub=%d", n3.dataTreeRefs[shared.BID], n3.subnodeRefs[shared.BID])
+	if file2[ib] != 0 {
+		t.Fatalf("reused IB inherited 0x%02x", file2[ib])
 	}
 }

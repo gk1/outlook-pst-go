@@ -316,7 +316,25 @@ func (s *Store) mark(ib, size uint64, alloc bool) error {
 			clearBit(bm, start+i)
 		}
 	}
+	s.clearBacking(ib, size)
 	return nil
+}
+
+func (s *Store) clearBacking(ib, size uint64) {
+	if len(s.backing) == 0 || size == 0 {
+		return
+	}
+	if ib >= uint64(len(s.backing)) {
+		return
+	}
+	end := ib + size
+	if end > uint64(len(s.backing)) {
+		end = uint64(len(s.backing))
+	}
+	region := s.backing[ib:end]
+	for i := range region {
+		region[i] = 0
+	}
 }
 
 func (s *Store) allocatedRange(ib, size uint64) bool {
@@ -628,7 +646,8 @@ func (s *Store) zeroFreeSlots(buf []byte) {
 
 // EncodeFile writes a Unicode PST image: HEADER, DList at 0x4200, and every
 // periodic map page. Allocated non-metadata payloads from a loaded/previous
-// image are preserved; freed slots are zeroed. ROOT matches the maps.
+// image are preserved; freed or freshly allocated slots are zeroed so reuse
+// cannot inherit stale bytes. ROOT matches the maps.
 func (s *Store) EncodeFile() ([]byte, error) {
 	hdr, err := EncodeUnicodeHeader(s.HeaderDraft())
 	if err != nil {

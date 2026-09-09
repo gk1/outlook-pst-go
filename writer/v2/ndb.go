@@ -24,6 +24,7 @@ type NDB struct {
 	blocks       map[uint64]BBTEntry
 	dataTreeRefs map[uint64]int
 	subnodeRefs  map[uint64]int
+	opaqueRefs   map[uint64]int
 	livePages    []uint64
 }
 
@@ -40,6 +41,7 @@ func NewNDB(ids *SequentialIDs) *NDB {
 		blocks:       make(map[uint64]BBTEntry),
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
+		opaqueRefs:   make(map[uint64]int),
 	}
 }
 
@@ -211,6 +213,9 @@ func (n *NDB) addExtra(bid uint64, kind extraRef) error {
 func (n *NDB) releaseExtra(bid uint64, kind extraRef) error {
 	m := n.extraMap(kind)
 	if m[bid] <= 0 {
+		if n.opaqueRefs[bid] > 0 {
+			return invalidArg("bid", "reopened extra refs for BID 0x%x are opaque until PST-006 reconstructs XBLOCK/SLENTRY (MS-PST %s)", bid, SectionRefCount)
+		}
 		return invalidArg("bid", "no extra ref to drop for BID 0x%x", bid)
 	}
 	m[bid]--
@@ -237,7 +242,7 @@ func (n *NDB) nbtLiveRefs(bid uint64) int {
 }
 
 func (n *NDB) extraLiveRefs(bid uint64) int {
-	return n.dataTreeRefs[bid] + n.subnodeRefs[bid]
+	return n.dataTreeRefs[bid] + n.subnodeRefs[bid] + n.opaqueRefs[bid]
 }
 
 func (n *NDB) computeRef(bid uint64) uint16 {
@@ -282,6 +287,7 @@ func (n *NDB) dropBlock(bid uint64) error {
 	delete(n.blocks, bid)
 	delete(n.dataTreeRefs, bid)
 	delete(n.subnodeRefs, bid)
+	delete(n.opaqueRefs, bid)
 	return n.freeBlockIB(e)
 }
 
@@ -353,8 +359,6 @@ func (n *NDB) ownedBlocks() []BBTEntry {
 		if n.nbtLiveRefs(e.BID)+n.extraLiveRefs(e.BID) == 0 {
 			continue
 		}
-		e.DataRefs = uint16(n.dataTreeRefs[e.BID])
-		e.SubRefs = uint16(n.subnodeRefs[e.BID])
 		out = append(out, e)
 	}
 	sortBBT(out)
@@ -838,7 +842,8 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 }
 
 // OpenNDB reopens a committed Unicode PST for continued mutation.
-// Store maps, ROOT BREFs, live tree pages, and bidNextP/bidNextB are retained.
+// Store maps, ROOT BREFs, live tree pages, payloads, and bidNextP/bidNextB
+// are retained. Extra cRef beyond NBT is opaque until PST-006.
 func OpenNDB(file []byte) (*NDB, error) {
 	store, err := LoadStore(file)
 	if err != nil {
@@ -855,6 +860,7 @@ func OpenNDB(file []byte) (*NDB, error) {
 		blocks:       make(map[uint64]BBTEntry),
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
+		opaqueRefs:   make(map[uint64]int),
 	}
 	if err := hydrateNDB(n, img); err != nil {
 		return nil, err
@@ -900,19 +906,10 @@ func (n *NDB) applyExtraRefs() error {
 		if extra < 0 {
 			return invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
 		}
-		data, sub := int(e.DataRefs), int(e.SubRefs)
-		switch {
-		case data+sub == extra:
-			if data > 0 {
-				n.dataTreeRefs[bid] = data
-			}
-			if sub > 0 {
-				n.subnodeRefs[bid] = sub
-			}
-		case data == 0 && sub == 0 && extra > 0:
-			n.dataTreeRefs[bid] = extra
-		default:
-			return invariant(SectionRefCount, "cRef", "BID 0x%x extra kinds data=%d sub=%d leftover=%d", bid, data, sub, extra)
+		// BBTENTRY dwPadding is unused (MUST be zero). Extra cRef that is not
+		// explained by NBT is opaque until PST-006 walks XBLOCK/SLENTRY.
+		if extra > 0 {
+			n.opaqueRefs[bid] = extra
 		}
 	}
 	return nil

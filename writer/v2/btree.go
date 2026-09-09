@@ -26,11 +26,6 @@ type BBTEntry struct {
 	IB       uint64
 	CB       uint16
 	RefCount uint16
-	// DataRefs/SubRefs occupy the unused 4 bytes of the 24-byte Unicode
-	// BBTENTRY slot so reopen can recover extra-ref kinds before PST-006
-	// reconstructs them from XBLOCK/SLENTRY. Zero when there are none.
-	DataRefs uint16
-	SubRefs  uint16
 }
 
 func (e BBTEntry) key() uint64 { return e.BID }
@@ -128,13 +123,9 @@ func encodeBTPayload(pageType, level byte, nbt []NBTEntry, bbt []BBTEntry, kids 
 			k = e.BID
 			binary.LittleEndian.PutUint64(buf[off:], e.BID)
 			binary.LittleEndian.PutUint64(buf[off+8:], e.IB)
-			if uint32(e.DataRefs)+uint32(e.SubRefs) >= uint32(e.RefCount) {
-				return nil, invalidArg("cRef", "extra refs data=%d sub=%d leave no BBTENTRY for BID 0x%x", e.DataRefs, e.SubRefs, e.BID)
-			}
 			binary.LittleEndian.PutUint16(buf[off+16:], e.CB)
 			binary.LittleEndian.PutUint16(buf[off+18:], e.RefCount)
-			binary.LittleEndian.PutUint16(buf[off+20:], e.DataRefs)
-			binary.LittleEndian.PutUint16(buf[off+22:], e.SubRefs)
+			binary.LittleEndian.PutUint32(buf[off+20:], 0) // dwPadding MUST be 0 (MS-PST 2.2.2.7.7.3)
 		default:
 			e := kids[i]
 			if e.Ref.BID == 0 {
@@ -257,8 +248,9 @@ func InspectBTPage(raw []byte, offset uint64) (*BTPageView, error) {
 				IB:       binary.LittleEndian.Uint64(b[off+8:]),
 				CB:       binary.LittleEndian.Uint16(b[off+16:]),
 				RefCount: binary.LittleEndian.Uint16(b[off+18:]),
-				DataRefs: binary.LittleEndian.Uint16(b[off+20:]),
-				SubRefs:  binary.LittleEndian.Uint16(b[off+22:]),
+			}
+			if pad := binary.LittleEndian.Uint32(b[off+20:]); pad != 0 {
+				return nil, invariant(SectionBBTENTRY, "dwPadding", "got 0x%08x want 0 (MS-PST %s)", pad, SectionBBTENTRY)
 			}
 			if e.BID == 0 || BIDHasReserved(e.BID) {
 				return nil, invariant(SectionBBTENTRY, "bid", "invalid BID 0x%x", e.BID)

@@ -88,6 +88,28 @@ func TestBBTLeafRejectsZeroRefCount(t *testing.T) {
 	}
 }
 
+func TestBBTEntryPaddingMustBeZero(t *testing.T) {
+	raw, err := EncodeBBTLeaf([]BBTEntry{{BID: 4, IB: 0x5000, CB: 16, RefCount: 2}}, 4, 0x8400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pad := binary.LittleEndian.Uint32(raw[20:24]); pad != 0 {
+		t.Fatalf("encoded dwPadding 0x%08x want 0", pad)
+	}
+	if _, err := InspectBTPage(raw, 0x8400); err != nil {
+		t.Fatal(err)
+	}
+	mut := append([]byte(nil), raw...)
+	binary.LittleEndian.PutUint32(mut[20:24], 0x01020304)
+	max := PagePayloadMax()
+	crc := crc32PST(mut[:max])
+	binary.LittleEndian.PutUint32(mut[max+4:max+8], crc)
+	_, err = InspectBTPage(mut, 0x8400)
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("nonzero dwPadding: %v", err)
+	}
+}
+
 func TestBTNonleafFirstKeyNotMaxKey(t *testing.T) {
 	// Two NBT leaves of 15 and 1: intermediate btkey must be the first NID
 	// of each child, not the last NID of the left child.
