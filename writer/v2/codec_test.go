@@ -129,6 +129,59 @@ func TestEncodeNBTPageBIDIsNotFileOffset(t *testing.T) {
 	}
 }
 
+func TestSequentialPageBIDsFourAndFiveEncode(t *testing.T) {
+	ids := NewSequentialIDs()
+	bid4, err := ids.TakePageBID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bid5, err := ids.TakePageBID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bid4 != FirstAllocBID || bid5 != FirstAllocBID+PageBIDIncrement {
+		t.Fatalf("page BIDs %d %d want 4 then 5", bid4, bid5)
+	}
+	if bid5%2 == 0 {
+		t.Fatal("second page BID should be odd")
+	}
+	payload := []byte{0xAA}
+	const ib4, ib5 = uint64(0x2000), uint64(0x2200)
+	for _, tc := range []struct {
+		name     string
+		pageType byte
+		bid, ib  uint64
+	}{
+		{"nbt-4", PageNBT, bid4, ib4},
+		{"nbt-5", PageNBT, bid5, ib5},
+		{"bbt-4", PageBBT, bid4, ib4},
+		{"bbt-5", PageBBT, bid5, ib5},
+		{"dlist-4", PageDList, bid4, DListPageOffset},
+		{"dlist-5", PageDList, bid5, DListPageOffset},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := EncodePage(payload, tc.pageType, tc.bid, tc.ib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pg, err := InspectPage(raw, tc.ib)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pg.BID != tc.bid {
+				t.Fatalf("BID 0x%x want 0x%x", pg.BID, tc.bid)
+			}
+			wantSig := signature(tc.bid, tc.ib)
+			if pg.Sig != wantSig {
+				t.Fatalf("sig 0x%04x want 0x%04x", pg.Sig, wantSig)
+			}
+			if pg.Type != tc.pageType {
+				t.Fatalf("ptype 0x%02x", pg.Type)
+			}
+		})
+	}
+}
+
 func TestEncodeAMapPageStillUsesIB(t *testing.T) {
 	raw, err := EncodePage([]byte{0xFF}, PageAMap, 4, FirstAMapPageOffset)
 	if err != nil {

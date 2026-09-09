@@ -24,11 +24,11 @@ func EncodePage(payload []byte, pageType byte, bid, offset uint64) ([]byte, erro
 		return nil, invalidArg("ptype", "unknown page type 0x%02x", pageType)
 	}
 	if allocatedPageBID(pageType) {
+		// Page BIDs use all bits (MS-PST 2.2.2.2) and increment by 1, so
+		// odd values such as 5 are valid. Reserved/internal bits apply
+		// to block BIDs only.
 		if bid == 0 {
 			return nil, invalidArg("bid", "NBT/BBT/DList page BID must be allocated from bidNextP, not null (MS-PST %s)", SectionBID)
-		}
-		if BIDHasReserved(bid) {
-			return nil, invalidArg("bid", "reserved bit must be 0 (MS-PST %s)", SectionBID)
 		}
 	}
 	buf := make([]byte, PageSize)
