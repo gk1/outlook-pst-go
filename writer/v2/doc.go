@@ -10,7 +10,9 @@
 // BTENTRY separators, page BIDs from bidNextP, and BBT reference-count
 // ownership, Store-backed page allocation, persist via ROOT BREFs and
 // bidNextB, and reopen that retains Store maps and allocated payloads.
-// Extra BBT refs reopen as opaque until PST-006 reconstructs XBLOCK/SLENTRY.
+// Extra BBT refs reopen as opaque unless PST-006 reconstructs them from
+// XBLOCK/XXBLOCK rgbid and SLENTRY/SIENTRY. PST-006 streams data trees
+// (direct/XBLOCK/XXBLOCK) and SLBLOCK/SIBLOCK subnode trees.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

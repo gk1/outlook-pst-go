@@ -150,3 +150,12 @@ func invalidArg(field, format string, args ...any) *Error {
 		Err:    ErrInvalidArg,
 	}
 }
+
+func ioErr(field, format string, args ...any) *Error {
+	return &Error{
+		Code:   CodeIO,
+		Field:  field,
+		Detail: fmt.Sprintf(format, args...),
+		Err:    ErrIO,
+	}
+}

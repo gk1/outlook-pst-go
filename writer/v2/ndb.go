@@ -26,6 +26,7 @@ type NDB struct {
 	subnodeRefs  map[uint64]int
 	opaqueRefs   map[uint64]int
 	livePages    []uint64
+	payloads     map[uint64][]byte // BID -> cb payload (no trailer)
 }
 
 // NewNDB returns an empty catalog. Page BIDs and IBs come from store (or a
@@ -42,6 +43,7 @@ func NewNDB(ids *SequentialIDs) *NDB {
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
 		opaqueRefs:   make(map[uint64]int),
+		payloads:     make(map[uint64][]byte),
 	}
 }
 
@@ -87,6 +89,59 @@ func (n *NDB) AllocBlock(cb uint16) (BBTEntry, error) {
 	e := BBTEntry{BID: bid, IB: ib, CB: cb, RefCount: 1}
 	n.blocks[bid] = e
 	return e, nil
+}
+
+// AllocInternalBlock allocates an XBLOCK/SLBLOCK-style block (bidInternal set).
+func (n *NDB) AllocInternalBlock(cb uint16) (BBTEntry, error) {
+	size := BlockDiskSize(uint64(cb))
+	ib, err := n.store.Allocate(size)
+	if err != nil {
+		return BBTEntry{}, err
+	}
+	bid, err := n.ids.TakeInternalBlockBID()
+	if err != nil {
+		_ = n.store.Free(ib, size)
+		return BBTEntry{}, err
+	}
+	if err := n.store.noteBlockBID(bid); err != nil {
+		_ = n.store.Free(ib, size)
+		return BBTEntry{}, err
+	}
+	n.ids.nextBlock = n.store.bidNextB
+	e := BBTEntry{BID: bid, IB: ib, CB: cb, RefCount: 1}
+	n.blocks[bid] = e
+	return e, nil
+}
+
+func (n *NDB) putPayload(e BBTEntry, data []byte) error {
+	if int(e.CB) != len(data) {
+		return invalidArg("cb", "payload %d bytes, BBT cb %d", len(data), e.CB)
+	}
+	if n.payloads == nil {
+		n.payloads = make(map[uint64][]byte)
+	}
+	n.payloads[e.BID] = append([]byte(nil), data...)
+	return nil
+}
+
+func (n *NDB) blockPayload(e BBTEntry) ([]byte, error) {
+	if n.payloads != nil {
+		if p, ok := n.payloads[e.BID]; ok {
+			return p, nil
+		}
+	}
+	size := BlockDiskSize(uint64(e.CB))
+	if n.store == nil || e.IB == 0 || uint64(len(n.store.backing)) < e.IB+size {
+		return nil, invariant(SectionBlockTrailer, "ib", "missing payload for BID 0x%x at 0x%x", e.BID, e.IB)
+	}
+	v, err := InspectBlock(n.store.backing[e.IB:e.IB+size], e.IB)
+	if err != nil {
+		return nil, err
+	}
+	if v.BID != e.BID {
+		return nil, invariant(SectionBID, "bid", "payload BID 0x%x want 0x%x", v.BID, e.BID)
+	}
+	return v.Plain, nil
 }
 
 func (n *NDB) occupyExtent(e BBTEntry) error {
@@ -284,11 +339,80 @@ func (n *NDB) dropBlock(bid uint64) error {
 	if !ok {
 		return nil
 	}
+	kids, kerr := n.treeChildRefs(e)
 	delete(n.blocks, bid)
 	delete(n.dataTreeRefs, bid)
 	delete(n.subnodeRefs, bid)
 	delete(n.opaqueRefs, bid)
-	return n.freeBlockIB(e)
+	delete(n.payloads, bid)
+	if err := n.freeBlockIB(e); err != nil {
+		return err
+	}
+	if kerr != nil {
+		return kerr
+	}
+	for _, k := range kids {
+		if n.extraMap(k.kind)[k.bid] <= 0 {
+			continue
+		}
+		if err := n.releaseExtra(k.bid, k.kind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type treeChild struct {
+	bid  uint64
+	kind extraRef
+}
+
+func (n *NDB) treeChildRefs(e BBTEntry) ([]treeChild, error) {
+	if !BIDIsInternal(e.BID) {
+		return nil, nil
+	}
+	data, err := n.blockPayload(e)
+	if err != nil {
+		return nil, nil
+	}
+	if len(data) < 2 {
+		return nil, nil
+	}
+	switch data[0] {
+	case BlockTypeXBlock:
+		xb, err := InspectXBlock(data)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]treeChild, len(xb.BIDs))
+		for i, bid := range xb.BIDs {
+			out[i] = treeChild{bid: bid, kind: refDataTree}
+		}
+		return out, nil
+	case BlockTypeSubnode:
+		sn, err := InspectSubnodeBlock(data)
+		if err != nil {
+			return nil, err
+		}
+		var out []treeChild
+		if sn.Level == 0 {
+			for _, ent := range sn.Leaves {
+				if ent.DataBID != 0 {
+					out = append(out, treeChild{bid: ent.DataBID, kind: refSubnode})
+				}
+				if ent.SubBID != 0 {
+					out = append(out, treeChild{bid: ent.SubBID, kind: refSubnode})
+				}
+			}
+		} else {
+			for _, k := range sn.Kids {
+				out = append(out, treeChild{bid: k.Ref, kind: refSubnode})
+			}
+		}
+		return out, nil
+	default:
+		return nil, nil
+	}
 }
 
 func (n *NDB) freeBlockIB(e BBTEntry) error {
@@ -485,8 +609,37 @@ func (n *NDB) Commit() ([]byte, error) {
 		}
 		copy(file[ib:], raw)
 	}
+	for _, e := range n.blocks {
+		raw, ok, err := n.encodePayloadBlock(e)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		if e.IB+uint64(len(raw)) > uint64(len(file)) {
+			return nil, invariant(SectionBlockTrailer, "ib", "block at 0x%x exceeds ibFileEof", e.IB)
+		}
+		copy(file[e.IB:], raw)
+	}
 	n.store.attachBacking(file)
 	return file, nil
+}
+
+func (n *NDB) encodePayloadBlock(e BBTEntry) ([]byte, bool, error) {
+	if n.payloads == nil {
+		return nil, false, nil
+	}
+	data, ok := n.payloads[e.BID]
+	if !ok {
+		return nil, false, nil
+	}
+	if BIDIsInternal(e.BID) {
+		raw, err := EncodeInternalBlock(data, e.BID, e.IB)
+		return raw, true, err
+	}
+	raw, err := EncodeBlock(data, e.BID, e.IB)
+	return raw, true, err
 }
 
 func encodeTree[T interface{ key() uint64 }](ptype byte, leaves []T, alloc func([]byte, byte) (BREF, error), encodeLeaf func([]T) ([]byte, error), maxLeaf int) (BREF, error) {
@@ -828,6 +981,9 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 	}); err != nil {
 		return err
 	}
+	if err := n.reconstructTreeRefs(); err != nil {
+		return err
+	}
 	if err := n.applyExtraRefs(); err != nil {
 		return err
 	}
@@ -843,7 +999,7 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 
 // OpenNDB reopens a committed Unicode PST for continued mutation.
 // Store maps, ROOT BREFs, live tree pages, payloads, and bidNextP/bidNextB
-// are retained. Extra cRef beyond NBT is opaque until PST-006.
+// are retained. Extra cRef is reconstructed from XBLOCK/SLENTRY when present.
 func OpenNDB(file []byte) (*NDB, error) {
 	store, err := LoadStore(file)
 	if err != nil {
@@ -861,6 +1017,7 @@ func OpenNDB(file []byte) (*NDB, error) {
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
 		opaqueRefs:   make(map[uint64]int),
+		payloads:     make(map[uint64][]byte),
 	}
 	if err := hydrateNDB(n, img); err != nil {
 		return nil, err
@@ -899,6 +1056,51 @@ func LoadTrees(img *TreeImage, ids *SequentialIDs) (*NDB, error) {
 	return n, n.CheckRefCounts()
 }
 
+func (n *NDB) reconstructTreeRefs() error {
+	for bid, e := range n.blocks {
+		if !BIDIsInternal(bid) {
+			continue
+		}
+		data, err := n.blockPayload(e)
+		if err != nil {
+			continue
+		}
+		if len(data) < 1 {
+			continue
+		}
+		switch data[0] {
+		case BlockTypeXBlock:
+			xb, err := InspectXBlock(data)
+			if err != nil {
+				return err
+			}
+			for _, child := range xb.BIDs {
+				n.dataTreeRefs[child]++
+			}
+		case BlockTypeSubnode:
+			sn, err := InspectSubnodeBlock(data)
+			if err != nil {
+				return err
+			}
+			if sn.Level == 0 {
+				for _, ent := range sn.Leaves {
+					if ent.DataBID != 0 {
+						n.subnodeRefs[ent.DataBID]++
+					}
+					if ent.SubBID != 0 {
+						n.subnodeRefs[ent.SubBID]++
+					}
+				}
+			} else {
+				for _, k := range sn.Kids {
+					n.subnodeRefs[k.Ref]++
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (n *NDB) applyExtraRefs() error {
 	for bid, e := range n.blocks {
 		nbt := n.nbtLiveRefs(bid)
@@ -906,10 +1108,12 @@ func (n *NDB) applyExtraRefs() error {
 		if extra < 0 {
 			return invariant(SectionRefCount, "cRef", "BID 0x%x cRef %d < 1+NBT %d", bid, e.RefCount, nbt)
 		}
-		// BBTENTRY dwPadding is unused (MUST be zero). Extra cRef that is not
-		// explained by NBT is opaque until PST-006 walks XBLOCK/SLENTRY.
-		if extra > 0 {
-			n.opaqueRefs[bid] = extra
+		typed := n.dataTreeRefs[bid] + n.subnodeRefs[bid]
+		if typed > extra {
+			return invariant(SectionRefCount, "cRef", "BID 0x%x typed extra %d > leftover %d", bid, typed, extra)
+		}
+		if opaque := extra - typed; opaque > 0 {
+			n.opaqueRefs[bid] = opaque
 		}
 	}
 	return nil
