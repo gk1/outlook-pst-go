@@ -35,9 +35,15 @@ func InspectDList(raw []byte) (*DListView, error) {
 		return nil, invariant(SectionDList, "cEntDList", "got %d max %d", n, DListMaxEntries)
 	}
 	ents := make([]DListEntry, n)
+	seen := make(map[uint32]struct{}, n)
 	for i := 0; i < n; i++ {
 		v := binaryLEUint32(b[8+i*4:])
-		ents[i] = DListEntry{PageNum: v & 0xFFFFF, Free: v >> 20}
+		pageNum := v & 0xFFFFF
+		if _, dup := seen[pageNum]; dup {
+			return nil, invariant(SectionDList, "dwPageNum", "duplicate AMap index %d", pageNum)
+		}
+		seen[pageNum] = struct{}{}
+		ents[i] = DListEntry{PageNum: pageNum, Free: v >> 20}
 	}
 	return &DListView{
 		Flags:   b[0],

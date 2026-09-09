@@ -31,8 +31,8 @@ func NewStore() *Store {
 	return s
 }
 
-// takePageBID assigns the next page BID from bidNextP. Page BIDs keep the
-// reserved and internal bits clear (MS-PST 2.2.2.2) by advancing 4.
+// takePageBID assigns the next page BID from bidNextP. Page BIDs use all
+// bits and increment by 1 (MS-PST 2.2.2.2). Block BIDs still advance by 4.
 func (s *Store) takePageBID() uint64 {
 	bid := s.bidNextP
 	s.bidNextP += PageBIDIncrement
@@ -445,12 +445,17 @@ func (s *Store) encodeFPMapAt(off uint64) ([]byte, error) {
 	return EncodePage(s.fpMapPayload(start), PageFPMap, off, off)
 }
 
-// pMapHasFreePages reports whether PMap index still has a fully free 512-byte page.
-// FPMap bit 0 means free pages remain; bit 1 means none. See MS-PST 2.2.2.7.6.
+// pMapHasFreePages reports whether PMap index still has a fully free 512-byte
+// page inside current file coverage. Pages beyond ibFileEof and PMaps that do
+// not exist are not free: FPMap bit 1. See MS-PST 2.2.2.7.6.
 func (s *Store) pMapHasFreePages(pmapIndex uint64) bool {
 	start := FirstAMapPageOffset + pmapIndex*PMapCoverageBytes
+	eof := s.FileEOF()
 	for bit := 0; bit < SlotsPerAMap; bit++ {
 		ib := start + uint64(bit)*uint64(PageSize)
+		if ib+uint64(PageSize) > eof {
+			continue
+		}
 		if !s.anyAllocated(ib, PageSize) {
 			return true
 		}
@@ -559,18 +564,26 @@ func LoadStore(file []byte) (*Store, error) {
 	if len(file) < int(DListPageOffset)+PageSize {
 		return nil, invariant(SectionDList, "size", "file too small for DList at 0x%x", DListPageOffset)
 	}
-	dl, err := InspectPage(file[DListPageOffset:DListPageOffset+PageSize], DListPageOffset)
+	dl, err := InspectDList(file[DListPageOffset : DListPageOffset+PageSize])
 	if err != nil {
 		return nil, err
 	}
-	if dl.Type != PageDList {
-		return nil, invariant(SectionDList, "ptype", "got 0x%02x want DList", dl.Type)
+	if h.BidNextP <= dl.Page.BID {
+		return nil, invariant(SectionBID, "bidNextP", "got %d, not strictly beyond DList BID %d (MS-PST %s)", h.BidNextP, dl.Page.BID, SectionBID)
+	}
+	for _, e := range dl.Entries {
+		if uint64(e.PageNum) > last {
+			return nil, invariant(SectionDList, "dwPageNum", "AMap index %d is beyond last AMap %d", e.PageNum, last)
+		}
+	}
+	if uint64(dl.Current) > last {
+		return nil, invariant(SectionDList, "ulCurrentPage", "current AMap %d is beyond last AMap %d", dl.Current, last)
 	}
 	s := &Store{
 		valid:         h.Root.AMapValid,
-		lastAllocAMap: binary.LittleEndian.Uint32(dl.Payload[4:8]),
+		lastAllocAMap: dl.Current,
 		bidNextP:      h.BidNextP,
-		dlistBID:      dl.BID,
+		dlistBID:      dl.Page.BID,
 	}
 	s.regions = make([]region, last+1)
 	for i := uint64(0); i <= last; i++ {

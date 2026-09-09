@@ -535,7 +535,119 @@ func TestFPMapFreeAndFullTransitions(t *testing.T) {
 	if !bitIsSet(bits, 0) {
 		t.Fatal("FPMap bit 0 should be 1 (no free pages)")
 	}
-	if bitIsSet(bits, 1) {
-		t.Fatal("absent PMap 1 should report free pages (bit 0)")
+	if !bitIsSet(bits, 1) {
+		t.Fatal("absent PMap 1 should be bit 1 (no free pages / not in file)")
 	}
+}
+
+func TestFPMapPartialFinalAndBeyondEOF(t *testing.T) {
+	s := NewStore()
+	bits := s.fpMapPayload(0)
+	if bitIsSet(bits, 0) {
+		t.Fatal("partial PMap 0 has free pages")
+	}
+	if !bitIsSet(bits, 1) {
+		t.Fatal("PMap 1 is beyond EOF; FPMap bit must be 1")
+	}
+	for s.RegionCount() < 9 {
+		if err := s.Grow(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bits = s.fpMapPayload(0)
+	if bitIsSet(bits, 0) {
+		t.Fatal("full PMap 0 still has free pages")
+	}
+	if bitIsSet(bits, 1) {
+		t.Fatal("partial PMap 1 (AMap 8 only) still has free pages")
+	}
+	if !bitIsSet(bits, 2) {
+		t.Fatal("PMap 2 is beyond EOF; FPMap bit must be 1")
+	}
+	// Fill the existing coverage of partial PMap 1. Beyond-EOF 512-byte
+	// pages must not count as free.
+	for slot := 0; slot < SlotsPerAMap; slot++ {
+		if bitIsSet(s.regions[8].bitmap[:], slot) {
+			continue
+		}
+		if err := s.mark(slotOffset(8, slot), BytesPerSlot, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.pMapHasFreePages(1) {
+		t.Fatal("filled partial PMap 1 should have no free in-file pages")
+	}
+	bits = s.fpMapPayload(0)
+	if !bitIsSet(bits, 1) {
+		t.Fatal("filled partial PMap 1 should be bit 1")
+	}
+}
+
+func resignDList(page []byte, bid uint64) {
+	max := PageSize - UnicodePageTrailer
+	sig := signature(bid, DListPageOffset)
+	binary.LittleEndian.PutUint16(page[max+2:max+4], sig)
+	binary.LittleEndian.PutUint64(page[max+8:max+16], bid)
+	recrcPage(page)
+}
+
+func TestDListLoadMutations(t *testing.T) {
+	s := NewStore()
+	if err := s.Grow(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadStore(raw); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("dwPageNum-beyond-last", func(t *testing.T) {
+		mut := append([]byte(nil), raw...)
+		page := mut[DListPageOffset : DListPageOffset+PageSize]
+		v := binary.LittleEndian.Uint32(page[8:])
+		free := v >> 20
+		binary.LittleEndian.PutUint32(page[8:], (99&0xFFFFF)|free<<20)
+		recrcPage(page)
+		_, err := LoadStore(mut)
+		mustInvariant(t, err, SectionDList, "dwPageNum")
+	})
+
+	t.Run("dwPageNum-duplicate", func(t *testing.T) {
+		mut := append([]byte(nil), raw...)
+		page := mut[DListPageOffset : DListPageOffset+PageSize]
+		v0 := binary.LittleEndian.Uint32(page[8:])
+		v1 := binary.LittleEndian.Uint32(page[12:])
+		// force entry 1 to the same AMap index as entry 0
+		binary.LittleEndian.PutUint32(page[12:], (v0&0xFFFFF)|(v1>>20)<<20)
+		recrcPage(page)
+		_, err := LoadStore(mut)
+		mustInvariant(t, err, SectionDList, "dwPageNum")
+	})
+
+	t.Run("bid-and-signature-beyond-counter", func(t *testing.T) {
+		mut := append([]byte(nil), raw...)
+		page := mut[DListPageOffset : DListPageOffset+PageSize]
+		resignDList(page, FirstAllocBID+PageBIDIncrement) // BID == bidNextP
+		_, err := LoadStore(mut)
+		mustInvariant(t, err, SectionBID, "bidNextP")
+	})
+
+	t.Run("header-counter-not-beyond-bid", func(t *testing.T) {
+		mut := append([]byte(nil), raw...)
+		binary.LittleEndian.PutUint64(mut[OffBidNextP:], FirstAllocBID)
+		recrcHeader(mut[:UnicodeHeaderSize])
+		_, err := LoadStore(mut)
+		mustInvariant(t, err, SectionBID, "bidNextP")
+	})
+
+	t.Run("null-dlist-bid", func(t *testing.T) {
+		mut := append([]byte(nil), raw...)
+		page := mut[DListPageOffset : DListPageOffset+PageSize]
+		resignDList(page, 0)
+		_, err := LoadStore(mut)
+		mustInvariant(t, err, SectionDList, "bid")
+	})
 }
