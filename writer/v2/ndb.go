@@ -18,19 +18,23 @@ const (
 // NDB is an in-memory Node/Block B-tree catalog. Trees are rebuilt as a whole
 // on Encode (copy-on-write optimization is later). See MS-PST 2.2.2.7.7.
 type NDB struct {
+	store        *Store
 	ids          *SequentialIDs
 	nodes        map[uint64]NBTEntry
 	blocks       map[uint64]BBTEntry
 	dataTreeRefs map[uint64]int
 	subnodeRefs  map[uint64]int
+	livePages    []uint64
 }
 
-// NewNDB returns an empty catalog. Page BIDs come from ids (or SequentialIDs).
+// NewNDB returns an empty catalog. Page BIDs and IBs come from store (or a
+// new Store). Block BIDs come from ids (or SequentialIDs).
 func NewNDB(ids *SequentialIDs) *NDB {
 	if ids == nil {
 		ids = NewSequentialIDs()
 	}
 	return &NDB{
+		store:        NewStore(),
 		ids:          ids,
 		nodes:        make(map[uint64]NBTEntry),
 		blocks:       make(map[uint64]BBTEntry),
@@ -39,7 +43,11 @@ func NewNDB(ids *SequentialIDs) *NDB {
 	}
 }
 
+// Store returns the allocation map backing this catalog.
+func (n *NDB) Store() *Store { return n.store }
+
 // PutBlock registers a data/internal block. cRef starts at 1 (the BBTENTRY).
+// The block may be staged with no external owner; Encode/Commit reclaim it.
 func (n *NDB) PutBlock(e BBTEntry) error {
 	if e.BID == 0 || BIDHasReserved(e.BID) {
 		return invalidArg("bid", "invalid block BID 0x%x (MS-PST %s)", e.BID, SectionBID)
@@ -50,6 +58,23 @@ func (n *NDB) PutBlock(e BBTEntry) error {
 	e.RefCount = 1
 	n.blocks[e.BID] = e
 	return nil
+}
+
+// AllocBlock allocates a data block in the Store and stages a BBTENTRY.
+func (n *NDB) AllocBlock(cb uint16) (BBTEntry, error) {
+	size := BlockDiskSize(uint64(cb))
+	ib, err := n.store.Allocate(size)
+	if err != nil {
+		return BBTEntry{}, err
+	}
+	bid, err := n.ids.TakeBlockBID()
+	if err != nil {
+		_ = n.store.Free(ib, size)
+		return BBTEntry{}, err
+	}
+	e := BBTEntry{BID: bid, IB: ib, CB: cb, RefCount: 1}
+	n.blocks[bid] = e
+	return e, nil
 }
 
 // PutNode inserts or replaces an NBT entry and adjusts BBT reference counts.
@@ -142,7 +167,7 @@ func (n *NDB) releaseExtra(bid uint64, kind extraRef) error {
 	if m[bid] == 0 {
 		delete(m, bid)
 	}
-	return n.resyncRef(bid)
+	return n.resyncAfterDrop(bid)
 }
 
 func (n *NDB) nbtLiveRefs(bid uint64) int {
@@ -187,19 +212,57 @@ func (n *NDB) resyncAfterDrop(bid uint64) error {
 	if bid == 0 {
 		return nil
 	}
+	if _, ok := n.blocks[bid]; !ok {
+		return nil
+	}
 	if err := n.resyncRef(bid); err != nil {
 		return err
 	}
-	e := n.blocks[bid]
-	if e.RefCount <= 1 && n.nbtLiveRefs(bid) == 0 && n.extraLiveRefs(bid) == 0 {
-		delete(n.blocks, bid)
+	if n.nbtLiveRefs(bid) == 0 && n.extraLiveRefs(bid) == 0 {
+		return n.dropBlock(bid)
+	}
+	return nil
+}
+
+func (n *NDB) dropBlock(bid uint64) error {
+	e, ok := n.blocks[bid]
+	if !ok {
+		return nil
+	}
+	delete(n.blocks, bid)
+	delete(n.dataTreeRefs, bid)
+	delete(n.subnodeRefs, bid)
+	return n.freeBlockIB(e)
+}
+
+func (n *NDB) freeBlockIB(e BBTEntry) error {
+	if n.store == nil || e.IB == 0 {
+		return nil
+	}
+	size := BlockDiskSize(uint64(e.CB))
+	if size == 0 || !n.store.allocatedRange(e.IB, size) {
+		return nil
+	}
+	return n.store.Free(e.IB, size)
+}
+
+func (n *NDB) reclaimOrphans() error {
+	var drop []uint64
+	for bid := range n.blocks {
+		if n.nbtLiveRefs(bid) == 0 && n.extraLiveRefs(bid) == 0 {
+			drop = append(drop, bid)
+		}
+	}
+	for _, bid := range drop {
+		if err := n.dropBlock(bid); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // CheckRefCounts verifies every BBT cRef equals 1 + NBT + data-tree + subnode refs.
 func (n *NDB) CheckRefCounts() error {
-	seen := make(map[uint64]struct{})
 	for bid, e := range n.blocks {
 		want := n.computeRef(bid)
 		if e.RefCount != want {
@@ -208,7 +271,6 @@ func (n *NDB) CheckRefCounts() error {
 		if e.BID != bid {
 			return invariant(SectionBBTENTRY, "bid", "map key 0x%x != entry 0x%x", bid, e.BID)
 		}
-		seen[bid] = struct{}{}
 	}
 	for _, e := range n.nodes {
 		for _, bid := range []uint64{e.DataBID, e.SubBID} {
@@ -232,9 +294,12 @@ func (n *NDB) sortedNodes() []NBTEntry {
 	return out
 }
 
-func (n *NDB) sortedBlocks() []BBTEntry {
+func (n *NDB) ownedBlocks() []BBTEntry {
 	out := make([]BBTEntry, 0, len(n.blocks))
 	for _, e := range n.blocks {
+		if n.nbtLiveRefs(e.BID)+n.extraLiveRefs(e.BID) == 0 {
+			continue
+		}
 		out = append(out, e)
 	}
 	sortBBT(out)
@@ -249,30 +314,64 @@ func sortBBT(s []BBTEntry) {
 	sort.Slice(s, func(i, j int) bool { return s[i].BID < s[j].BID })
 }
 
-// TreeImage is a serialized NBT+BBT with pages keyed by IB.
+// TreeImage is a serialized NBT+BBT. Pages is filled by Encode; File is the
+// persisted PST used by OpenTrees (walk follows header ROOT BREFs).
 type TreeImage struct {
 	NBTRoot BREF
 	BBTRoot BREF
 	Pages   map[uint64][]byte // IB -> 512-byte page
+	File    []byte
 }
 
-// Encode rebuilds Unicode NBT and BBT pages. pageBase is the IB of the first page.
-// Page BIDs come from bidNextP (increment 1) and are never the file offset.
-func (n *NDB) Encode(pageBase uint64) (*TreeImage, error) {
+func metadataPageIB(ib uint64) bool {
+	if ib == DListPageOffset {
+		return true
+	}
+	idx, ok := AMapIndexForOffset(ib)
+	if !ok {
+		return true
+	}
+	for _, p := range RegionMapPages(idx) {
+		if p.Offset == ib {
+			return true
+		}
+	}
+	return false
+}
+
+// Encode rebuilds Unicode NBT and BBT pages. Each page is reserved in the
+// AMap; page BIDs come from bidNextP (increment 1) and are never the file
+// offset. Superseded tree pages are freed after the new tree is committed.
+// Unowned (cRef==1) BBT records are reclaimed and not serialized.
+func (n *NDB) Encode() (*TreeImage, error) {
+	if err := n.reclaimOrphans(); err != nil {
+		return nil, err
+	}
 	if err := n.CheckRefCounts(); err != nil {
 		return nil, err
 	}
 	img := &TreeImage{Pages: make(map[uint64][]byte)}
-	nextIB := pageBase
+	var newPages []uint64
+	rollback := func() {
+		for _, ib := range newPages {
+			_ = n.store.Free(ib, PageSize)
+		}
+	}
 	alloc := func(payload []byte, ptype byte) (BREF, error) {
-		bid, err := n.ids.TakePageBID()
+		ib, err := n.store.AllocatePage()
 		if err != nil {
 			return BREF{}, err
 		}
-		ib := nextIB
-		nextIB += uint64(PageSize)
+		newPages = append(newPages, ib)
+		bid := n.store.takePageBID()
 		if bid == ib {
 			return BREF{}, invariant(SectionBID, "bid", "page BID 0x%x equals file offset (MS-PST %s)", bid, SectionBID)
+		}
+		if ib%uint64(PageSize) != 0 {
+			return BREF{}, invariant(SectionBTPAGE, "ib", "page IB 0x%x is not 512-byte aligned", ib)
+		}
+		if metadataPageIB(ib) {
+			return BREF{}, invariant(SectionAMap, "ib", "tree page IB 0x%x collides with metadata", ib)
 		}
 		raw, err := EncodePage(payload, ptype, bid, ib)
 		if err != nil {
@@ -286,17 +385,48 @@ func (n *NDB) Encode(pageBase uint64) (*TreeImage, error) {
 		return encodeBTPayload(PageNBT, 0, chunk, nil, nil)
 	}, MaxNBTLeafEntries)
 	if err != nil {
+		rollback()
 		return nil, err
 	}
-	bbtRoot, err := encodeTree(PageBBT, n.sortedBlocks(), alloc, func(chunk []BBTEntry) ([]byte, error) {
+	bbtRoot, err := encodeTree(PageBBT, n.ownedBlocks(), alloc, func(chunk []BBTEntry) ([]byte, error) {
 		return encodeBTPayload(PageBBT, 0, nil, chunk, nil)
 	}, MaxBBTLeafEntries)
 	if err != nil {
+		rollback()
 		return nil, err
 	}
 	img.NBTRoot = nbtRoot
 	img.BBTRoot = bbtRoot
+
+	for _, ib := range n.livePages {
+		if err := n.store.Free(ib, PageSize); err != nil {
+			rollback()
+			return nil, err
+		}
+	}
+	n.livePages = newPages
+	n.store.SetTreeRoots(img.NBTRoot, img.BBTRoot)
 	return img, nil
+}
+
+// Commit writes a Unicode PST: maps, HEADER ROOT BREFNBT/BREFBBT and bidNextP,
+// and the encoded NBT/BBT pages. Reopen with OpenTrees.
+func (n *NDB) Commit() ([]byte, error) {
+	img, err := n.Encode()
+	if err != nil {
+		return nil, err
+	}
+	file, err := n.store.EncodeFile()
+	if err != nil {
+		return nil, err
+	}
+	for ib, raw := range img.Pages {
+		if ib+uint64(len(raw)) > uint64(len(file)) {
+			return nil, invariant(SectionBTPAGE, "ib", "page at 0x%x exceeds ibFileEof", ib)
+		}
+		copy(file[ib:], raw)
+	}
+	return file, nil
 }
 
 func encodeTree[T interface{ key() uint64 }](ptype byte, leaves []T, alloc func([]byte, byte) (BREF, error), encodeLeaf func([]T) ([]byte, error), maxLeaf int) (BREF, error) {
@@ -352,10 +482,20 @@ func encodeTree[T interface{ key() uint64 }](ptype byte, leaves []T, alloc func(
 	return childRefs[0].Ref, nil
 }
 
+func (img *TreeImage) rawAt(ib uint64) ([]byte, error) {
+	if raw, ok := img.Pages[ib]; ok {
+		return raw, nil
+	}
+	if img.File != nil && ib+uint64(PageSize) <= uint64(len(img.File)) {
+		return img.File[ib : ib+uint64(PageSize)], nil
+	}
+	return nil, invariant(SectionBTPAGE, "ib", "missing page at IB 0x%x", ib)
+}
+
 func (img *TreeImage) page(ref BREF) (*BTPageView, error) {
-	raw, ok := img.Pages[ref.IB]
-	if !ok {
-		return nil, invariant(SectionBTPAGE, "ib", "missing page at IB 0x%x", ref.IB)
+	raw, err := img.rawAt(ref.IB)
+	if err != nil {
+		return nil, err
 	}
 	v, err := InspectBTPage(raw, ref.IB)
 	if err != nil {
@@ -453,11 +593,22 @@ func (img *TreeImage) walkLeaves(root BREF, fn func(*BTPageView) error) error {
 	return nil
 }
 
-// CheckTrees validates first-key separators, unique page BIDs, and BBT coverage.
+// CheckTrees validates first-key separators, unique aligned page IBs/BIDs, and BBT coverage.
 func (img *TreeImage) CheckTrees() error {
 	seenBID := make(map[uint64]uint64)
+	seenIB := make(map[uint64]struct{})
 	var check func(BREF, byte) (uint64, error)
 	check = func(ref BREF, wantType byte) (uint64, error) {
+		if ref.IB%uint64(PageSize) != 0 {
+			return 0, invariant(SectionBTPAGE, "ib", "page IB 0x%x is not 512-byte aligned", ref.IB)
+		}
+		if metadataPageIB(ref.IB) {
+			return 0, invariant(SectionAMap, "ib", "tree page IB 0x%x collides with metadata", ref.IB)
+		}
+		if _, dup := seenIB[ref.IB]; dup {
+			return 0, invariant(SectionBTPAGE, "ib", "duplicate page IB 0x%x", ref.IB)
+		}
+		seenIB[ref.IB] = struct{}{}
 		v, err := img.page(ref)
 		if err != nil {
 			return 0, err
@@ -505,6 +656,9 @@ func (img *TreeImage) CheckTrees() error {
 		if _, dup := bbt[e.BID]; dup {
 			return invariant(SectionBBTENTRY, "bid", "duplicate BBT BID 0x%x", e.BID)
 		}
+		if e.RefCount < 2 {
+			return invariant(SectionRefCount, "cRef", "orphan BBT cRef=%d for BID 0x%x (MS-PST %s)", e.RefCount, e.BID, SectionRefCount)
+		}
 		bbt[e.BID] = e
 		return nil
 	}); err != nil {
@@ -541,6 +695,29 @@ func (img *TreeImage) RootLevel(root BREF) (byte, error) {
 		return 0, err
 	}
 	return v.Level, nil
+}
+
+// OpenTrees reconstructs a TreeImage by following HEADER ROOT BREFNBT/BREFBBT.
+func OpenTrees(file []byte) (*TreeImage, error) {
+	if len(file) < UnicodeHeaderSize {
+		return nil, invariant(SectionHeader, "size", "file is %d bytes, need header", len(file))
+	}
+	h, err := InspectHeader(file[:UnicodeHeaderSize])
+	if err != nil {
+		return nil, err
+	}
+	if h.Root.NBTBID == 0 || h.Root.BBTBID == 0 {
+		return nil, invariant(SectionRoot, "bref", "header NBT/BBT BREF is null (MS-PST %s)", SectionRoot)
+	}
+	img := &TreeImage{
+		NBTRoot: BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
+		BBTRoot: BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
+		File:    file,
+	}
+	if err := img.CheckTrees(); err != nil {
+		return nil, err
+	}
+	return img, nil
 }
 
 // LoadTrees reconstructs an NDB from encoded NBT/BBT leaves.

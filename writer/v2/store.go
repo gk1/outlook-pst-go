@@ -15,6 +15,8 @@ type Store struct {
 	valid         byte
 	bidNextP      uint64
 	dlistBID      uint64
+	nbtRoot       BREF
+	bbtRoot       BREF
 }
 
 type region struct {
@@ -97,8 +99,18 @@ func (s *Store) HeaderDraft() HeaderDraft {
 	d.Root.AMapFree = s.AMapFree()
 	d.Root.PMapFree = 0
 	d.Root.AMapValid = s.valid
+	d.Root.NBTBID = s.nbtRoot.BID
+	d.Root.NBTIB = s.nbtRoot.IB
+	d.Root.BBTBID = s.bbtRoot.BID
+	d.Root.BBTIB = s.bbtRoot.IB
 	d.BidNextP = s.bidNextP
 	return d
+}
+
+// SetTreeRoots records ROOT BREFNBT/BREFBBT for the next header encode.
+func (s *Store) SetTreeRoots(nbt, bbt BREF) {
+	s.nbtRoot = nbt
+	s.bbtRoot = bbt
 }
 
 // SetAMapValid records fAMapValid for the next header encode.
@@ -144,6 +156,60 @@ func (s *Store) Allocate(size uint64) (uint64, error) {
 	idx, _ := AMapIndexForOffset(ib)
 	s.lastAllocAMap = uint32(idx)
 	return ib, nil
+}
+
+// AllocatePage first-fits a 512-byte page on a PageSize boundary so NBT/BBT
+// IBs cannot collide with each other or with 64-byte data-block packing.
+func (s *Store) AllocatePage() (uint64, error) {
+	slots := int(PageSize / BytesPerSlot)
+	if ib, ok := s.firstFitAligned(slots, uint64(PageSize)); ok {
+		if err := s.mark(ib, PageSize, true); err != nil {
+			return 0, err
+		}
+		idx, _ := AMapIndexForOffset(ib)
+		s.lastAllocAMap = uint32(idx)
+		return ib, nil
+	}
+	if err := s.Grow(); err != nil {
+		return 0, err
+	}
+	ib, ok := s.firstFitAligned(slots, uint64(PageSize))
+	if !ok {
+		return 0, limitErr("size", "no 512-aligned page slot in an AMap region (MS-PST %s)", SectionAMap)
+	}
+	if err := s.mark(ib, PageSize, true); err != nil {
+		return 0, err
+	}
+	idx, _ := AMapIndexForOffset(ib)
+	s.lastAllocAMap = uint32(idx)
+	return ib, nil
+}
+
+func (s *Store) firstFitAligned(slots int, align uint64) (uint64, bool) {
+	for i := range s.regions {
+		bm := s.regions[i].bitmap[:]
+		n := SlotsPerAMap
+		slot := 0
+		for slot+slots <= n {
+			ib := slotOffset(uint64(i), slot)
+			if ib%align != 0 {
+				slot++
+				continue
+			}
+			fit := true
+			for k := 0; k < slots; k++ {
+				if bitIsSet(bm, slot+k) {
+					fit = false
+					slot = slot + k + 1
+					break
+				}
+			}
+			if fit {
+				return ib, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // Reserve marks [ib, ib+size) allocated. ib and size must be 64-byte aligned

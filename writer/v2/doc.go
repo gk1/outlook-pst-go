@@ -8,7 +8,8 @@
 // and external/internal block codecs (trailer, CRC, signature, BID, crypt
 // boundaries). PST-005 implements Unicode NBT/BBT construction: first-key
 // BTENTRY separators, page BIDs from bidNextP, and BBT reference-count
-// ownership. Finalize currently returns ErrNotImplemented until later
+// ownership, Store-backed page allocation, and persist via ROOT BREFs.
+// Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //
 // Target (locked by this package):
