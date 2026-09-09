@@ -202,6 +202,9 @@ func EncodeTCINFO(d TableDraft) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(cols) > MaxTCColumns {
+		return nil, invalidArg("cCols", "%d columns after required PidTagLtpRowId/PidTagLtpRowVer exceeds byte cCols %d (MS-PST %s)", len(cols), MaxTCColumns, SectionTCINFO)
+	}
 	cols, rgib, err := assignColumnLayout(cols)
 	if err != nil {
 		return nil, err

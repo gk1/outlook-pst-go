@@ -467,6 +467,63 @@ func TestEncodeTCINFORejectsWrongTypeSpecialTags(t *testing.T) {
 	}
 }
 
+func ordinaryColumns(n int) []ColumnView {
+	out := make([]ColumnView, 0, n)
+	id := uint16(1)
+	for len(out) < n {
+		if id == PidTagLtpRowId || id == PidTagLtpRowVer {
+			id++
+			continue
+		}
+		out = append(out, ColumnView{PropType: PtypInteger32, PropID: id, Size: 4})
+		id++
+	}
+	return out
+}
+
+func TestEncodeTCINFOAccepts255Columns(t *testing.T) {
+	cols := append(ordinaryColumns(253),
+		ColumnView{PropType: PtypInteger32, PropID: PidTagLtpRowId, Size: 4},
+		ColumnView{PropType: PtypInteger32, PropID: PidTagLtpRowVer, Size: 4},
+	)
+	raw, err := EncodeTCINFO(TableDraft{Columns: cols})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := InspectTable(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.NumCols != 255 {
+		t.Fatalf("cCols=%d want 255", view.NumCols)
+	}
+	if got := view.RgIB[3] - view.RgIB[2]; got != 32 {
+		t.Fatalf("CEB width %d, want 32 for cCols=255", got)
+	}
+	id := colByID(t, view.Columns, PidTagLtpRowId)
+	ver := colByID(t, view.Columns, PidTagLtpRowVer)
+	if id.Bit != 0 || id.Offset != 0 || ver.Bit != 1 || ver.Offset != 4 {
+		t.Fatalf("specials %+v %+v", id, ver)
+	}
+}
+
+func TestEncodeTCINFORejects256Columns(t *testing.T) {
+	cols := append(ordinaryColumns(254),
+		ColumnView{PropType: PtypInteger32, PropID: PidTagLtpRowId, Size: 4},
+		ColumnView{PropType: PtypInteger32, PropID: PidTagLtpRowVer, Size: 4},
+	)
+	raw, err := EncodeTCINFO(TableDraft{Columns: cols})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("got %v, want ErrInvalidArg", err)
+	}
+	if raw != nil {
+		t.Fatalf("wrapped table leaked %d bytes", len(raw))
+	}
+}
+
 func TestInspectTableRejectsBadLtpRowId(t *testing.T) {
 	raw := mustEncodeTC(t, TableDraft{Columns: []ColumnView{
 		{PropType: 0x0003, PropID: PidTagLtpRowId, Size: 4},
