@@ -292,9 +292,20 @@ func (r *DataTreeReader) Read(p []byte) (int, error) {
 }
 
 func (n *NDB) flattenDataTree(root uint64) (uint64, []uint64, error) {
+	return n.flattenDataTreeAt(root, map[uint64]struct{}{}, 0)
+}
+
+func (n *NDB) flattenDataTreeAt(root uint64, seen map[uint64]struct{}, depth int) (uint64, []uint64, error) {
 	if root == 0 {
 		return 0, nil, nil
 	}
+	if depth > 2 {
+		return 0, nil, invariant(SectionXXBlock, "cLevel", "data tree deeper than XXBLOCK->XBLOCK->data (MS-PST %s)", SectionXXBlock)
+	}
+	if _, ok := seen[root]; ok {
+		return 0, nil, invariant(SectionXBlock, "rgbid", "cycle or duplicate BID 0x%x", root)
+	}
+	seen[root] = struct{}{}
 	e, ok := n.LookupBlock(root)
 	if !ok {
 		return 0, nil, invalidArg("bid", "missing data-tree root 0x%x", root)
@@ -310,32 +321,68 @@ func (n *NDB) flattenDataTree(root uint64) (uint64, []uint64, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	var leaves []uint64
-	var sum uint64
 	if xb.Level == XBlockLevel {
+		if depth > 1 {
+			return 0, nil, invariant(SectionXXBlock, "cLevel", "XBLOCK nested too deep")
+		}
+		var leaves []uint64
+		var sum uint64
 		for _, bid := range xb.BIDs {
+			if BIDIsInternal(bid) {
+				return 0, nil, invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
+			}
+			if _, dup := seen[bid]; dup {
+				return 0, nil, invariant(SectionXBlock, "rgbid", "duplicate BID 0x%x", bid)
+			}
+			seen[bid] = struct{}{}
 			child, ok := n.LookupBlock(bid)
 			if !ok {
 				return 0, nil, invariant(SectionXBlock, "rgbid", "missing data BID 0x%x", bid)
 			}
-			if BIDIsInternal(bid) {
-				return 0, nil, invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
-			}
 			leaves = append(leaves, bid)
 			sum += uint64(child.CB)
 		}
-	} else {
-		for _, bid := range xb.BIDs {
-			sub, kids, err := n.flattenDataTree(bid)
-			if err != nil {
-				return 0, nil, err
-			}
-			leaves = append(leaves, kids...)
-			sum += sub
+		if sum != uint64(xb.Total) {
+			return 0, nil, invariant(SectionXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
 		}
+		return sum, leaves, nil
+	}
+	if depth != 0 {
+		return 0, nil, invariant(SectionXXBlock, "cLevel", "XXBLOCK 0x%x is not at tree root", root)
+	}
+	var leaves []uint64
+	var sum uint64
+	for _, bid := range xb.BIDs {
+		if _, dup := seen[bid]; dup {
+			return 0, nil, invariant(SectionXXBlock, "rgbid", "cycle or duplicate BID 0x%x", bid)
+		}
+		child, ok := n.LookupBlock(bid)
+		if !ok {
+			return 0, nil, invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
+		}
+		if !BIDIsInternal(bid) {
+			return 0, nil, invariant(SectionXXBlock, "rgbid", "XXBLOCK child 0x%x is not internal", bid)
+		}
+		cdata, err := n.blockPayload(child)
+		if err != nil {
+			return 0, nil, err
+		}
+		cx, err := InspectXBlock(cdata)
+		if err != nil {
+			return 0, nil, err
+		}
+		if cx.Level != XBlockLevel {
+			return 0, nil, invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, cx.Level)
+		}
+		sub, kids, err := n.flattenDataTreeAt(bid, seen, depth+1)
+		if err != nil {
+			return 0, nil, err
+		}
+		leaves = append(leaves, kids...)
+		sum += sub
 	}
 	if sum != uint64(xb.Total) {
-		return 0, nil, invariant(SectionXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
+		return 0, nil, invariant(SectionXXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
 	}
 	return sum, leaves, nil
 }

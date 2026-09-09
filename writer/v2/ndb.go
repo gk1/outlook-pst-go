@@ -117,11 +117,20 @@ func (n *NDB) putPayload(e BBTEntry, data []byte) error {
 	if int(e.CB) != len(data) {
 		return invalidArg("cb", "payload %d bytes, BBT cb %d", len(data), e.CB)
 	}
-	if n.payloads == nil {
-		n.payloads = make(map[uint64][]byte)
+	var raw []byte
+	var err error
+	if BIDIsInternal(e.BID) {
+		raw, err = EncodeInternalBlock(data, e.BID, e.IB)
+	} else {
+		raw, err = EncodeBlock(data, e.BID, e.IB)
 	}
-	n.payloads[e.BID] = append([]byte(nil), data...)
-	return nil
+	if err != nil {
+		return err
+	}
+	if n.payloads != nil {
+		delete(n.payloads, e.BID)
+	}
+	return n.store.writeExtent(e.IB, raw)
 }
 
 func (n *NDB) blockPayload(e BBTEntry) ([]byte, error) {

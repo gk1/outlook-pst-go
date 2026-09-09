@@ -12,7 +12,8 @@
 // bidNextB, and reopen that retains Store maps and allocated payloads.
 // Extra BBT refs reopen as opaque unless PST-006 reconstructs them from
 // XBLOCK/XXBLOCK rgbid and SLENTRY/SIENTRY. PST-006 streams data trees
-// (direct/XBLOCK/XXBLOCK) and SLBLOCK/SIBLOCK subnode trees.
+// (direct/XBLOCK/XXBLOCK) into Store backing as blocks arrive and builds
+// SLBLOCK plus one SIBLOCK (cLevel 0x01) over SLBLOCKs.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

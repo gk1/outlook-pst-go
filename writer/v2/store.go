@@ -621,6 +621,24 @@ func (s *Store) attachBacking(file []byte) {
 	s.backing = append([]byte(nil), file...)
 }
 
+// writeExtent copies an already-encoded block into the backing image.
+func (s *Store) writeExtent(ib uint64, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	end := ib + uint64(len(raw))
+	if end > s.FileEOF() {
+		return invariant(SectionAMap, "ib", "write 0x%x+%d exceeds ibFileEof 0x%x", ib, len(raw), s.FileEOF())
+	}
+	if uint64(len(s.backing)) < s.FileEOF() {
+		nb := make([]byte, s.FileEOF())
+		copy(nb, s.backing)
+		s.backing = nb
+	}
+	copy(s.backing[ib:], raw)
+	return nil
+}
+
 func (s *Store) zeroFreeSlots(buf []byte) {
 	for i := range s.regions {
 		bm := s.regions[i].bitmap[:]

@@ -72,6 +72,7 @@ const (
 	BlockTypeSubnode      byte   = 0x02
 	XBlockLevel           byte   = 1
 	XXBlockLevel          byte   = 2
+	SIBlockLevel          byte   = 1 // SIBLOCK cLevel MUST be 0x01 (MS-PST 2.2.2.8.3.3.2)
 	PageBIDIncrement      uint64 = 1 // page BIDs use all bits (MS-PST 2.2.2.2)
 	BlockBIDIncrement     uint64 = 4 // block BIDs keep reserved/internal bits clear
 	BIDReserved           uint64 = 1 // bid.r MUST be 0

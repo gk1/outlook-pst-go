@@ -39,6 +39,14 @@ func (r repeatByte) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func payloadBytes(n *NDB) int {
+	var s int
+	for _, p := range n.payloads {
+		s += len(p)
+	}
+	return s
+}
+
 func TestXBlockLayoutRoundTrip(t *testing.T) {
 	bids := []uint64{4, 8, 12}
 	raw, err := EncodeXBlock(XBlockLevel, 24, bids)
@@ -158,6 +166,9 @@ func TestXXBlockTransition(t *testing.T) {
 	if xb.Level != XXBlockLevel || xb.Count != 2 {
 		t.Fatalf("xx %+v", xb)
 	}
+	if held := payloadBytes(n); held != 0 {
+		t.Fatalf("XXBLOCK PutDataTree retained %d payload bytes", held)
+	}
 	mustNode(t, n, 0x21, root.BID, 0, 0)
 	file, err := n.Commit()
 	if err != nil {
@@ -190,11 +201,14 @@ func TestXXBlockTransition(t *testing.T) {
 }
 
 func TestDataTreeHashReopenBounded(t *testing.T) {
-	const nBytes = int64(3*MaxDataBlockCB + 100)
+	const nBytes = int64(4 << 20) // 4 MiB: large enough to catch O(n) payload retention
 	n := NewNDB(nil)
 	root, err := n.PutDataTree(io.LimitReader(repeatByte(0x7E), nBytes), nBytes)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if held := payloadBytes(n); held != 0 {
+		t.Fatalf("PutDataTree retained %d payload bytes; want stream-to-backing only", held)
 	}
 	mustNode(t, n, 0x21, root.BID, 0, 0)
 	r1, err := n.OpenDataTree(root.BID)
@@ -278,4 +292,169 @@ func TestXBlockLcbTotalMismatch(t *testing.T) {
 	if _, _, err := n.flattenDataTree(blk.BID); !errors.Is(err, ErrInvariant) {
 		t.Fatalf("lcbTotal: %v", err)
 	}
+}
+
+func TestXXBlockMalformedChildCycleDuplicate(t *testing.T) {
+	t.Run("xx-child-is-xx", func(t *testing.T) {
+		n := NewNDB(nil)
+		leaf := mustAlloc(t, n, 8)
+		if err := n.putPayload(leaf, bytes.Repeat([]byte{1}, 8)); err != nil {
+			t.Fatal(err)
+		}
+		xp, err := EncodeXBlock(XBlockLevel, 8, []uint64{leaf.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		xb, err := n.AllocInternalBlock(uint16(len(xp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(xb, xp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(leaf.BID); err != nil {
+			t.Fatal(err)
+		}
+		innerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{xb.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner, err := n.AllocInternalBlock(uint16(len(innerp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(inner, innerp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(xb.BID); err != nil {
+			t.Fatal(err)
+		}
+		outerp, err := EncodeXBlock(XXBlockLevel, 8, []uint64{inner.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outer, err := n.AllocInternalBlock(uint16(len(outerp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(outer, outerp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(inner.BID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := n.flattenDataTree(outer.BID); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("xx->xx: %v", err)
+		}
+		if err := n.dropBlock(outer.BID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := n.LookupBlock(inner.BID); ok {
+			t.Fatal("inner XX leaked after drop")
+		}
+		if _, ok := n.LookupBlock(xb.BID); ok {
+			t.Fatal("XBLOCK leaked after drop")
+		}
+		if _, ok := n.LookupBlock(leaf.BID); ok {
+			t.Fatal("leaf leaked after drop")
+		}
+	})
+	t.Run("self-cycle", func(t *testing.T) {
+		n := NewNDB(nil)
+		xx, err := n.AllocInternalBlock(8 + 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := EncodeXBlock(XXBlockLevel, 1, []uint64{xx.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uint16(len(payload)) != xx.CB {
+			xx2, err := n.AllocInternalBlock(uint16(len(payload)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = n.dropBlock(xx.BID)
+			xx = xx2
+			payload, err = EncodeXBlock(XXBlockLevel, 1, []uint64{xx.BID})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := n.putPayload(xx, payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := n.flattenDataTree(xx.BID); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("cycle: %v", err)
+		}
+		if err := n.dropBlock(xx.BID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := n.LookupBlock(xx.BID); ok {
+			t.Fatal("self-cycle block leaked")
+		}
+	})
+	t.Run("duplicate-leaf", func(t *testing.T) {
+		n := NewNDB(nil)
+		leaf := mustAlloc(t, n, 8)
+		if err := n.putPayload(leaf, bytes.Repeat([]byte{9}, 8)); err != nil {
+			t.Fatal(err)
+		}
+		xp, err := EncodeXBlock(XBlockLevel, 8, []uint64{leaf.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		xb1, err := n.AllocInternalBlock(uint16(len(xp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(xb1, xp); err != nil {
+			t.Fatal(err)
+		}
+		xb2, err := n.AllocInternalBlock(uint16(len(xp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(xb2, xp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(leaf.BID); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(leaf.BID); err != nil {
+			t.Fatal(err)
+		}
+		xxp, err := EncodeXBlock(XXBlockLevel, 16, []uint64{xb1.BID, xb2.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		xx, err := n.AllocInternalBlock(uint16(len(xxp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(xx, xxp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(xb1.BID); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(xb2.BID); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := n.flattenDataTree(xx.BID); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("dup leaf: %v", err)
+		}
+		if err := n.dropBlock(xx.BID); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := n.LookupBlock(xb1.BID); ok {
+			t.Fatal("xb1 leaked")
+		}
+		if _, ok := n.LookupBlock(xb2.BID); ok {
+			t.Fatal("xb2 leaked")
+		}
+		if _, ok := n.LookupBlock(leaf.BID); ok {
+			t.Fatal("shared leaf leaked")
+		}
+	})
 }

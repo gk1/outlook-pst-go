@@ -56,8 +56,8 @@ func EncodeSLBlock(entries []SLEntry) ([]byte, error) {
 }
 
 func EncodeSIBlock(level byte, kids []SIEntry) ([]byte, error) {
-	if level == 0 {
-		return nil, invalidArg("cLevel", "SIBLOCK cLevel must be > 0 (MS-PST %s)", SectionSIBlock)
+	if level != SIBlockLevel {
+		return nil, invalidArg("cLevel", "SIBLOCK cLevel must be 0x01 (MS-PST %s)", SectionSIBlock)
 	}
 	if len(kids) == 0 {
 		return nil, invalidArg("cEnt", "SIBLOCK has no entries (MS-PST %s)", SectionSIBlock)
@@ -148,6 +148,9 @@ func InspectSubnodeBlock(data []byte) (*SubnodeView, error) {
 		}
 		return v, nil
 	}
+	if v.Level != SIBlockLevel {
+		return nil, invariant(SectionSIBlock, "cLevel", "got %d want 0x01 (MS-PST %s)", v.Level, SectionSIBlock)
+	}
 	if int(v.Count) > MaxSIBlockEntries {
 		return nil, invariant(SectionSIBlock, "cEnt", "got %d max %d", v.Count, MaxSIBlockEntries)
 	}
@@ -231,56 +234,35 @@ func (n *NDB) buildSubnodeTree(entries []SLEntry, note func(BBTEntry)) (BBTEntry
 		}
 		leaves = append(leaves, SIEntry{Key: chunk[0].NID, Ref: blk.BID})
 	}
-	return n.buildSILevels(leaves, 1, note)
+	return n.buildSIRoot(leaves, note)
 }
 
-func (n *NDB) buildSILevels(kids []SIEntry, level byte, note func(BBTEntry)) (BBTEntry, error) {
-	if len(kids) == 1 && level == 1 {
-		e, _ := n.LookupBlock(kids[0].Ref)
-		return e, nil
-	}
+func (n *NDB) buildSIRoot(kids []SIEntry, note func(BBTEntry)) (BBTEntry, error) {
 	if len(kids) == 1 {
 		e, _ := n.LookupBlock(kids[0].Ref)
 		return e, nil
 	}
-	var next []SIEntry
-	for i := 0; i < len(kids); i += MaxSIBlockEntries {
-		end := i + MaxSIBlockEntries
-		if end > len(kids) {
-			end = len(kids)
-		}
-		chunk := kids[i:end]
-		if len(chunk) == 1 && len(next) == 0 && i+1 >= len(kids) {
-			e, _ := n.LookupBlock(chunk[0].Ref)
-			return e, nil
-		}
-		payload, err := EncodeSIBlock(level, chunk)
-		if err != nil {
+	if len(kids) > MaxSIBlockEntries {
+		return BBTEntry{}, limitErr("cEnt", "need %d SLBLOCKs, max %d in one SIBLOCK (MS-PST %s)", len(kids), MaxSIBlockEntries, SectionSIBlock)
+	}
+	payload, err := EncodeSIBlock(SIBlockLevel, kids)
+	if err != nil {
+		return BBTEntry{}, err
+	}
+	blk, err := n.AllocInternalBlock(uint16(len(payload)))
+	if err != nil {
+		return BBTEntry{}, err
+	}
+	note(blk)
+	if err := n.putPayload(blk, payload); err != nil {
+		return BBTEntry{}, err
+	}
+	for _, k := range kids {
+		if err := n.AddSubnodeRef(k.Ref); err != nil {
 			return BBTEntry{}, err
 		}
-		blk, err := n.AllocInternalBlock(uint16(len(payload)))
-		if err != nil {
-			return BBTEntry{}, err
-		}
-		note(blk)
-		if err := n.putPayload(blk, payload); err != nil {
-			return BBTEntry{}, err
-		}
-		for _, k := range chunk {
-			if err := n.AddSubnodeRef(k.Ref); err != nil {
-				return BBTEntry{}, err
-			}
-		}
-		next = append(next, SIEntry{Key: chunk[0].Key, Ref: blk.BID})
 	}
-	if len(next) == 1 {
-		e, _ := n.LookupBlock(next[0].Ref)
-		return e, nil
-	}
-	if level == 255 {
-		return BBTEntry{}, limitErr("cLevel", "subnode tree exceeds max depth (MS-PST %s)", SectionSIBlock)
-	}
-	return n.buildSILevels(next, level+1, note)
+	return blk, nil
 }
 
 // WalkSubnodes visits every SLENTRY in NID order.
@@ -296,8 +278,8 @@ func (n *NDB) WalkSubnodes(root uint64, fn func(SLEntry) error) error {
 }
 
 func (n *NDB) walkSubnode(e BBTEntry, fn func(SLEntry) error, depth int) error {
-	if depth > 8 {
-		return invariant(SectionSIBlock, "cLevel", "subnode walk exceeded depth 8")
+	if depth > 1 {
+		return invariant(SectionSIBlock, "cLevel", "subnode walk exceeded SIBLOCK->SLBLOCK (MS-PST %s)", SectionSIBlock)
 	}
 	data, err := n.blockPayload(e)
 	if err != nil {
@@ -315,8 +297,10 @@ func (n *NDB) walkSubnode(e BBTEntry, fn func(SLEntry) error, depth int) error {
 		}
 		return nil
 	}
-	var first uint64
-	for i, k := range v.Kids {
+	if v.Level != SIBlockLevel {
+		return invariant(SectionSIBlock, "cLevel", "got %d want 0x01", v.Level)
+	}
+	for _, k := range v.Kids {
 		child, ok := n.LookupBlock(k.Ref)
 		if !ok {
 			return invariant(SectionSIBlock, "bid", "missing child 0x%x", k.Ref)
@@ -328,10 +312,17 @@ func (n *NDB) walkSubnode(e BBTEntry, fn func(SLEntry) error, depth int) error {
 		if k.Key != fk {
 			return invariant(SectionSIBlock, "nid", "separator 0x%x is not child first key 0x%x", k.Key, fk)
 		}
-		if i == 0 {
-			first = fk
+		cdata, err := n.blockPayload(child)
+		if err != nil {
+			return err
 		}
-		_ = first
+		cv, err := InspectSubnodeBlock(cdata)
+		if err != nil {
+			return err
+		}
+		if cv.Level != 0 {
+			return invariant(SectionSIBlock, "bid", "SIENTRY 0x%x must point to an SLBLOCK (MS-PST %s)", k.Ref, SectionSIBlock)
+		}
 		if err := n.walkSubnode(child, fn, depth+1); err != nil {
 			return err
 		}
@@ -348,14 +339,11 @@ func (n *NDB) subnodeFirstKey(e BBTEntry) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if v.Level == 0 {
-		if len(v.Leaves) == 0 {
-			return 0, invariant(SectionSLBlock, "cEnt", "empty SLBLOCK")
-		}
-		return v.Leaves[0].NID, nil
+	if v.Level != 0 {
+		return 0, invariant(SectionSIBlock, "cLevel", "SIENTRY child must be an SLBLOCK, got cLevel %d", v.Level)
 	}
-	if len(v.Kids) == 0 {
-		return 0, invariant(SectionSIBlock, "cEnt", "empty SIBLOCK")
+	if len(v.Leaves) == 0 {
+		return 0, invariant(SectionSLBlock, "cEnt", "empty SLBLOCK")
 	}
-	return v.Kids[0].Key, nil
+	return v.Leaves[0].NID, nil
 }

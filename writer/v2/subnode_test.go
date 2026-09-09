@@ -181,29 +181,31 @@ func TestSubnodeForcesSIBlock(t *testing.T) {
 	}
 }
 
-func TestSubnodeThreeLevelSynthetic(t *testing.T) {
-	// Build 3-level SI without filling 170k leaves: encode two SI level-1
-	// blocks as children of a level-2 SIBLOCK and inspect first-key.
-	l1a, err := EncodeSIBlock(1, []SIEntry{{Key: 1, Ref: MakeInternalBID(8)}, {Key: 10, Ref: MakeInternalBID(12)}})
+func TestSIBlockRejectsLevelNotOne(t *testing.T) {
+	kids := []SIEntry{{Key: 0x21, Ref: MakeInternalBID(8)}}
+	if _, err := EncodeSIBlock(2, kids); !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("cLevel 2: %v", err)
+	}
+	if _, err := EncodeSIBlock(0, kids); !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("cLevel 0: %v", err)
+	}
+	raw, err := EncodeSIBlock(1, kids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	l1b, err := EncodeSIBlock(1, []SIEntry{{Key: 100, Ref: MakeInternalBID(16)}, {Key: 110, Ref: MakeInternalBID(20)}})
-	if err != nil {
-		t.Fatal(err)
+	raw[1] = 2
+	if _, err := InspectSubnodeBlock(raw); !errors.Is(err, ErrInvariant) {
+		t.Fatalf("inspect cLevel 2: %v", err)
 	}
-	_ = l1a
-	_ = l1b
-	raw, err := EncodeSIBlock(2, []SIEntry{{Key: 1, Ref: MakeInternalBID(24)}, {Key: 100, Ref: MakeInternalBID(28)}})
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestSIBlockCapacityExceeded(t *testing.T) {
+	kids := make([]SIEntry, MaxSIBlockEntries+1)
+	for i := range kids {
+		kids[i] = SIEntry{Key: uint64(i + 1), Ref: MakeInternalBID(uint64(8 + 4*i))}
 	}
-	v, err := InspectSubnodeBlock(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.Level != 2 || v.Kids[0].Key != 1 || v.Kids[1].Key != 100 {
-		t.Fatalf("%+v", v)
+	if _, err := EncodeSIBlock(SIBlockLevel, kids); !errors.Is(err, ErrLimit) {
+		t.Fatalf("over capacity: %v", err)
 	}
 }
 
