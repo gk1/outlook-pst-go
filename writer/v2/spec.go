@@ -35,8 +35,10 @@ const (
 	MaxDataBlockCB               = 8176
 	UnicodeWVer                  = 23
 	UnicodeWVerMin               = 23
+	UnicodeWVerMax               = 23 // existing reader (disk.ReadHeader) accepts 20-23
 	UnicodeWVerWIP               = 37
 	ClientVerPST                 = 19
+	FirstAllocBID         uint64 = 4 // BID 0 is null; first assignable page/block BID
 	NIDIndexDefault       uint32 = 0x400
 	NIDIndexSearchFolder  uint32 = 0x4000
 	NIDIndexNormalMessage uint32 = 0x10000

@@ -46,7 +46,8 @@ type RootView struct {
 
 // HeaderDraft is the input to EncodeUnicodeHeader.
 // Reserved HEADER/ROOT bytes are always written as zero. rgbFM/rgbFP are
-// always 0xFF. Platform bytes are always 0x01. wVer is Unicode 23.
+// always 0xFF. Platform bytes are always 0x01. wVer is Unicode 23 and
+// wVerClient is 19 (zero defaults to those; any other value is rejected).
 type HeaderDraft struct {
 	MagicClient uint16
 	WVer        uint16
@@ -60,6 +61,8 @@ type HeaderDraft struct {
 }
 
 // RootDraft is the input to EncodeUnicodeRoot.
+// fAMapValid is written as given (0=INVALID_AMAP is preserved for
+// transaction staging). EncodeUnicodeRoot never coerces 0 to VALID_AMAP2.
 type RootDraft struct {
 	FileEOF   uint64
 	AMapLast  uint64
@@ -85,24 +88,22 @@ func DefaultRgNID() [32]uint32 {
 }
 
 // DefaultHeaderDraft returns a committed Unicode v23 header skeleton.
+// NBT/BBT BREFs are deliberately unassigned (BID 0 / IB 0). Page and block
+// BID counters start at FirstAllocBID so they do not collide with the null BID.
 func DefaultHeaderDraft() HeaderDraft {
 	return HeaderDraft{
 		MagicClient: ClientMagicPST,
 		WVer:        UnicodeWVer,
 		WVerClient:  ClientVerPST,
-		BidNextP:    4,
+		BidNextP:    FirstAllocBID,
 		Unique:      1,
 		NIDs:        DefaultRgNID(),
 		Crypt:       CryptNone,
-		BidNextB:    4,
+		BidNextB:    FirstAllocBID,
 		Root: RootDraft{
 			FileEOF:   FirstAMapPageOffset + PageSize,
 			AMapLast:  FirstAMapPageOffset,
 			AMapValid: AMapValid2,
-			NBTBID:    4,
-			NBTIB:     0x2000, // placeholder; later codecs assign real BREFs
-			BBTBID:    8,
-			BBTIB:     0x2200,
 		},
 	}
 }
@@ -128,8 +129,15 @@ func validateHeaderDraft(d HeaderDraft) error {
 	if wver == UnicodeWVerWIP {
 		return unsupported(FeatureWIPCrypt, fmt.Sprintf("wVer=%d (MS-PST %s)", wver, SectionHeader))
 	}
-	if wver < UnicodeWVerMin {
-		return invalidArg("wVer", "got %d, Unicode creators MUST use >= %d (MS-PST %s)", wver, UnicodeWVerMin, SectionHeader)
+	if wver != UnicodeWVer {
+		return invalidArg("wVer", "got %d, this writer emits wVer=%d so output round-trips through disk.ReadHeader (MS-PST %s)", wver, UnicodeWVer, SectionHeader)
+	}
+	wverClient := d.WVerClient
+	if wverClient == 0 {
+		wverClient = ClientVerPST
+	}
+	if wverClient != ClientVerPST {
+		return invalidArg("wVerClient", "got %d want %d (MS-PST %s)", wverClient, ClientVerPST, SectionHeader)
 	}
 	switch d.Crypt {
 	case CryptNone, CryptPermute, CryptCyclic:
@@ -138,12 +146,10 @@ func validateHeaderDraft(d HeaderDraft) error {
 	default:
 		return invalidArg("bCryptMethod", "unknown 0x%02x (MS-PST %s)", d.Crypt, SectionCrypt)
 	}
-	amap := d.Root.AMapValid
-	if amap == 0 {
-		amap = AMapValid2
-	}
-	if amap != AMapValid2 {
-		return invalidArg("fAMapValid", "new files MUST use VALID_AMAP2 0x02, got 0x%02x (MS-PST %s)", amap, SectionRoot)
+	switch d.Root.AMapValid {
+	case AMapValid2, AMapInvalid, AMapValid1:
+	default:
+		return invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", d.Root.AMapValid, SectionRoot)
 	}
 	return nil
 }
@@ -156,13 +162,12 @@ func writeHeaderCRC(buf []byte) {
 }
 
 // EncodeUnicodeRoot writes the 72-byte Unicode ROOT. Reserved fields are zero.
+// fAMapValid is preserved, including INVALID_AMAP (0) for transaction staging.
 func EncodeUnicodeRoot(r RootDraft) ([]byte, error) {
-	amap := r.AMapValid
-	if amap == 0 {
-		amap = AMapValid2
-	}
-	if amap != AMapValid2 && amap != AMapInvalid && amap != AMapValid1 {
-		return nil, invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", amap, SectionRoot)
+	switch r.AMapValid {
+	case AMapValid2, AMapInvalid, AMapValid1:
+	default:
+		return nil, invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", r.AMapValid, SectionRoot)
 	}
 	buf := make([]byte, UnicodeRootSize)
 	binary.LittleEndian.PutUint64(buf[OffRootFileEOF:], r.FileEOF)
@@ -173,7 +178,7 @@ func EncodeUnicodeRoot(r RootDraft) ([]byte, error) {
 	binary.LittleEndian.PutUint64(buf[OffRootNBTIB:], r.NBTIB)
 	binary.LittleEndian.PutUint64(buf[OffRootBBTBID:], r.BBTBID)
 	binary.LittleEndian.PutUint64(buf[OffRootBBTIB:], r.BBTIB)
-	buf[OffRootAMapValid] = amap
+	buf[OffRootAMapValid] = r.AMapValid
 	return buf, nil
 }
 
@@ -196,11 +201,9 @@ func InspectRoot(raw []byte) (*RootView, error) {
 	}
 	amap := b[OffRootAMapValid]
 	switch amap {
-	case AMapValid2:
-	case AMapInvalid:
-		return nil, invariant(SectionRoot, "fAMapValid", "INVALID_AMAP 0x00 is not a committed file (MS-PST 2.6.1.3.7)")
-	case AMapValid1:
-		return nil, invariant(SectionRoot, "fAMapValid", "VALID_AMAP1 0x01 is deprecated; new files use VALID_AMAP2 0x02")
+	case AMapValid2, AMapInvalid, AMapValid1:
+		// All MS-PST 2.2.2.5 values. InspectHeader requires VALID_AMAP2
+		// for a committed file; transaction staging uses INVALID_AMAP.
 	default:
 		return nil, invariant(SectionRoot, "fAMapValid", "unknown 0x%02x", amap)
 	}
@@ -234,9 +237,6 @@ func EncodeUnicodeHeader(d HeaderDraft) ([]byte, error) {
 	}
 	if d.WVerClient == 0 {
 		d.WVerClient = ClientVerPST
-	}
-	if d.Root.AMapValid == 0 {
-		d.Root.AMapValid = AMapValid2
 	}
 	root, err := EncodeUnicodeRoot(d.Root)
 	if err != nil {
@@ -286,8 +286,12 @@ func InspectHeader(raw []byte) (*HeaderView, error) {
 	if wver == UnicodeWVerWIP {
 		return nil, unsupported(FeatureWIPCrypt, fmt.Sprintf("wVer=%d (MS-PST %s)", wver, SectionHeader))
 	}
-	if wver < UnicodeWVerMin {
-		return nil, invariant(SectionHeader, "wVer", "unsupported version %d; Unicode MUST be >= %d", wver, UnicodeWVerMin)
+	if wver != UnicodeWVer {
+		return nil, invariant(SectionHeader, "wVer", "got %d want %d (writer contract; existing reader max is %d)", wver, UnicodeWVer, UnicodeWVerMax)
+	}
+	wverClient := binary.LittleEndian.Uint16(b[OffWVerClient:])
+	if wverClient != ClientVerPST {
+		return nil, invariant(SectionHeader, "wVerClient", "got %d want %d", wverClient, ClientVerPST)
 	}
 	client := binary.LittleEndian.Uint16(b[OffMagicClient:])
 	if client == ClientMagicOST {
@@ -345,12 +349,15 @@ func InspectHeader(raw []byte) (*HeaderView, error) {
 	if err != nil {
 		return nil, err
 	}
+	if root.AMapValid != AMapValid2 {
+		return nil, invariant(SectionRoot, "fAMapValid", "committed header MUST use VALID_AMAP2 0x02, got 0x%02x (MS-PST 2.6.1.3.7)", root.AMapValid)
+	}
 	h := &HeaderView{
 		Magic:          magic,
 		CRCPartial:     gotPartial,
 		MagicClient:    client,
 		WVer:           wver,
-		WVerClient:     binary.LittleEndian.Uint16(b[OffWVerClient:]),
+		WVerClient:     wverClient,
 		PlatformCreate: b[OffPlatformCreate],
 		PlatformAccess: b[OffPlatformAccess],
 		Reserved1:      binary.LittleEndian.Uint32(b[OffReserved1:]),

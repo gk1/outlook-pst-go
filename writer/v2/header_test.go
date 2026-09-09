@@ -271,6 +271,12 @@ func TestInspectHeaderMutations(t *testing.T) {
 		{name: "wVer-low", section: SectionHeader, field: "wVer", patch: func(b []byte) {
 			binary.LittleEndian.PutUint16(b[OffWVer:], 1)
 		}, recrc: true},
+		{name: "wVer-high", section: SectionHeader, field: "wVer", patch: func(b []byte) {
+			binary.LittleEndian.PutUint16(b[OffWVer:], 24)
+		}, recrc: true},
+		{name: "wVerClient", section: SectionHeader, field: "wVerClient", patch: func(b []byte) {
+			binary.LittleEndian.PutUint16(b[OffWVerClient:], 12)
+		}, recrc: true},
 		{name: "bPlatformCreate", section: SectionHeader, field: "bPlatformCreate", patch: func(b []byte) { b[OffPlatformCreate] = 0 }, recrc: true},
 		{name: "bPlatformAccess", section: SectionHeader, field: "bPlatformAccess", patch: func(b []byte) { b[OffPlatformAccess] = 2 }, recrc: true},
 		{name: "qwUnused", section: SectionHeader, field: "qwUnused", patch: func(b []byte) { b[OffQWUnused] = 1 }, recrc: true},
@@ -350,5 +356,121 @@ func TestInspectHeaderCRCSpans(t *testing.T) {
 	}
 	if view.CRCPartial == 0 || view.CRCFull == 0 {
 		t.Fatal("crc zero")
+	}
+}
+
+func TestEncodeUnicodeHeaderRejectsHighWVer(t *testing.T) {
+	d := DefaultHeaderDraft()
+	d.WVer = 24
+	_, err := EncodeUnicodeHeader(d)
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("got %v, want ErrInvalidArg", err)
+	}
+	var we *Error
+	if !errors.As(err, &we) || we.Field != "wVer" {
+		t.Fatalf("field=%q err=%v", we.Field, err)
+	}
+}
+
+func TestEncodeUnicodeHeaderRequiresWVerClient19(t *testing.T) {
+	d := DefaultHeaderDraft()
+	d.WVerClient = 12
+	_, err := EncodeUnicodeHeader(d)
+	if !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("got %v, want ErrInvalidArg", err)
+	}
+	d = DefaultHeaderDraft()
+	d.WVer = 0
+	d.WVerClient = 0
+	raw := mustHeader(t, d)
+	if binary.LittleEndian.Uint16(raw[OffWVer:]) != UnicodeWVer {
+		t.Fatalf("wVer %d", binary.LittleEndian.Uint16(raw[OffWVer:]))
+	}
+	if binary.LittleEndian.Uint16(raw[OffWVerClient:]) != ClientVerPST {
+		t.Fatalf("wVerClient %d", binary.LittleEndian.Uint16(raw[OffWVerClient:]))
+	}
+}
+
+func TestDefaultHeaderUnassignedBTrees(t *testing.T) {
+	d := DefaultHeaderDraft()
+	if d.Root.NBTBID != 0 || d.Root.NBTIB != 0 || d.Root.BBTBID != 0 || d.Root.BBTIB != 0 {
+		t.Fatalf("placeholder BREFs %+v", d.Root)
+	}
+	if d.BidNextP != FirstAllocBID || d.BidNextB != FirstAllocBID {
+		t.Fatalf("BID counters p=%d b=%d", d.BidNextP, d.BidNextB)
+	}
+	raw := mustHeader(t, d)
+	h, err := disk.ReadHeader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Root.BRefNBT.BID != 0 || h.Root.BRefNBT.IB != 0 {
+		t.Fatalf("nbt %+v", h.Root.BRefNBT)
+	}
+	if h.Root.BRefBBT.BID != 0 || h.Root.BRefBBT.IB != 0 {
+		t.Fatalf("bbt %+v", h.Root.BRefBBT)
+	}
+	if h.BidNextP != FirstAllocBID || h.BidNextB != FirstAllocBID {
+		t.Fatalf("reader counters p=%d b=%d", h.BidNextP, h.BidNextB)
+	}
+}
+
+func TestEncodeUnicodeRootPreservesInvalidAMap(t *testing.T) {
+	r := DefaultHeaderDraft().Root
+	r.AMapValid = AMapInvalid
+	raw, err := EncodeUnicodeRoot(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[OffRootAMapValid] != AMapInvalid {
+		t.Fatalf("encoded 0x%02x, coerced away from INVALID_AMAP", raw[OffRootAMapValid])
+	}
+	view, err := InspectRoot(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.AMapValid != AMapInvalid {
+		t.Fatalf("round-trip %d", view.AMapValid)
+	}
+
+	r.AMapValid = AMapValid1
+	raw, err = EncodeUnicodeRoot(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[OffRootAMapValid] != AMapValid1 {
+		t.Fatalf("VALID_AMAP1 encoded 0x%02x", raw[OffRootAMapValid])
+	}
+	view, err = InspectRoot(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.AMapValid != AMapValid1 {
+		t.Fatalf("VALID_AMAP1 round-trip %d", view.AMapValid)
+	}
+}
+
+func TestEncodeUnicodeHeaderTransactionInvalidAMap(t *testing.T) {
+	d := DefaultHeaderDraft()
+	d.Root.AMapValid = AMapInvalid
+	raw := mustHeader(t, d)
+	if raw[OffRoot+OffRootAMapValid] != AMapInvalid {
+		t.Fatalf("header coerced fAMapValid to 0x%02x", raw[OffRoot+OffRootAMapValid])
+	}
+	_, err := InspectHeader(raw)
+	mustInvariant(t, err, SectionRoot, "fAMapValid")
+	view, err := InspectRoot(raw[OffRoot : OffRoot+UnicodeRootSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.AMapValid != AMapInvalid {
+		t.Fatalf("root view %d", view.AMapValid)
+	}
+	h, err := disk.ReadHeader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Root.FAMapValid != AMapInvalid {
+		t.Fatalf("reader fAMapValid %d", h.Root.FAMapValid)
 	}
 }

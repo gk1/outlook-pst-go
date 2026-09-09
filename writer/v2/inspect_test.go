@@ -54,7 +54,7 @@ func TestInspectHeaderMalformedMagic(t *testing.T) {
 
 func TestInspectHeaderMalformedCRC(t *testing.T) {
 	raw := mustHeader(t, DefaultHeaderDraft())
-	raw[OffWVerClient] ^= 0x01 // covered by both CRC spans; recompute not done
+	raw[OffUnique] ^= 0x01 // covered by both CRC spans; recompute not done
 	_, err := InspectHeader(raw)
 	mustInvariant(t, err, SectionHeader, "dwCRCPartial")
 }
