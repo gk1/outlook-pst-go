@@ -13,6 +13,8 @@ type Store struct {
 	regions       []region
 	lastAllocAMap uint32
 	valid         byte
+	bidNextP      uint64
+	dlistBID      uint64
 }
 
 type region struct {
@@ -23,9 +25,18 @@ type region struct {
 // PMap at 0x4600, and a DList at 0x4200. Header/DList live in the unmapped
 // prefix before 0x4400.
 func NewStore() *Store {
-	s := &Store{valid: AMapValid2}
+	s := &Store{valid: AMapValid2, bidNextP: FirstAllocBID}
+	s.dlistBID = s.takePageBID()
 	s.mustGrow()
 	return s
+}
+
+// takePageBID assigns the next page BID from bidNextP. Page BIDs keep the
+// reserved and internal bits clear (MS-PST 2.2.2.2) by advancing 4.
+func (s *Store) takePageBID() uint64 {
+	bid := s.bidNextP
+	s.bidNextP += PageBIDIncrement
+	return bid
 }
 
 func (s *Store) mustGrow() {
@@ -84,6 +95,7 @@ func (s *Store) HeaderDraft() HeaderDraft {
 	d.Root.AMapFree = s.AMapFree()
 	d.Root.PMapFree = 0
 	d.Root.AMapValid = s.valid
+	d.BidNextP = s.bidNextP
 	return d
 }
 
@@ -102,6 +114,9 @@ func (s *Store) SetAMapValid(v byte) error {
 // Grows by whole AMap regions when the request does not fit. The allocation
 // never spans an AMap region. See MS-PST 2.6.1.1.2.
 func (s *Store) Allocate(size uint64) (uint64, error) {
+	if size > MaxAllocBytes {
+		return 0, limitErr("size", "allocation %d exceeds MS-PST max %d", size, MaxAllocBytes)
+	}
 	slots, err := slotsForSize(size)
 	if err != nil {
 		return 0, err
@@ -132,6 +147,9 @@ func (s *Store) Allocate(size uint64) (uint64, error) {
 // Reserve marks [ib, ib+size) allocated. ib and size must be 64-byte aligned
 // and lie inside mapped space. Fails if any slot is already allocated.
 func (s *Store) Reserve(ib, size uint64) error {
+	if size > MaxAllocBytes {
+		return limitErr("size", "reserve %d exceeds MS-PST max %d", size, MaxAllocBytes)
+	}
 	if ib%BytesPerSlot != 0 {
 		return invalidArg("ib", "offset 0x%x is not %d-byte aligned", ib, BytesPerSlot)
 	}
@@ -414,16 +432,40 @@ func (s *Store) encodeFMap(k uint64) ([]byte, error) {
 }
 
 func (s *Store) encodeFPMapAt(off uint64) ([]byte, error) {
-	payload := bytesFilled(AMapBitmapBytes, 0xFF)
-	return EncodePage(payload, PageFPMap, off, off)
+	idx, ok := AMapIndexForOffset(off)
+	if !ok {
+		return nil, invalidArg("ib", "FPMap at 0x%x is outside AMap coverage", off)
+	}
+	pmap := PMapIndexForAMap(idx)
+	if pmap < FPMapHeaderPMaps {
+		return nil, invalidArg("ib", "FPMap at 0x%x is in HEADER.rgbFP range", off)
+	}
+	k := (pmap - FPMapHeaderPMaps) / FPMapPagePMaps
+	start := FPMapHeaderPMaps + k*FPMapPagePMaps
+	return EncodePage(s.fpMapPayload(start), PageFPMap, off, off)
 }
 
-func bytesFilled(n int, v byte) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = v
+// pMapHasFreePages reports whether PMap index still has a fully free 512-byte page.
+// FPMap bit 0 means free pages remain; bit 1 means none. See MS-PST 2.2.2.7.6.
+func (s *Store) pMapHasFreePages(pmapIndex uint64) bool {
+	start := FirstAMapPageOffset + pmapIndex*PMapCoverageBytes
+	for bit := 0; bit < SlotsPerAMap; bit++ {
+		ib := start + uint64(bit)*uint64(PageSize)
+		if !s.anyAllocated(ib, PageSize) {
+			return true
+		}
 	}
-	return b
+	return false
+}
+
+func (s *Store) fpMapPayload(startPMap uint64) []byte {
+	payload := make([]byte, AMapBitmapBytes)
+	for bit := 0; bit < SlotsPerAMap; bit++ {
+		if !s.pMapHasFreePages(startPMap + uint64(bit)) {
+			setBit(payload, bit)
+		}
+	}
+	return payload
 }
 
 func (s *Store) encodeDList() ([]byte, error) {
@@ -438,7 +480,7 @@ func (s *Store) encodeDList() ([]byte, error) {
 			continue
 		}
 		ents = append(ents, ent{
-			pageNum: uint32(AMapOffset(uint64(i)) / uint64(PageSize)),
+			pageNum: uint32(i), // zero-based AMap index (MS-PST 2.2.2.7.4.1)
 			free:    free,
 		})
 	}
@@ -459,7 +501,7 @@ func (s *Store) encodeDList() ([]byte, error) {
 		v := (e.pageNum & 0xFFFFF) | uint32(e.free)<<20
 		binary.LittleEndian.PutUint32(payload[8+i*4:], v)
 	}
-	return EncodePage(payload, PageDList, 0, DListPageOffset)
+	return EncodePage(payload, PageDList, s.dlistBID, DListPageOffset)
 }
 
 // EncodeFile writes a Unicode PST image: HEADER, DList at 0x4200, and every
@@ -524,7 +566,12 @@ func LoadStore(file []byte) (*Store, error) {
 	if dl.Type != PageDList {
 		return nil, invariant(SectionDList, "ptype", "got 0x%02x want DList", dl.Type)
 	}
-	s := &Store{valid: h.Root.AMapValid, lastAllocAMap: binary.LittleEndian.Uint32(dl.Payload[4:8])}
+	s := &Store{
+		valid:         h.Root.AMapValid,
+		lastAllocAMap: binary.LittleEndian.Uint32(dl.Payload[4:8]),
+		bidNextP:      h.BidNextP,
+		dlistBID:      dl.BID,
+	}
 	s.regions = make([]region, last+1)
 	for i := uint64(0); i <= last; i++ {
 		off := AMapOffset(i)

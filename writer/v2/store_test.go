@@ -94,6 +94,9 @@ func TestEmptyStoreMapsAndHeader(t *testing.T) {
 	if h.Root.AMapValid != AMapValid2 || h.Root.PMapFree != 0 {
 		t.Fatalf("ROOT %+v", h.Root)
 	}
+	if h.BidNextP != FirstAllocBID+PageBIDIncrement {
+		t.Fatalf("bidNextP %d want %d", h.BidNextP, FirstAllocBID+PageBIDIncrement)
+	}
 	amap, err := InspectAMap(raw[FirstAMapPageOffset:FirstAMapPageOffset+PageSize], FirstAMapPageOffset)
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +118,14 @@ func TestEmptyStoreMapsAndHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dl.Flags != DFLBackfillComplete || dl.Count != 1 || dl.Entries[0].PageNum != uint32(FirstAMapPageOffset/PageSize) {
+	if dl.Flags != DFLBackfillComplete || dl.Count != 1 || dl.Entries[0].PageNum != 0 {
 		t.Fatalf("DList %+v", dl)
+	}
+	if dl.Page.BID != FirstAllocBID {
+		t.Fatalf("DList BID 0x%x want 0x%x", dl.Page.BID, FirstAllocBID)
+	}
+	if dl.Page.Sig != signature(FirstAllocBID, DListPageOffset) {
+		t.Fatalf("DList sig 0x%04x want 0x%04x", dl.Page.Sig, signature(FirstAllocBID, DListPageOffset))
 	}
 	loaded, err := disk.ReadHeader(bytes.NewReader(raw))
 	if err != nil {
@@ -162,13 +171,12 @@ func TestAllocateCrossesAMapRegion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fill := uint64(SlotsPerAMap-18) * BytesPerSlot
-	ib, err := s.Allocate(fill)
-	if err != nil {
+	// Leave one 64-byte hole at the end of region 0. Public Allocate is capped
+	// at 8192, so the bulk fill uses the unexported mark helper.
+	fillStart := first + BytesPerSlot
+	fillSize := (AMapRegionEnd(0) - BytesPerSlot) - fillStart
+	if err := s.mark(fillStart, fillSize, true); err != nil {
 		t.Fatal(err)
-	}
-	if ib != first+BytesPerSlot {
-		t.Fatalf("fill at 0x%x", ib)
 	}
 	if s.RegionCount() != 1 {
 		t.Fatalf("grew early: %d", s.RegionCount())
@@ -316,11 +324,32 @@ func TestReserveRejectsOverlapAndUnaligned(t *testing.T) {
 	}
 }
 
-func TestAllocateRejectsTooLarge(t *testing.T) {
+func TestAllocate8192Boundary(t *testing.T) {
 	s := NewStore()
-	_, err := s.Allocate(AMapCoverageBytes)
+	ib, err := s.Allocate(MaxAllocBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Allocate(MaxAllocBytes + BytesPerSlot)
 	if !errors.Is(err, ErrLimit) {
-		t.Fatalf("got %v", err)
+		t.Fatalf("8256 allocate: %v", err)
+	}
+	if err := s.Reserve(ib+MaxAllocBytes, MaxAllocBytes+BytesPerSlot); !errors.Is(err, ErrLimit) {
+		t.Fatalf("8256 reserve: %v", err)
+	}
+	raw, err := s.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckAllocation(raw); err != nil {
+		t.Fatal(err)
+	}
+	re, err := LoadStore(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.BitmapEqual(re) {
+		t.Fatal("reopen after 8192 alloc mismatch")
 	}
 }
 
@@ -394,5 +423,119 @@ func TestFMapPageAfter128Regions(t *testing.T) {
 	}
 	if pg.Payload[0] != 0xFF {
 		t.Fatalf("FMap[0]=0x%02x", pg.Payload[0])
+	}
+}
+
+func TestDListPageNumIsAMapIndex(t *testing.T) {
+	s := NewStore()
+	if err := s.Grow(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl, err := InspectDList(raw[DListPageOffset : DListPageOffset+PageSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dl.Count != 2 {
+		t.Fatalf("count %d entries %+v", dl.Count, dl.Entries)
+	}
+	seen := map[uint32]bool{}
+	for _, e := range dl.Entries {
+		if e.PageNum > 1 {
+			t.Fatalf("dwPageNum %d is not a zero-based AMap index", e.PageNum)
+		}
+		seen[e.PageNum] = true
+	}
+	if !seen[0] || !seen[1] {
+		t.Fatalf("missing AMap index in %+v", dl.Entries)
+	}
+}
+
+func TestDListBIDSignatureAndCounterRoundTrip(t *testing.T) {
+	s := NewStore()
+	raw, err := s.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dl, err := InspectDList(raw[DListPageOffset : DListPageOffset+PageSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dl.Page.BID != FirstAllocBID {
+		t.Fatalf("BID 0x%x want 0x%x", dl.Page.BID, FirstAllocBID)
+	}
+	wantSig := signature(dl.Page.BID, DListPageOffset)
+	if dl.Page.Sig != wantSig {
+		t.Fatalf("sig 0x%04x want 0x%04x", dl.Page.Sig, wantSig)
+	}
+	h, err := InspectHeader(raw[:UnicodeHeaderSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.BidNextP != FirstAllocBID+PageBIDIncrement {
+		t.Fatalf("bidNextP %d want %d", h.BidNextP, FirstAllocBID+PageBIDIncrement)
+	}
+	re, err := LoadStore(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if re.dlistBID != dl.Page.BID || re.bidNextP != h.BidNextP {
+		t.Fatalf("loaded bid=0x%x next=%d", re.dlistBID, re.bidNextP)
+	}
+	raw2, err := re.EncodeFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw[DListPageOffset:DListPageOffset+PageSize], raw2[DListPageOffset:DListPageOffset+PageSize]) {
+		t.Fatal("DList changed after reopen encode")
+	}
+	if !bytes.Equal(raw[:UnicodeHeaderSize], raw2[:UnicodeHeaderSize]) {
+		t.Fatal("header changed after reopen encode")
+	}
+	bad := append([]byte(nil), raw[DListPageOffset:DListPageOffset+PageSize]...)
+	bad[PageSize-UnicodePageTrailer+2] ^= 0x01
+	_, err = InspectDList(bad)
+	mustInvariant(t, err, SectionSignature, "wSig")
+}
+
+func TestFPMapFreeAndFullTransitions(t *testing.T) {
+	s := NewStore()
+	if !s.pMapHasFreePages(0) {
+		t.Fatal("new PMap 0 should have free pages")
+	}
+	bits := s.fpMapPayload(0)
+	if bitIsSet(bits, 0) {
+		t.Fatal("FPMap bit 0 should be 0 (has free pages)")
+	}
+	for s.RegionCount() < int(AMapsPerPMap) {
+		if err := s.Grow(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !s.pMapHasFreePages(0) {
+		t.Fatal("grown PMap 0 still has free pages")
+	}
+	for i := 0; i < int(AMapsPerPMap); i++ {
+		for slot := 0; slot < SlotsPerAMap; slot++ {
+			if bitIsSet(s.regions[i].bitmap[:], slot) {
+				continue
+			}
+			if err := s.mark(slotOffset(uint64(i), slot), BytesPerSlot, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if s.pMapHasFreePages(0) {
+		t.Fatal("filled PMap 0 should have no free pages")
+	}
+	bits = s.fpMapPayload(0)
+	if !bitIsSet(bits, 0) {
+		t.Fatal("FPMap bit 0 should be 1 (no free pages)")
+	}
+	if bitIsSet(bits, 1) {
+		t.Fatal("absent PMap 1 should report free pages (bit 0)")
 	}
 }

@@ -49,6 +49,8 @@ const (
 	DListPageOffset              = 0x4200
 	DListMaxEntries              = 119 // Unicode: 476 bytes of 4-byte entries
 	MaxDataBlockCB               = 8176
+	MaxAllocBytes                = 8192 // MS-PST max on-disk page/block size
+	PageBIDIncrement      uint64 = 4    // next page BID; reserved/internal bits stay 0
 	UnicodeWVer                  = 23
 	UnicodeWVerMin               = 23
 	UnicodeWVerMax               = 23 // existing reader (disk.ReadHeader) accepts 20-23

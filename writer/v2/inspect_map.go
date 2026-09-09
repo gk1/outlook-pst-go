@@ -26,6 +26,9 @@ func InspectDList(raw []byte) (*DListView, error) {
 	if pg.Type != PageDList {
 		return nil, invariant(SectionDList, "ptype", "got 0x%02x want DList", pg.Type)
 	}
+	if pg.BID == 0 {
+		return nil, invariant(SectionDList, "bid", "DList BID is null; allocate from bidNextP (MS-PST %s)", SectionBID)
+	}
 	b := pg.Payload
 	n := int(b[1])
 	if n > DListMaxEntries {
