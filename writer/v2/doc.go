@@ -23,9 +23,10 @@
 // (MS-PST 2.6.1.3.7). CommitFile writes a sibling
 // temp, renames, and fsyncs the parent directory. A post-rename dirsync or
 // reopen failure returns ErrAdopt, keeps the work spool as the usable
-// source, and records PendingPath. The payload source is one owned/borrowed
-// ioHandle: borrowed readers are never closed, owned files are closed,
-// owned temp spools are closed and removed. VALID_AMAP1 is rejected.
+// source, and records PendingPath. sameIO uses a comparable identity token for *MemSink/*FileSink/*os.File after
+// optional unwrap; unknown types are never compared with ==. The payload
+// source is one owned/borrowed ioHandle: borrowed readers are never closed,
+// owned files are closed, owned temp spools are closed and removed. VALID_AMAP1 is rejected.
 // Close/remove failures after a successful dest sync return a cleanup error
 // without pointing NDB at a closed old source.
 // Finalize currently returns ErrNotImplemented until later

@@ -4,6 +4,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 )
 
 // replacePath is the commit-file rename. Tests inject failures here.
@@ -36,12 +37,43 @@ var openCommitted = openCommittedFile
 // closeSink closes a commit temp. Tests inject failures.
 var closeSink = func(s Sink) error { return s.Close() }
 
+// createCommitTemp creates the CommitFile sibling. Tests inject failures.
+var createCommitTemp = func(path string) (Sink, error) { return CreateFileSink(path) }
+
+// truncWork truncates the work spool to the restored EOF. Tests inject failures.
+var truncWork = truncSink
+
 func openCommittedFile(path string) (Sink, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return nil, err
 	}
 	return &FileSink{f: f}, nil
+}
+
+func truncSink(w Sink, eof int64) error {
+	if w == nil {
+		return nil
+	}
+	tr, ok := w.(interface{ Truncate(int64) error })
+	if !ok {
+		return nil
+	}
+	return tr.Truncate(eof)
+}
+
+func writeAtFull(w io.WriterAt, p []byte, off int64) error {
+	if w == nil {
+		return invalidArg("sink", "nil writer")
+	}
+	n, err := w.WriteAt(p, off)
+	if err != nil {
+		return err
+	}
+	if n != len(p) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 // ioHandle is the single owned/borrowed payload source.
@@ -116,24 +148,38 @@ type UnwrapReaderAt interface {
 	UnwrapReaderAt() io.ReaderAt
 }
 
-// sameIO reports whether a and b are the same payload object. Interface
-// values are never compared with ==. Wrappers must implement UnwrapSink or
-// UnwrapReaderAt; unknown value types do not match by first-pointer walking.
+// sameIO reports whether a and b are the same known payload object.
+// Interface values are never compared with ==. Unknown or non-comparable
+// types yield identity 0 and never match.
 func sameIO(a, b any) bool {
-	ca := sinkCore(a)
-	cb := sinkCore(b)
-	return ca != nil && cb != nil && ca == cb
+	ia, ib := knownID(a), knownID(b)
+	return ia != 0 && ia == ib
 }
 
-func sinkCore(v any) any {
+func knownID(v any) uintptr {
+	v = unwrapIO(v)
+	switch x := v.(type) {
+	case *MemSink:
+		return ptrID(x)
+	case *FileSink:
+		return ptrID(x)
+	case *os.File:
+		return ptrID(x)
+	}
+	return 0
+}
+
+func ptrID(p any) uintptr {
+	rv := reflect.ValueOf(p)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return 0
+	}
+	return rv.Pointer()
+}
+
+func unwrapIO(v any) any {
 	for hops := 0; hops < 8 && v != nil; hops++ {
 		switch x := v.(type) {
-		case *MemSink:
-			return x
-		case *FileSink:
-			return x
-		case *os.File:
-			return x
 		case UnwrapSink:
 			next := x.UnwrapSink()
 			if next == nil {
@@ -178,10 +224,6 @@ type snapshot struct {
 	hadWork       bool
 }
 
-func (snap *snapshot) release() error {
-	return nil
-}
-
 func cloneRegions(in []region) []region {
 	out := make([]region, len(in))
 	copy(out, in)
@@ -208,9 +250,9 @@ func cloneU64(in []uint64) []uint64 {
 	return out
 }
 
-func (n *NDB) capture() (*snapshot, error) {
+func (n *NDB) capture() *snapshot {
 	if n == nil || n.store == nil {
-		return &snapshot{}, nil
+		return &snapshot{}
 	}
 	s := n.store
 	snap := &snapshot{
@@ -234,7 +276,7 @@ func (n *NDB) capture() (*snapshot, error) {
 		snap.ids = *n.ids
 	}
 	snap.hadWork = s.work != nil && s.work.w != nil
-	return snap, nil
+	return snap
 }
 
 func (n *NDB) restore(snap *snapshot) error {
@@ -282,19 +324,14 @@ func (n *NDB) restoreSource(snap *snapshot) error {
 	if err := s.restoreUndo(); err != nil {
 		return err
 	}
-	eof := int64(s.FileEOF())
-	if s.work != nil && s.work.w != nil {
-		if tr, ok := s.work.w.(interface{ Truncate(int64) error }); ok {
-			if err := tr.Truncate(eof); err != nil {
-				return ioErr("spool", "truncate: %v", err)
-			}
-		}
+	if err := truncWork(s.work.w, int64(s.FileEOF())); err != nil {
+		return ioErr("spool", "truncate: %v", err)
 	}
 	return nil
 }
 
 func (n *NDB) abortTxn(snap *snapshot, err error) error {
-	return rollbackErr(err, errorsJoin(n.restore(snap), snap.release()))
+	return rollbackErr(err, n.restore(snap))
 }
 
 func (n *NDB) beginTxn(snap *snapshot) {
@@ -316,16 +353,13 @@ func (n *NDB) runTxn(fn func() error) error {
 	if n == nil || n.store == nil {
 		return fn()
 	}
-	snap, err := n.capture()
-	if err != nil {
-		return err
-	}
+	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
 	if err := fn(); err != nil {
 		return n.abortTxn(snap, err)
 	}
-	return snap.release()
+	return nil
 }
 
 func syncSink(dst Sink) error {
@@ -348,6 +382,9 @@ func (n *NDB) rejectInPlace(dst Sink) error {
 	if n.store.io != nil && (sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r)) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the last committed source; use CommitFile")
 	}
+	if n.store.io != nil && knownID(dst) == 0 && knownID(n.store.io.w) == 0 && knownID(n.store.io.r) == 0 && (n.store.io.w != nil || n.store.io.r != nil) {
+		return unsupported(FeatureInPlaceMutation, "CommitTo destination has no comparable identity; use CommitFile")
+	}
 	if n.store.work != nil && (sameIO(dst, n.store.work.w) || sameIO(dst, n.store.work.r)) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the work spool; use CommitFile")
 	}
@@ -362,7 +399,7 @@ func (s *Store) writeHeader(dst Sink, valid byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err := dst.WriteAt(hdr, 0); err != nil {
+	if err := writeAtFull(dst, hdr, 0); err != nil {
 		return ioErr("header", "write: %v", err)
 	}
 	return nil
@@ -386,7 +423,7 @@ func (s *Store) writeBody(dst Sink) error {
 	if err != nil {
 		return err
 	}
-	if _, err := dst.WriteAt(dlist, int64(DListPageOffset)); err != nil {
+	if err := writeAtFull(dst, dlist, int64(DListPageOffset)); err != nil {
 		return ioErr("dlist", "write: %v", err)
 	}
 	for i := range s.regions {
@@ -395,7 +432,7 @@ func (s *Store) writeBody(dst Sink) error {
 			return err
 		}
 		for _, p := range pages {
-			if _, err := dst.WriteAt(p.raw, int64(p.off)); err != nil {
+			if err := writeAtFull(dst, p.raw, int64(p.off)); err != nil {
 				return ioErr("amap", "write at 0x%x: %v", p.off, err)
 			}
 		}
@@ -425,7 +462,7 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 		return err
 	}
 	for ib, raw := range img.Pages {
-		if _, err := dst.WriteAt(raw, int64(ib)); err != nil {
+		if err := writeAtFull(dst, raw, int64(ib)); err != nil {
 			return ioErr("page", "write at 0x%x: %v", ib, err)
 		}
 	}

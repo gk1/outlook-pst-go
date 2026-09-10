@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,39 @@ type ncSink struct {
 }
 
 func (s ncSink) UnwrapSink() Sink { return s.MemSink }
+
+type opaqueNC struct {
+	*MemSink
+	_ [0]func()
+}
+
+type failReadAt struct {
+	io.ReaderAt
+}
+
+func (f failReadAt) ReadAt([]byte, int64) (int, error) { return 0, io.ErrClosedPipe }
+
+type shortSink struct {
+	Sink
+	n int
+}
+
+func (s shortSink) WriteAt(p []byte, off int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n := s.n
+	if n <= 0 {
+		n = 1
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+	_, _ = s.Sink.WriteAt(p[:n], off)
+	return n, nil
+}
+
+func (s shortSink) UnwrapSink() Sink { return s.Sink }
 
 type failClose struct {
 	Sink
@@ -195,11 +229,7 @@ func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
 	if err := n2.store.ensureSpool(); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := n2.capture()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer snap.release()
+	snap := n2.capture()
 	if !snap.hadWork {
 		t.Fatal("expected work spool")
 	}
@@ -575,11 +605,7 @@ func TestReaderAtOnlyMutateCommitReopen(t *testing.T) {
 
 func TestFaultWriteDoesNotAdoptDestination(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("src"), false)
-	before, err := n.capture()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer before.release()
+	before := n.capture()
 	ms := NewMemSink("dst")
 	fs := &faultSink{Sink: ms, failWrite: 1}
 	if err := n.CommitTo(fs); err == nil {
@@ -947,14 +973,200 @@ func TestSpoolCreateAndSeedInjected(t *testing.T) {
 
 func TestCommitRestoreErrorIsJoined(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("join"), false)
+	old := truncWork
+	truncWork = func(Sink, int64) error { return io.ErrClosedPipe }
+	defer func() { truncWork = old }()
 	ms := NewMemSink("dst")
 	fs := &faultSink{Sink: ms, failWrite: 1}
 	err := n.CommitTo(fs)
 	if err == nil {
 		t.Fatal("expected fault")
 	}
-	if errors.Is(err, ErrIO) || errors.Is(err, io.ErrClosedPipe) {
-		return
+	if !errors.Is(err, ErrIO) && !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("missing op error: %v", err)
 	}
-	t.Fatalf("missing op error: %v", err)
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("restore not joined: %v", err)
+	}
+}
+
+func TestOpaqueNonComparableSinkCommitTo(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("opaque"), false)
+	dst := opaqueNC{MemSink: NewMemSink("opaque")}
+	if reflect.TypeOf(dst).Comparable() {
+		t.Fatal("opaqueNC must not be comparable")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CommitTo panicked: %v", r)
+		}
+	}()
+	if err := n.CommitTo(dst); err != nil {
+		t.Fatal(err)
+	}
+	writes := len(dst.Bytes())
+	err := n.CommitTo(dst)
+	if !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("second opaque CommitTo: %v", err)
+	}
+	if len(dst.Bytes()) != writes {
+		t.Fatal("second CommitTo mutated dest in place")
+	}
+}
+
+func TestNoteUndoDoesNotInventZeros(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "undo-read.pst")
+	n, root, _ := seedNDB(t, []byte("keep-bytes"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	e, ok := n2.LookupBlock(root.BID)
+	if !ok {
+		t.Fatal("missing block")
+	}
+	size := int(BlockDiskSize(uint64(e.CB)))
+	orig, err := n2.store.readExtent(e.IB, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n2.store.ensureSpool(); err != nil {
+		t.Fatal(err)
+	}
+	n2.store.beginUndo()
+	defer n2.store.endUndo()
+	n2.store.work.r = failReadAt{}
+	if n2.store.io != nil {
+		n2.store.io.r = failReadAt{}
+	}
+	err = n2.store.writeExtent(e.IB, bytes.Repeat([]byte{0xA5}, size))
+	if err == nil {
+		t.Fatal("expected undo capture failure")
+	}
+	n2.store.work.r = n2.store.work.w
+	sk, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sk.Close()
+	n2.store.io.r = sk
+	got, err := n2.store.readExtent(e.IB, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, orig) {
+		t.Fatal("rollback manufactured zeros")
+	}
+}
+
+func TestClearBackingPropagatesShortWrite(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("clr"), false)
+	blk := mustAlloc(t, n, 64)
+	n.store.setWriter(shortSink{Sink: n.store.writer(), n: 1})
+	err := n.store.Free(blk.IB, 64)
+	if err == nil {
+		t.Fatal("expected short write")
+	}
+	if !errors.Is(err, ErrIO) && !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestWriteExtentPropagatesShortWrite(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("short"), false)
+	e, ok := n.LookupBlock(n.nodes[0x21].DataBID)
+	if !ok {
+		t.Fatal("missing block")
+	}
+	n.store.beginUndo()
+	defer n.store.endUndo()
+	n.store.setWriter(shortSink{Sink: n.store.writer(), n: 1})
+	raw := bytes.Repeat([]byte{0xA5}, int(BlockDiskSize(uint64(e.CB))))
+	err := n.store.writeExtent(e.IB, raw)
+	if err == nil {
+		t.Fatal("expected short write")
+	}
+	if !errors.Is(err, ErrIO) && !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestCommitFileJoinsCleanupOnWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cleanup.pst")
+	n, _, _ := seedNDB(t, []byte("tmp"), false)
+	oldC := createCommitTemp
+	createCommitTemp = func(p string) (Sink, error) {
+		sk, err := CreateFileSink(p)
+		if err != nil {
+			return nil, err
+		}
+		return &faultSink{Sink: sk, failWrite: 1}, nil
+	}
+	oldR := removeFile
+	removeFile = func(string) error { return io.ErrClosedPipe }
+	defer func() {
+		createCommitTemp = oldC
+		removeFile = oldR
+	}()
+	err := n.CommitFile(path)
+	if err == nil {
+		t.Fatal("expected joined cleanup")
+	}
+	if !strings.Contains(err.Error(), "rollback") && !errors.Is(err, io.ErrClosedPipe) && !errors.Is(err, ErrIO) {
+		t.Fatalf("cleanup not joined: %v", err)
+	}
+}
+
+func TestRollbackJoinsWorkSpoolRemove(t *testing.T) {
+	n := NewNDB(nil)
+	old := removeFile
+	removeFile = func(string) error { return io.ErrClosedPipe }
+	defer func() { removeFile = old }()
+	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
+	if err == nil {
+		t.Fatal("expected boom")
+	}
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("spool remove not joined: %v", err)
+	}
+}
+
+func TestRestoreUndoWriteFailure(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("undo-w"), false)
+	e, ok := n.LookupBlock(n.nodes[0x21].DataBID)
+	if !ok {
+		t.Fatal("missing")
+	}
+	size := int(BlockDiskSize(uint64(e.CB)))
+	if _, err := n.store.readExtent(e.IB, size); err != nil {
+		t.Fatal(err)
+	}
+	n.store.beginUndo()
+	if err := n.store.writeExtent(e.IB, bytes.Repeat([]byte{0xA5}, size)); err != nil {
+		t.Fatal(err)
+	}
+	n.store.setWriter(&faultSink{Sink: n.store.writer(), failWrite: 1})
+	err := n.store.restoreUndo()
+	n.store.endUndo()
+	if err == nil {
+		t.Fatal("expected undo write failure")
+	}
+}
+
+func TestOpaqueNonComparableSinkSameIONoPanic(t *testing.T) {
+	a := opaqueNC{MemSink: NewMemSink("a")}
+	b := opaqueNC{MemSink: NewMemSink("b")}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("sameIO panicked: %v", r)
+		}
+	}()
+	if sameIO(a, a) || sameIO(a, b) {
+		t.Fatal("unknown non-comparable sink must not match by ==")
+	}
 }

@@ -613,10 +613,7 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err := n.rejectInPlace(dst); err != nil {
 		return err
 	}
-	snap, err := n.capture()
-	if err != nil {
-		return err
-	}
+	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
 	img, err := n.Encode()
@@ -626,10 +623,7 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err := n.writeCommit(dst, img); err != nil {
 		return n.abortTxn(snap, err)
 	}
-	if err := n.adopt(dst, lifeBorrowed); err != nil {
-		return rollbackErr(err, snap.release())
-	}
-	return snap.release()
+	return n.adopt(dst, lifeBorrowed)
 }
 
 // PendingPath is a CommitFile path that is durable on disk but not yet
@@ -649,37 +643,28 @@ func (n *NDB) CommitFile(path string) error {
 		return invalidArg("path", "empty commit path")
 	}
 	tmp := path + ".tmp"
-	dst, err := CreateFileSink(tmp)
+	dst, err := createCommitTemp(tmp)
 	if err != nil {
 		return ioErr("file", "create %s: %v", tmp, err)
 	}
-	snap, err := n.capture()
-	if err != nil {
-		_ = dst.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
+	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
 	cleanupTmp := func() error {
-		return errorsJoin(dst.Close(), os.Remove(tmp))
+		return errorsJoin(closeSink(dst), removeFile(tmp))
 	}
 	img, err := n.Encode()
 	if err != nil {
-		_ = cleanupTmp()
-		return n.abortTxn(snap, err)
+		return n.abortTxn(snap, rollbackErr(err, cleanupTmp()))
 	}
 	if err := n.writeCommit(dst, img); err != nil {
-		_ = cleanupTmp()
-		return n.abortTxn(snap, err)
+		return n.abortTxn(snap, rollbackErr(err, cleanupTmp()))
 	}
 	if err := closeSink(dst); err != nil {
-		_ = os.Remove(tmp)
-		return n.abortTxn(snap, ioErr("file", "close %s: %v", tmp, err))
+		return n.abortTxn(snap, rollbackErr(ioErr("file", "close %s: %v", tmp, err), removeFile(tmp)))
 	}
 	if err := replacePath(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return n.abortTxn(snap, ioErr("file", "rename %s -> %s: %v", tmp, path, err))
+		return n.abortTxn(snap, rollbackErr(ioErr("file", "rename %s -> %s: %v", tmp, path, err), removeFile(tmp)))
 	}
 	if err := syncDir(path); err != nil {
 		return n.failAdopt(path, err)

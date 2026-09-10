@@ -341,19 +341,28 @@ func (s *Store) mark(ib, size uint64, alloc bool) error {
 			clearBit(bm, start+i)
 		}
 	}
-	s.clearBacking(ib, size)
+	if err := s.clearBacking(ib, size); err != nil {
+		return err
+	}
 	return nil
 }
 
-func (s *Store) clearBacking(ib, size uint64) {
+func (s *Store) clearBacking(ib, size uint64) error {
 	if size == 0 {
-		return
+		return nil
 	}
-	if w := s.writer(); w != nil {
-		_ = s.noteUndo(ib, int(size))
-		z := make([]byte, size)
-		_, _ = w.WriteAt(z, int64(ib))
+	w := s.writer()
+	if w == nil {
+		return nil
 	}
+	if err := s.noteUndo(ib, int(size)); err != nil {
+		return err
+	}
+	z := make([]byte, size)
+	if err := writeAtFull(w, z, int64(ib)); err != nil {
+		return ioErr("spool", "clear 0x%x: %v", ib, err)
+	}
+	return nil
 }
 
 func (s *Store) allocatedRange(ib, size uint64) bool {
@@ -690,9 +699,9 @@ func (s *Store) noteUndo(off uint64, n int) error {
 			pos = next
 			continue
 		}
-		orig, err := s.readExtent(pos, int(next-pos))
+		orig, err := s.readUndoBytes(pos, int(next-pos))
 		if err != nil {
-			orig = make([]byte, int(next-pos))
+			return ioErr("snapshot", "undo capture 0x%x: %v", pos, err)
 		}
 		s.undo.extents = append(s.undo.extents, undoExtent{ib: pos, orig: orig})
 		pos = next
@@ -711,7 +720,7 @@ func (s *Store) restoreUndo() error {
 	s.undo.restoring = true
 	defer func() { s.undo.restoring = false }()
 	for _, e := range s.undo.extents {
-		if _, err := w.WriteAt(e.orig, int64(e.ib)); err != nil {
+		if err := writeAtFull(w, e.orig, int64(e.ib)); err != nil {
 			return ioErr("snapshot", "undo 0x%x: %v", e.ib, err)
 		}
 	}
@@ -732,8 +741,10 @@ func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if err := s.noteUndo(ib, len(raw)); err != nil {
 		return err
 	}
-	_, err := s.writer().WriteAt(raw, int64(ib))
-	return err
+	if err := writeAtFull(s.writer(), raw, int64(ib)); err != nil {
+		return ioErr("spool", "write 0x%x: %v", ib, err)
+	}
+	return nil
 }
 
 func (s *Store) ensureSpool() error {
@@ -784,6 +795,45 @@ func (s *Store) attachSource(r io.ReaderAt) {
 		h.w = sk
 	}
 	s.io = h
+}
+
+func (s *Store) readUndoBytes(ib uint64, size int) ([]byte, error) {
+	if size <= 0 {
+		return nil, nil
+	}
+	raw := make([]byte, size)
+	try := func(r io.ReaderAt) (done bool, err error) {
+		if r == nil {
+			return false, nil
+		}
+		nr, rerr := r.ReadAt(raw, int64(ib))
+		if nr >= size {
+			return true, nil
+		}
+		if rerr == nil || rerr == io.EOF {
+			return false, nil
+		}
+		return false, rerr
+	}
+	if s.work != nil {
+		done, err := try(s.work.r)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return raw, nil
+		}
+	}
+	if s.io != nil {
+		done, err := try(s.io.r)
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return raw, nil
+		}
+	}
+	return make([]byte, size), nil
 }
 
 func (s *Store) readExtent(ib uint64, size int) ([]byte, error) {
@@ -861,8 +911,8 @@ func copyReaderAtFrom(dst io.WriterAt, src io.ReaderAt, from, n int64) error {
 		}
 		nr, err := src.ReadAt(buf[:c], off)
 		if nr > 0 {
-			if _, werr := dst.WriteAt(buf[:nr], off); werr != nil {
-				return werr
+			if err := writeAtFull(dst, buf[:nr], off); err != nil {
+				return err
 			}
 		}
 		if err != nil && err != io.EOF {
@@ -890,7 +940,7 @@ func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
 			}
 			z := make([]byte, uint64(slot-start)*BytesPerSlot)
 			off := slotOffset(uint64(i), start)
-			if _, err := w.WriteAt(z, int64(off)); err != nil {
+			if err := writeAtFull(w, z, int64(off)); err != nil {
 				return err
 			}
 		}
