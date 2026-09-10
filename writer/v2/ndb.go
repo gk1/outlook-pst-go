@@ -613,7 +613,11 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err := n.rejectInPlace(dst); err != nil {
 		return err
 	}
-	snap := n.capture()
+	snap, err := n.capture()
+	if err != nil {
+		return err
+	}
+	defer snap.release()
 	img, err := n.Encode()
 	if err != nil {
 		_ = n.restore(snap)
@@ -647,7 +651,13 @@ func (n *NDB) CommitFile(path string) error {
 	if err != nil {
 		return ioErr("file", "create %s: %v", tmp, err)
 	}
-	snap := n.capture()
+	snap, err := n.capture()
+	if err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	defer snap.release()
 	img, err := n.Encode()
 	if err != nil {
 		_ = n.restore(snap)

@@ -186,15 +186,16 @@ func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	eof := n2.store.FileEOF()
-	snap := n2.capture()
-	if !snap.hadWork {
-		if err := n2.store.ensureSpool(); err != nil {
-			t.Fatal(err)
-		}
-		snap = n2.capture()
-		if !snap.hadWork {
-			t.Fatal("expected work spool")
-		}
+	if err := n2.store.ensureSpool(); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := n2.capture()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer snap.release()
+	if !snap.hadWork || snap.workCopy == "" {
+		t.Fatal("expected frozen work spool")
 	}
 	z := bytes.Repeat([]byte{0xA5}, size)
 	if err := n2.store.writeExtent(e.IB, z); err != nil {
@@ -247,6 +248,82 @@ func TestCommitToRejectsInPlaceBeforeWrite(t *testing.T) {
 	}
 	if fs.writes != writes || fs.off0 != off0 {
 		t.Fatalf("in-place CommitTo mutated dest writes=%d->%d off0=%d->%d", writes, fs.writes, off0, fs.off0)
+	}
+}
+
+func TestFailedTreeKeepsPriorUncommittedWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keep-work.pst")
+	n, orig, _ := seedNDB(t, []byte("orig-payload"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	keep, err := n2.PutDataTree(bytes.NewReader([]byte("keep2")), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n2, 0x61, keep.BID, 0, 0)
+	_, err = n2.PutDataTree(&boomReader{left: 2 << 20}, 0)
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("got %v", err)
+	}
+	got, ok := n2.LookupNode(0x61)
+	if !ok || got.DataBID != keep.BID {
+		t.Fatalf("uncommitted node lost: %+v ok=%v", got, ok)
+	}
+	rd, err := n2.OpenDataTree(keep.BID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotb, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotb) != "keep2" {
+		t.Fatalf("work payload %q", gotb)
+	}
+	out := filepath.Join(t.TempDir(), "keep-work-out.pst")
+	if err := n2.CommitFile(out); err != nil {
+		t.Fatal(err)
+	}
+	n3, err := OpenNDBFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n3.Close()
+	if _, ok := n3.LookupNode(0x21); !ok {
+		t.Fatal("original node missing")
+	}
+	got, ok = n3.LookupNode(0x61)
+	if !ok || got.DataBID != keep.BID {
+		t.Fatalf("keep2 missing after commit %+v", got)
+	}
+	rd, err = n3.OpenDataTree(orig.BID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotb, err = io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotb) != "orig-payload" {
+		t.Fatalf("original payload %q", gotb)
+	}
+}
+
+func TestCommitToRejectsWorkSpool(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("work"), false)
+	w := n.store.writer()
+	if w == nil {
+		t.Fatal("expected work spool")
+	}
+	if err := n.CommitTo(w); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("work-spool CommitTo: %v", err)
 	}
 }
 
@@ -378,6 +455,9 @@ func TestNonComparableSinkCommit(t *testing.T) {
 	if err := n.CommitTo(dst); err != nil {
 		t.Fatal(err)
 	}
+	if err := n.CommitTo(dst); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("second ncSink CommitTo: %v", err)
+	}
 	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(dst.Bytes())}, int64(len(dst.Bytes())))
 	if err != nil {
 		t.Fatal(err)
@@ -484,7 +564,11 @@ func TestReaderAtOnlyMutateCommitReopen(t *testing.T) {
 
 func TestFaultWriteDoesNotAdoptDestination(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("src"), false)
-	before := n.capture()
+	before, err := n.capture()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer before.release()
 	ms := NewMemSink("dst")
 	fs := &faultSink{Sink: ms, failWrite: 1}
 	if err := n.CommitTo(fs); err == nil {

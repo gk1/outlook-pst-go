@@ -101,31 +101,45 @@ func (s *Store) setWriter(w Sink) {
 }
 
 // sameIO reports whether a and b are the same pointer-backed object.
-// Interface values are never compared with ==.
+// Interface values are never compared with ==. Struct wrappers (including
+// non-comparable value types) match on their first pointer-backed payload.
 func sameIO(a, b any) bool {
-	if a == nil || b == nil {
-		return false
+	pa, okA := ioPointer(a)
+	pb, okB := ioPointer(b)
+	return okA && okB && pa == pb
+}
+
+func ioPointer(v any) (uintptr, bool) {
+	if v == nil {
+		return 0, false
 	}
-	va := reflect.ValueOf(a)
-	vb := reflect.ValueOf(b)
-	for va.Kind() == reflect.Interface && !va.IsNil() {
-		va = va.Elem()
+	return ioPointerValue(reflect.ValueOf(v))
+}
+
+func ioPointerValue(rv reflect.Value) (uintptr, bool) {
+	for rv.Kind() == reflect.Interface && !rv.IsNil() {
+		rv = rv.Elem()
 	}
-	for vb.Kind() == reflect.Interface && !vb.IsNil() {
-		vb = vb.Elem()
+	switch rv.Kind() {
+	case reflect.Ptr:
+		if rv.IsNil() {
+			return 0, false
+		}
+		return rv.Pointer(), true
+	case reflect.Struct:
+		for i := 0; i < rv.NumField(); i++ {
+			if p, ok := ioPointerValue(rv.Field(i)); ok {
+				return p, true
+			}
+		}
 	}
-	if va.Kind() != reflect.Ptr || vb.Kind() != reflect.Ptr {
-		return false
-	}
-	if va.IsNil() || vb.IsNil() {
-		return false
-	}
-	return va.Pointer() == vb.Pointer()
+	return 0, false
 }
 
 // snapshot is the one transaction boundary. Field names for Store/NDB value
 // state match the live structs so TestSnapshotCoversMutableFields can catch
-// omissions. io/work handles are represented by hadWork, not cloned bytes.
+// omissions. io/work handles are represented by hadWork plus a frozen copy of
+// the work spool bytes (workCopy), not by cloning FileEOF into RAM.
 type snapshot struct {
 	regions       []region
 	lastAllocAMap uint32
@@ -144,6 +158,38 @@ type snapshot struct {
 	opaqueRefs    map[uint64]int
 	livePages     []uint64
 	hadWork       bool
+	workCopy      string
+}
+
+func (snap *snapshot) release() {
+	if snap == nil || snap.workCopy == "" {
+		return
+	}
+	_ = os.Remove(snap.workCopy)
+	snap.workCopy = ""
+}
+
+func (snap *snapshot) freezeWork(s *Store) error {
+	if s == nil || s.work == nil || s.work.r == nil {
+		return nil
+	}
+	snap.hadWork = true
+	f, err := os.CreateTemp("", "pst-v2-snap-*.img")
+	if err != nil {
+		return ioErr("snapshot", "create: %v", err)
+	}
+	if err := copyReaderAt(f, s.work.r, int64(s.FileEOF())); err != nil {
+		name := f.Name()
+		_ = f.Close()
+		_ = os.Remove(name)
+		return ioErr("snapshot", "copy work: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return ioErr("snapshot", "close: %v", err)
+	}
+	snap.workCopy = f.Name()
+	return nil
 }
 
 func cloneRegions(in []region) []region {
@@ -172,9 +218,9 @@ func cloneU64(in []uint64) []uint64 {
 	return out
 }
 
-func (n *NDB) capture() *snapshot {
+func (n *NDB) capture() (*snapshot, error) {
 	if n == nil || n.store == nil {
-		return &snapshot{}
+		return &snapshot{}, nil
 	}
 	s := n.store
 	snap := &snapshot{
@@ -193,12 +239,15 @@ func (n *NDB) capture() *snapshot {
 		subnodeRefs:   cloneMap(n.subnodeRefs),
 		opaqueRefs:    cloneMap(n.opaqueRefs),
 		livePages:     cloneU64(n.livePages),
-		hadWork:       s.work != nil && s.work.w != nil,
 	}
 	if n.ids != nil {
 		snap.ids = *n.ids
 	}
-	return snap
+	if err := snap.freezeWork(s); err != nil {
+		snap.release()
+		return nil, err
+	}
+	return snap, nil
 }
 
 func (n *NDB) restore(snap *snapshot) error {
@@ -244,13 +293,15 @@ func (n *NDB) restoreSource(snap *snapshot) error {
 		return err
 	}
 	eof := int64(s.FileEOF())
-	if s.io != nil && s.io.r != nil && s.work != nil && s.work.w != nil && !sameIO(s.io.r, s.work.w) {
-		if err := copyReaderAt(s.work.w, s.io.r, eof); err != nil {
-			return ioErr("spool", "restore from committed source: %v", err)
+	if snap.workCopy != "" && s.work != nil && s.work.w != nil {
+		f, err := os.Open(snap.workCopy)
+		if err != nil {
+			return ioErr("snapshot", "open: %v", err)
 		}
-	} else if s.work != nil && s.work.w != nil {
-		if err := s.zeroFreeSlotsAt(s.work.w); err != nil {
-			return ioErr("spool", "restore zero free slots: %v", err)
+		err = copyReaderAt(s.work.w, f, eof)
+		_ = f.Close()
+		if err != nil {
+			return ioErr("snapshot", "restore work: %v", err)
 		}
 	}
 	if s.work != nil && s.work.w != nil {
@@ -273,7 +324,11 @@ func cleanupErr(err error) *Error {
 }
 
 func (n *NDB) runTxn(fn func() error) error {
-	snap := n.capture()
+	snap, err := n.capture()
+	if err != nil {
+		return err
+	}
+	defer snap.release()
 	if err := fn(); err != nil {
 		return rollbackErr(err, n.restore(snap))
 	}
@@ -294,11 +349,14 @@ func (n *NDB) rejectInPlace(dst Sink) error {
 	if dst == nil {
 		return invalidArg("sink", "nil commit sink")
 	}
-	if n == nil || n.store == nil || n.store.io == nil {
+	if n == nil || n.store == nil {
 		return nil
 	}
-	if sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r) {
+	if n.store.io != nil && (sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r)) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the last committed source; use CommitFile")
+	}
+	if n.store.work != nil && (sameIO(dst, n.store.work.w) || sameIO(dst, n.store.work.r)) {
+		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the work spool; use CommitFile")
 	}
 	return nil
 }

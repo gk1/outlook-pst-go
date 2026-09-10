@@ -17,7 +17,7 @@
 // Sink). PST-007 is the transaction/crash-safety boundary: one snapshot
 // covers allocator, catalog, refs, live pages, roots, and whether a work
 // spool exists; failed tree writes restore that snapshot and rewind the
-// work spool from the last committed source (or drop it). CommitTo
+// work spool from a frozen copy of its bytes (or drop it if the txn created it). CommitTo
 // rejects the last committed source before any dest write. It writes
 // INVALID_AMAP + sync, then body/pages (header bytes skipped on copy),
 // then VALID_AMAP2 + sync (MS-PST 2.6.1.3.7). CommitFile writes a sibling
