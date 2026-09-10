@@ -529,6 +529,17 @@ func fillRegionZero(t *testing.T, n *NDB) {
 			}
 		}
 	}
+	probe, err := s.Allocate(BytesPerSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidx, ok := AMapIndexForOffset(probe)
+	if !ok || pidx == 0 {
+		t.Fatalf("region 0 still had space (ib=0x%x idx=%d); lastAllocAMap change would not be observable", probe, pidx)
+	}
+	if err := s.Free(probe, BytesPerSlot); err != nil {
+		t.Fatal(err)
+	}
 	s.lastAllocAMap = 0
 }
 
@@ -593,52 +604,6 @@ type failTruncate struct {
 }
 
 func (f failTruncate) Truncate(int64) error { return io.ErrClosedPipe }
-
-func mustTinyXX(t *testing.T, n *NDB) (BBTEntry, []byte) {
-	t.Helper()
-	var xbs []uint64
-	var payload []byte
-	for i := 0; i < 2; i++ {
-		chunk := []byte{byte('A' + i), byte('A' + i)}
-		leaf := mustAlloc(t, n, uint16(len(chunk)))
-		if err := n.putPayload(leaf, chunk); err != nil {
-			t.Fatal(err)
-		}
-		xp, err := EncodeXBlock(XBlockLevel, uint32(len(chunk)), []uint64{leaf.BID})
-		if err != nil {
-			t.Fatal(err)
-		}
-		xb, err := n.AllocInternalBlock(uint16(len(xp)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := n.putPayload(xb, xp); err != nil {
-			t.Fatal(err)
-		}
-		if err := n.AddDataTreeRef(leaf.BID); err != nil {
-			t.Fatal(err)
-		}
-		xbs = append(xbs, xb.BID)
-		payload = append(payload, chunk...)
-	}
-	xxp, err := EncodeXBlock(XXBlockLevel, uint32(len(payload)), xbs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	xx, err := n.AllocInternalBlock(uint16(len(xxp)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := n.putPayload(xx, xxp); err != nil {
-		t.Fatal(err)
-	}
-	for _, bid := range xbs {
-		if err := n.AddDataTreeRef(bid); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return xx, payload
-}
 
 func reopenReaderAt(t *testing.T, n *NDB, dataBID, subBID uint64, payload []byte) {
 	t.Helper()
@@ -725,7 +690,22 @@ func TestOpenNDBFromReaderAtOnly(t *testing.T) {
 	})
 	t.Run("xxblock", func(t *testing.T) {
 		n := NewNDB(nil)
-		root, payload := mustTinyXX(t, n)
+		need := int64(MaxXBlockEntries+1) * int64(MaxDataBlockCB)
+		root, err := n.PutDataTree(io.LimitReader(repeatByte(0x5A), need), need)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := n.blockPayload(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		xb, err := InspectXBlock(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if xb.Level != XXBlockLevel {
+			t.Fatalf("root cLevel %d want XXBLOCK", xb.Level)
+		}
 		innerData := mustAlloc(t, n, 8)
 		if err := n.putPayload(innerData, []byte("innersub")); err != nil {
 			t.Fatal(err)
@@ -734,7 +714,69 @@ func TestOpenNDBFromReaderAtOnly(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		reopenReaderAt(t, n, root.BID, inner.BID, payload)
+		mustNode(t, n, 0x41, root.BID, inner.BID, 0)
+		path := filepath.Join(t.TempDir(), "xx-readerat.pst")
+		dst, err := CreateFileSink(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.CommitTo(dst); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := dst.Close(); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n2, err := OpenNDBFrom(onlyReaderAt{f}, st.Size())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer n2.Close()
+		if n2.Store().spool != nil {
+			t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().spool)
+		}
+		gotNode, ok := n2.LookupNode(0x41)
+		if !ok || gotNode.DataBID != root.BID || gotNode.SubBID != inner.BID {
+			t.Fatalf("reopen node %+v ok=%v", gotNode, ok)
+		}
+		rd, err := n2.OpenDataTree(root.BID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h := sha256.New()
+		got, err := io.Copy(h, rd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != need {
+			t.Fatalf("got %d bytes want %d", got, need)
+		}
+		want := sha256.New()
+		_, _ = io.Copy(want, io.LimitReader(repeatByte(0x5A), need))
+		if !bytes.Equal(h.Sum(nil), want.Sum(nil)) {
+			t.Fatal("hash mismatch after ReaderAt-only XXBLOCK reopen")
+		}
+		var kids []SLEntry
+		if err := n2.WalkSubnodes(inner.BID, func(e SLEntry) error {
+			kids = append(kids, e)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(kids) != 1 || kids[0].DataBID != innerData.BID {
+			t.Fatalf("subnode %+v", kids)
+		}
 	})
 }
 
