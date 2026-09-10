@@ -617,17 +617,19 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err != nil {
 		return err
 	}
-	defer snap.release()
+	n.beginTxn(snap)
+	defer n.store.endUndo()
 	img, err := n.Encode()
 	if err != nil {
-		_ = n.restore(snap)
-		return err
+		return n.abortTxn(snap, err)
 	}
 	if err := n.writeCommit(dst, img); err != nil {
-		_ = n.restore(snap)
-		return err
+		return n.abortTxn(snap, err)
 	}
-	return n.adopt(dst, lifeBorrowed)
+	if err := n.adopt(dst, lifeBorrowed); err != nil {
+		return rollbackErr(err, snap.release())
+	}
+	return snap.release()
 }
 
 // PendingPath is a CommitFile path that is durable on disk but not yet
@@ -657,29 +659,27 @@ func (n *NDB) CommitFile(path string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	defer snap.release()
+	n.beginTxn(snap)
+	defer n.store.endUndo()
+	cleanupTmp := func() error {
+		return errorsJoin(dst.Close(), os.Remove(tmp))
+	}
 	img, err := n.Encode()
 	if err != nil {
-		_ = n.restore(snap)
-		_ = dst.Close()
-		_ = os.Remove(tmp)
-		return err
+		_ = cleanupTmp()
+		return n.abortTxn(snap, err)
 	}
 	if err := n.writeCommit(dst, img); err != nil {
-		_ = n.restore(snap)
-		_ = dst.Close()
-		_ = os.Remove(tmp)
-		return err
+		_ = cleanupTmp()
+		return n.abortTxn(snap, err)
 	}
 	if err := closeSink(dst); err != nil {
-		_ = n.restore(snap)
 		_ = os.Remove(tmp)
-		return ioErr("file", "close %s: %v", tmp, err)
+		return n.abortTxn(snap, ioErr("file", "close %s: %v", tmp, err))
 	}
 	if err := replacePath(tmp, path); err != nil {
-		_ = n.restore(snap)
 		_ = os.Remove(tmp)
-		return ioErr("file", "rename %s -> %s: %v", tmp, path, err)
+		return n.abortTxn(snap, ioErr("file", "rename %s -> %s: %v", tmp, path, err))
 	}
 	if err := syncDir(path); err != nil {
 		return n.failAdopt(path, err)

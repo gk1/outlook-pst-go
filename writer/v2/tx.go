@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 )
 
 // replacePath is the commit-file rename. Tests inject failures here.
@@ -12,6 +11,12 @@ var replacePath = os.Rename
 
 // removeFile removes a temp spool or failed commit temp. Tests inject failures.
 var removeFile = os.Remove
+
+// createTemp creates the work spool. Tests inject failures.
+var createTemp = os.CreateTemp
+
+// copyWork seeds a new work spool from the committed source. Tests inject failures.
+var copyWork = copyReaderAt
 
 // syncDir fsyncs the parent directory after rename. Tests inject failures.
 var syncDir = syncParentDir
@@ -100,46 +105,59 @@ func (s *Store) setWriter(w Sink) {
 	}
 }
 
-// sameIO reports whether a and b are the same pointer-backed object.
-// Interface values are never compared with ==. Struct wrappers (including
-// non-comparable value types) match on their first pointer-backed payload.
+// UnwrapSink is the identity contract for Sink wrappers. Core types
+// (*MemSink, *FileSink, *os.File) are themselves. Wrappers unwrap until a core.
+type UnwrapSink interface {
+	UnwrapSink() Sink
+}
+
+// UnwrapReaderAt is the identity contract for ReaderAt wrappers.
+type UnwrapReaderAt interface {
+	UnwrapReaderAt() io.ReaderAt
+}
+
+// sameIO reports whether a and b are the same payload object. Interface
+// values are never compared with ==. Wrappers must implement UnwrapSink or
+// UnwrapReaderAt; unknown value types do not match by first-pointer walking.
 func sameIO(a, b any) bool {
-	pa, okA := ioPointer(a)
-	pb, okB := ioPointer(b)
-	return okA && okB && pa == pb
+	ca := sinkCore(a)
+	cb := sinkCore(b)
+	return ca != nil && cb != nil && ca == cb
 }
 
-func ioPointer(v any) (uintptr, bool) {
-	if v == nil {
-		return 0, false
-	}
-	return ioPointerValue(reflect.ValueOf(v))
-}
-
-func ioPointerValue(rv reflect.Value) (uintptr, bool) {
-	for rv.Kind() == reflect.Interface && !rv.IsNil() {
-		rv = rv.Elem()
-	}
-	switch rv.Kind() {
-	case reflect.Ptr:
-		if rv.IsNil() {
-			return 0, false
-		}
-		return rv.Pointer(), true
-	case reflect.Struct:
-		for i := 0; i < rv.NumField(); i++ {
-			if p, ok := ioPointerValue(rv.Field(i)); ok {
-				return p, true
+func sinkCore(v any) any {
+	for hops := 0; hops < 8 && v != nil; hops++ {
+		switch x := v.(type) {
+		case *MemSink:
+			return x
+		case *FileSink:
+			return x
+		case *os.File:
+			return x
+		case UnwrapSink:
+			next := x.UnwrapSink()
+			if next == nil {
+				return nil
 			}
+			v = next
+			continue
+		case UnwrapReaderAt:
+			next := x.UnwrapReaderAt()
+			if next == nil {
+				return nil
+			}
+			v = next
+			continue
 		}
+		return v
 	}
-	return 0, false
+	return nil
 }
 
 // snapshot is the one transaction boundary. Field names for Store/NDB value
 // state match the live structs so TestSnapshotCoversMutableFields can catch
-// omissions. io/work handles are represented by hadWork plus a frozen copy of
-// the work spool bytes (workCopy), not by cloning FileEOF into RAM.
+// omissions. io/work handles are represented by hadWork. In-place work
+// mutations are reverted from Store.undo (extent journal), not a FileEOF copy.
 type snapshot struct {
 	regions       []region
 	lastAllocAMap uint32
@@ -158,37 +176,9 @@ type snapshot struct {
 	opaqueRefs    map[uint64]int
 	livePages     []uint64
 	hadWork       bool
-	workCopy      string
 }
 
-func (snap *snapshot) release() {
-	if snap == nil || snap.workCopy == "" {
-		return
-	}
-	_ = os.Remove(snap.workCopy)
-	snap.workCopy = ""
-}
-
-func (snap *snapshot) freezeWork(s *Store) error {
-	if s == nil || s.work == nil || s.work.r == nil {
-		return nil
-	}
-	snap.hadWork = true
-	f, err := os.CreateTemp("", "pst-v2-snap-*.img")
-	if err != nil {
-		return ioErr("snapshot", "create: %v", err)
-	}
-	if err := copyReaderAt(f, s.work.r, int64(s.FileEOF())); err != nil {
-		name := f.Name()
-		_ = f.Close()
-		_ = os.Remove(name)
-		return ioErr("snapshot", "copy work: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(f.Name())
-		return ioErr("snapshot", "close: %v", err)
-	}
-	snap.workCopy = f.Name()
+func (snap *snapshot) release() error {
 	return nil
 }
 
@@ -243,10 +233,7 @@ func (n *NDB) capture() (*snapshot, error) {
 	if n.ids != nil {
 		snap.ids = *n.ids
 	}
-	if err := snap.freezeWork(s); err != nil {
-		snap.release()
-		return nil, err
-	}
+	snap.hadWork = s.work != nil && s.work.w != nil
 	return snap, nil
 }
 
@@ -292,18 +279,10 @@ func (n *NDB) restoreSource(snap *snapshot) error {
 	if err := s.ensureSpool(); err != nil {
 		return err
 	}
-	eof := int64(s.FileEOF())
-	if snap.workCopy != "" && s.work != nil && s.work.w != nil {
-		f, err := os.Open(snap.workCopy)
-		if err != nil {
-			return ioErr("snapshot", "open: %v", err)
-		}
-		err = copyReaderAt(s.work.w, f, eof)
-		_ = f.Close()
-		if err != nil {
-			return ioErr("snapshot", "restore work: %v", err)
-		}
+	if err := s.restoreUndo(); err != nil {
+		return err
 	}
+	eof := int64(s.FileEOF())
 	if s.work != nil && s.work.w != nil {
 		if tr, ok := s.work.w.(interface{ Truncate(int64) error }); ok {
 			if err := tr.Truncate(eof); err != nil {
@@ -312,6 +291,16 @@ func (n *NDB) restoreSource(snap *snapshot) error {
 		}
 	}
 	return nil
+}
+
+func (n *NDB) abortTxn(snap *snapshot, err error) error {
+	return rollbackErr(err, errorsJoin(n.restore(snap), snap.release()))
+}
+
+func (n *NDB) beginTxn(snap *snapshot) {
+	if snap != nil && snap.hadWork && n != nil && n.store != nil {
+		n.store.beginUndo()
+	}
 }
 
 func cleanupErr(err error) *Error {
@@ -324,15 +313,19 @@ func cleanupErr(err error) *Error {
 }
 
 func (n *NDB) runTxn(fn func() error) error {
+	if n == nil || n.store == nil {
+		return fn()
+	}
 	snap, err := n.capture()
 	if err != nil {
 		return err
 	}
-	defer snap.release()
+	n.beginTxn(snap)
+	defer n.store.endUndo()
 	if err := fn(); err != nil {
-		return rollbackErr(err, n.restore(snap))
+		return n.abortTxn(snap, err)
 	}
-	return nil
+	return snap.release()
 }
 
 func syncSink(dst Sink) error {
@@ -420,8 +413,8 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 	if n.store.unique == 0 {
 		n.store.unique = 1
 	}
-	// MS-PST 2.6.1.3.7: INVALID_AMAP + sync before any body/page mutation so a
-	// crash cannot leave mixed bytes under a VALID header.
+	// MS-PST 2.6.1.3.7: INVALID + sync, body/pages + sync, VALID + sync.
+	// A crash cannot expose mixed bytes under a VALID header.
 	if err := n.store.writeHeader(dst, AMapInvalid); err != nil {
 		return err
 	}
@@ -435,6 +428,10 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 		if _, err := dst.WriteAt(raw, int64(ib)); err != nil {
 			return ioErr("page", "write at 0x%x: %v", ib, err)
 		}
+	}
+	// Body/pages must be durable before VALID reaches storage (MS-PST 2.6.1.3.7).
+	if err := syncSink(dst); err != nil {
+		return err
 	}
 	if err := n.store.writeHeader(dst, AMapValid2); err != nil {
 		return err

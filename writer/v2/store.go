@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 )
 
@@ -23,6 +22,7 @@ type Store struct {
 	bbtRoot       BREF
 	io            *ioHandle // last committed source
 	work          *ioHandle // uncommitted writable spool
+	undo          *undoLog  // extent journal for the active transaction
 }
 
 // srcLife is who may Close/remove the writable handle.
@@ -350,6 +350,7 @@ func (s *Store) clearBacking(ib, size uint64) {
 		return
 	}
 	if w := s.writer(); w != nil {
+		_ = s.noteUndo(ib, int(size))
 		z := make([]byte, size)
 		_, _ = w.WriteAt(z, int64(ib))
 	}
@@ -633,6 +634,90 @@ func (s *Store) encodeDList() ([]byte, error) {
 	return EncodePage(payload, PageDList, s.dlistBID, DListPageOffset)
 }
 
+type undoExtent struct {
+	ib   uint64
+	orig []byte
+}
+
+type undoLog struct {
+	eof       uint64
+	extents   []undoExtent
+	restoring bool
+}
+
+func (s *Store) beginUndo() {
+	if s == nil {
+		return
+	}
+	s.undo = &undoLog{eof: s.FileEOF()}
+}
+
+func (s *Store) endUndo() {
+	if s != nil {
+		s.undo = nil
+	}
+}
+
+func (u *undoLog) skipCovered(pos, end uint64) (covered bool, next uint64) {
+	next = end
+	for _, e := range u.extents {
+		eEnd := e.ib + uint64(len(e.orig))
+		if pos >= e.ib && pos < eEnd {
+			return true, eEnd
+		}
+		if e.ib > pos && e.ib < next {
+			next = e.ib
+		}
+	}
+	return false, next
+}
+
+func (s *Store) noteUndo(off uint64, n int) error {
+	if s == nil || s.undo == nil || s.undo.restoring || n <= 0 {
+		return nil
+	}
+	start := off
+	end := off + uint64(n)
+	if start >= s.undo.eof {
+		return nil
+	}
+	if end > s.undo.eof {
+		end = s.undo.eof
+	}
+	for pos := start; pos < end; {
+		covered, next := s.undo.skipCovered(pos, end)
+		if covered {
+			pos = next
+			continue
+		}
+		orig, err := s.readExtent(pos, int(next-pos))
+		if err != nil {
+			orig = make([]byte, int(next-pos))
+		}
+		s.undo.extents = append(s.undo.extents, undoExtent{ib: pos, orig: orig})
+		pos = next
+	}
+	return nil
+}
+
+func (s *Store) restoreUndo() error {
+	if s == nil || s.undo == nil {
+		return nil
+	}
+	w := s.writer()
+	if w == nil {
+		return nil
+	}
+	s.undo.restoring = true
+	defer func() { s.undo.restoring = false }()
+	for _, e := range s.undo.extents {
+		if _, err := w.WriteAt(e.orig, int64(e.ib)); err != nil {
+			return ioErr("snapshot", "undo 0x%x: %v", e.ib, err)
+		}
+	}
+	return nil
+}
+
 func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if len(raw) == 0 {
 		return nil
@@ -644,6 +729,9 @@ func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if err := s.ensureSpool(); err != nil {
 		return err
 	}
+	if err := s.noteUndo(ib, len(raw)); err != nil {
+		return err
+	}
 	_, err := s.writer().WriteAt(raw, int64(ib))
 	return err
 }
@@ -652,7 +740,7 @@ func (s *Store) ensureSpool() error {
 	if s.work != nil && s.work.w != nil {
 		return nil
 	}
-	f, err := os.CreateTemp("", "pst-v2-*.spool")
+	f, err := createTemp("", "pst-v2-*.spool")
 	if err != nil {
 		return ioErr("spool", "create: %v", err)
 	}
@@ -662,9 +750,9 @@ func (s *Store) ensureSpool() error {
 		src = s.io.r
 	}
 	if src != nil && !sameIO(src, sk) {
-		if err := copyReaderAt(sk, src, int64(s.FileEOF())); err != nil {
+		if err := copyWork(sk, src, int64(s.FileEOF())); err != nil {
 			_ = f.Close()
-			_ = os.Remove(f.Name())
+			_ = removeFile(f.Name())
 			return ioErr("spool", "seed: %v", err)
 		}
 	}
@@ -788,14 +876,20 @@ func copyReaderAtFrom(dst io.WriterAt, src io.ReaderAt, from, n int64) error {
 }
 
 func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
-	z := make([]byte, BytesPerSlot)
 	for i := range s.regions {
 		bm := s.regions[i].bitmap[:]
-		for slot := 0; slot < SlotsPerAMap; slot++ {
+		slot := 0
+		for slot < SlotsPerAMap {
 			if bitIsSet(bm, slot) {
+				slot++
 				continue
 			}
-			off := slotOffset(uint64(i), slot)
+			start := slot
+			for slot < SlotsPerAMap && !bitIsSet(bm, slot) {
+				slot++
+			}
+			z := make([]byte, uint64(slot-start)*BytesPerSlot)
+			off := slotOffset(uint64(i), start)
 			if _, err := w.WriteAt(z, int64(off)); err != nil {
 				return err
 			}
@@ -813,6 +907,9 @@ func (s *Store) WriteTo(dst Sink) error {
 		return err
 	}
 	if err := s.writeBody(dst); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
 		return err
 	}
 	if err := s.writeHeader(dst, AMapValid2); err != nil {

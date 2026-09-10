@@ -16,11 +16,11 @@
 // FileEOF, and reopens via OpenNDBFrom from any io.ReaderAt (not only
 // Sink). PST-007 is the transaction/crash-safety boundary: one snapshot
 // covers allocator, catalog, refs, live pages, roots, and whether a work
-// spool exists; failed tree writes restore that snapshot and rewind the
-// work spool from a frozen copy of its bytes (or drop it if the txn created it). CommitTo
-// rejects the last committed source before any dest write. It writes
-// INVALID_AMAP + sync, then body/pages (header bytes skipped on copy),
-// then VALID_AMAP2 + sync (MS-PST 2.6.1.3.7). CommitFile writes a sibling
+// spool exists; failed tree writes restore that snapshot and rewind in-place
+// work mutations from an extent undo journal (or drop work if the txn created
+// it). CommitTo rejects the last committed source before any dest write. It
+// writes INVALID_AMAP + sync, body/pages + sync, then VALID_AMAP2 + sync
+// (MS-PST 2.6.1.3.7). CommitFile writes a sibling
 // temp, renames, and fsyncs the parent directory. A post-rename dirsync or
 // reopen failure returns ErrAdopt, keeps the work spool as the usable
 // source, and records PendingPath. The payload source is one owned/borrowed

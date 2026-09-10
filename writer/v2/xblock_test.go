@@ -591,11 +591,15 @@ type onlyReaderAt struct{ r io.ReaderAt }
 
 func (o onlyReaderAt) ReadAt(p []byte, off int64) (int, error) { return o.r.ReadAt(p, off) }
 
+func (o onlyReaderAt) UnwrapReaderAt() io.ReaderAt { return o.r }
+
 type failTruncate struct {
 	Sink
 }
 
 func (f failTruncate) Truncate(int64) error { return io.ErrClosedPipe }
+
+func (f failTruncate) UnwrapSink() Sink { return f.Sink }
 
 func reopenReaderAt(t *testing.T, n *NDB, dataBID, subBID uint64, payload []byte) {
 	t.Helper()

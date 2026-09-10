@@ -61,11 +61,17 @@ type ncSink struct {
 	_ [0]func()
 }
 
+func (s ncSink) UnwrapSink() Sink { return s.MemSink }
+
 type failClose struct {
 	Sink
 }
 
 func (f failClose) Close() error { return io.ErrClosedPipe }
+
+func (f failClose) UnwrapSink() Sink { return f.Sink }
+
+func (f *faultSink) UnwrapSink() Sink { return f.Sink }
 
 func seedNDB(t *testing.T, payload []byte, withSub bool) (*NDB, BBTEntry, BBTEntry) {
 	t.Helper()
@@ -140,7 +146,7 @@ func TestSnapshotCoversMutableFields(t *testing.T) {
 	for i := 0; i < snap.NumField(); i++ {
 		names[snap.Field(i).Name] = true
 	}
-	skipStore := map[string]bool{"io": true, "work": true}
+	skipStore := map[string]bool{"io": true, "work": true, "undo": true}
 	st := reflect.TypeOf(Store{})
 	for i := 0; i < st.NumField(); i++ {
 		f := st.Field(i)
@@ -194,12 +200,17 @@ func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer snap.release()
-	if !snap.hadWork || snap.workCopy == "" {
-		t.Fatal("expected frozen work spool")
+	if !snap.hadWork {
+		t.Fatal("expected work spool")
 	}
+	n2.store.beginUndo()
+	defer n2.store.endUndo()
 	z := bytes.Repeat([]byte{0xA5}, size)
 	if err := n2.store.writeExtent(e.IB, z); err != nil {
 		t.Fatal(err)
+	}
+	if n2.store.undo == nil || len(n2.store.undo.extents) == 0 {
+		t.Fatal("expected bounded undo extents, not a full-image copy")
 	}
 	mut, err := n2.store.readExtent(e.IB, size)
 	if err != nil {
@@ -225,7 +236,7 @@ func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, orig) {
-		t.Fatal("retained extent not restored from committed source")
+		t.Fatal("retained extent not restored from undo journal")
 	}
 }
 
@@ -654,7 +665,8 @@ func TestCommitToInjectedBoundaries(t *testing.T) {
 		{name: "body-write", failWrite: 2},
 		{name: "truncate", failTrunc: 1},
 		{name: "valid-header", failOff0: 2},
-		{name: "sync-valid", failSync: 2, accept: true},
+		{name: "sync-body", failSync: 2},
+		{name: "sync-valid", failSync: 3, accept: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -817,4 +829,132 @@ func TestCommitFileInjectedBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTreeTxnDoesNotCopyFullImage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "no-copy.pst")
+	n, _, _ := seedNDB(t, []byte("orig-payload"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	keep, err := n2.PutDataTree(bytes.NewReader([]byte("keep2")), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n2, 0x61, keep.BID, 0, 0)
+	calls := 0
+	old := createTemp
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		calls++
+		return old(dir, pattern)
+	}
+	defer func() { createTemp = old }()
+	_, err = n2.PutDataTree(&boomReader{left: 2 << 20}, 0)
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("got %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("tree txn created %d full-image temps", calls)
+	}
+	got, ok := n2.LookupNode(0x61)
+	if !ok || got.DataBID != keep.BID {
+		t.Fatalf("uncommitted node lost: %+v", got)
+	}
+}
+
+func TestCommitToInjectsEveryWriteAndSync(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("count"), false)
+	ms := NewMemSink("count")
+	fs := &faultSink{Sink: ms}
+	if err := n.CommitTo(fs); err != nil {
+		t.Fatal(err)
+	}
+	writes, syncs, truncs := fs.writes, fs.syncs, fs.truncs
+	if writes < 3 || syncs < 3 {
+		t.Fatalf("too few commit ops writes=%d syncs=%d", writes, syncs)
+	}
+	check := func(t *testing.T, failWrite, failSync, failTrunc int) {
+		t.Helper()
+		n, _, _ := seedNDB(t, []byte("inj"), false)
+		ms := NewMemSink("every")
+		fs := &faultSink{Sink: ms, failWrite: failWrite, failSync: failSync, failTrunc: failTrunc}
+		err := n.CommitTo(fs)
+		if err == nil {
+			t.Fatal("expected injected failure")
+		}
+		if n.store.io != nil && sameIO(n.store.io.w, fs) {
+			t.Fatal("adopted failed dest")
+		}
+		herr := destHeader(t, ms)
+		if herr == nil {
+			if err := CheckAllocation(ms.Bytes()); err != nil {
+				t.Fatalf("VALID mixed dest: %v", err)
+			}
+		}
+	}
+	for i := 1; i <= writes; i++ {
+		i := i
+		t.Run("write", func(t *testing.T) { check(t, i, 0, 0) })
+	}
+	for i := 1; i <= syncs; i++ {
+		i := i
+		t.Run("sync", func(t *testing.T) { check(t, 0, i, 0) })
+	}
+	for i := 1; i <= truncs; i++ {
+		i := i
+		t.Run("trunc", func(t *testing.T) { check(t, 0, 0, i) })
+	}
+}
+
+func TestSpoolCreateAndSeedInjected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seed.pst")
+	n, _, _ := seedNDB(t, []byte("seeded"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	oldC := createTemp
+	createTemp = func(string, string) (*os.File, error) { return nil, io.ErrClosedPipe }
+	_, err = n2.PutDataTree(bytes.NewReader([]byte("x")), 1)
+	createTemp = oldC
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("createTemp: %v", err)
+	}
+	n3, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n3.Close()
+	oldCopy := copyWork
+	copyWork = func(io.WriterAt, io.ReaderAt, int64) error { return io.ErrClosedPipe }
+	_, err = n3.PutDataTree(bytes.NewReader([]byte("y")), 1)
+	copyWork = oldCopy
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("copyWork: %v", err)
+	}
+}
+
+func TestCommitRestoreErrorIsJoined(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("join"), false)
+	ms := NewMemSink("dst")
+	fs := &faultSink{Sink: ms, failWrite: 1}
+	err := n.CommitTo(fs)
+	if err == nil {
+		t.Fatal("expected fault")
+	}
+	if errors.Is(err, ErrIO) || errors.Is(err, io.ErrClosedPipe) {
+		return
+	}
+	t.Fatalf("missing op error: %v", err)
 }
