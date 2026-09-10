@@ -21,9 +21,19 @@ type Store struct {
 	nbtRoot       BREF
 	bbtRoot       BREF
 	backing       []byte
+	src           io.ReaderAt
 	spool         Sink
-	spoolTmp      bool
+	srcLife       srcLife
 }
+
+// srcLife is who may Close/remove the writable handle.
+type srcLife uint8
+
+const (
+	lifeBorrowed srcLife = iota // caller-owned; never close
+	lifeClose                   // we opened it; close, do not remove
+	lifeTemp                    // pst-v2-*.spool; close and remove
+)
 
 type region struct {
 	bitmap [AMapBitmapBytes]byte
@@ -657,24 +667,36 @@ func (s *Store) ensureSpool() error {
 	if err != nil {
 		return ioErr("spool", "create: %v", err)
 	}
-	s.spool = &FileSink{f: f}
-	s.spoolTmp = true
+	sk := &FileSink{f: f}
+	if s.src != nil {
+		if err := copyReaderAt(sk, s.src, int64(s.FileEOF())); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return ioErr("spool", "seed: %v", err)
+		}
+	}
+	s.spool = sk
+	s.src = sk
+	s.srcLife = lifeTemp
 	return nil
 }
 
-func (s *Store) closeOwnedSpool() error {
-	if s.spool == nil {
+func (s *Store) closeOwned() error {
+	if s.srcLife == lifeBorrowed || s.spool == nil {
 		return nil
 	}
 	name := ""
-	tmp := s.spoolTmp
-	if tmp {
+	if s.srcLife == lifeTemp {
 		name = s.spool.Name()
 	}
 	err := s.spool.Close()
+	if s.src == s.spool {
+		s.src = nil
+	}
 	s.spool = nil
-	s.spoolTmp = false
-	if tmp && name != "" {
+	life := s.srcLife
+	s.srcLife = lifeBorrowed
+	if life == lifeTemp && name != "" {
 		if rerr := os.Remove(name); rerr != nil && !os.IsNotExist(rerr) {
 			return errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
 		}
@@ -682,9 +704,48 @@ func (s *Store) closeOwnedSpool() error {
 	return err
 }
 
-// Close releases an owned temp spool (descriptor and file). Shared sinks are closed, not removed.
+func (s *Store) ownClose() {
+	if s.spool != nil {
+		s.srcLife = lifeClose
+	}
+}
+
+func (s *Store) attachSource(r io.ReaderAt) {
+	s.src = r
+	if sk, ok := r.(Sink); ok {
+		s.spool = sk
+	}
+	s.srcLife = lifeBorrowed
+}
+
+func (s *Store) readExtent(ib uint64, size int) ([]byte, error) {
+	if size == 0 {
+		return []byte{}, nil
+	}
+	raw := make([]byte, size)
+	try := func(r io.ReaderAt) bool {
+		if r == nil {
+			return false
+		}
+		nr, err := r.ReadAt(raw, int64(ib))
+		return nr >= size && (err == nil || err == io.EOF)
+	}
+	if try(s.spool) {
+		return raw, nil
+	}
+	if s.src != nil && s.src != s.spool && try(s.src) {
+		return raw, nil
+	}
+	if uint64(len(s.backing)) >= ib+uint64(size) {
+		copy(raw, s.backing[ib:ib+uint64(size)])
+		return raw, nil
+	}
+	return nil, invariant(SectionBlockTrailer, "ib", "missing payload at 0x%x", ib)
+}
+
+// Close closes/removes only owned handles. Borrowed caller sinks stay open.
 func (s *Store) Close() error {
-	return s.closeOwnedSpool()
+	return s.closeOwned()
 }
 
 func errorsJoin(a, b error) error {
@@ -778,8 +839,12 @@ func (s *Store) WriteTo(dst Sink) error {
 		return invalidArg("sink", "nil commit sink")
 	}
 	eof := int64(s.FileEOF())
-	if s.spool != nil && dst != s.spool {
-		if err := copyReaderAt(dst, s.spool, eof); err != nil {
+	src := s.src
+	if s.spool != nil {
+		src = s.spool
+	}
+	if src != nil && dst != src && dst != s.spool {
+		if err := copyReaderAt(dst, src, eof); err != nil {
 			return ioErr("spool", "copy: %v", err)
 		}
 	}
@@ -1027,10 +1092,7 @@ func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
 	if s.AMapFree() != h.Root.AMapFree {
 		return nil, invariant(SectionRoot, "cbAMapFree", "bitmap free %d != ROOT %d", s.AMapFree(), h.Root.AMapFree)
 	}
-	if sk, ok := r.(Sink); ok {
-		s.spool = sk
-		s.spoolTmp = false
-	}
+	s.attachSource(r)
 	return s, nil
 }
 

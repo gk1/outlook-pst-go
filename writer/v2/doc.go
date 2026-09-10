@@ -12,10 +12,12 @@
 // bidNextB, and reopen that retains Store maps and allocated payloads.
 // Extra BBT refs reopen as opaque unless PST-006 reconstructs them from
 // XBLOCK/XXBLOCK rgbid and SLENTRY/SIENTRY. PST-006 streams data trees
-// (direct/XBLOCK/XXBLOCK) into a FileSink spool, commits through CommitTo
-// without assembling FileEOF, reopens via OpenNDBFrom/OpenNDBFile, and
+// into a FileSink spool, commits through CommitTo without assembling
+// FileEOF, and reopens via OpenNDBFrom from any io.ReaderAt (not only
+// Sink). Close/remove applies only to owned temp/file handles. Reopen
 // recursively validates XXBLOCK->XBLOCK->data and SIBLOCK->SLBLOCK
-// (lcbTotal, child existence, duplicates/cycles) on write and reopen.
+// (lcbTotal, child existence, duplicates/cycles). Failed tree writes
+// restore bidNextB and surface cleanup errors.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

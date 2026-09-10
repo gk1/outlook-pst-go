@@ -508,6 +508,8 @@ func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 	n := NewNDB(nil)
 	beforeR := n.Store().RegionCount()
 	beforeEOF := n.Store().FileEOF()
+	beforeBid := n.Store().bidNextB
+	beforeIDs := n.ids.nextBlock
 	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
 	if !errors.Is(err, ErrIO) {
 		t.Fatalf("got %v", err)
@@ -521,6 +523,12 @@ func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 	if n.Store().FileEOF() != beforeEOF {
 		t.Fatalf("eof 0x%x want 0x%x", n.Store().FileEOF(), beforeEOF)
 	}
+	if n.Store().bidNextB != beforeBid {
+		t.Fatalf("bidNextB 0x%x want 0x%x", n.Store().bidNextB, beforeBid)
+	}
+	if n.ids.nextBlock != beforeIDs {
+		t.Fatalf("ids.nextBlock 0x%x want 0x%x", n.ids.nextBlock, beforeIDs)
+	}
 	var spoolName string
 	if n.Store().spool != nil {
 		spoolName = n.Store().spool.Name()
@@ -532,5 +540,91 @@ func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 		if _, statErr := os.Stat(spoolName); !os.IsNotExist(statErr) {
 			t.Fatalf("leaked spool %s: %v", spoolName, statErr)
 		}
+	}
+}
+
+type onlyReaderAt struct{ r io.ReaderAt }
+
+func (o onlyReaderAt) ReadAt(p []byte, off int64) (int, error) { return o.r.ReadAt(p, off) }
+
+type failTruncate struct {
+	Sink
+}
+
+func (f failTruncate) Truncate(int64) error { return io.ErrClosedPipe }
+
+func TestOpenNDBFromReaderAtOnly(t *testing.T) {
+	n := NewNDB(nil)
+	payload := bytes.Repeat([]byte{0x5A}, 200)
+	root, err := n.PutDataTree(bytes.NewReader(payload), int64(len(payload)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x21, root.BID, 0, 0)
+	file, err := n.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(file)}, int64(len(file)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	if n2.Store().spool != nil {
+		t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().spool)
+	}
+	rd, err := n2.OpenDataTree(root.BID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("got %d bytes", len(got))
+	}
+}
+
+func TestCommitToDoesNotCloseBorrowedSink(t *testing.T) {
+	n := NewNDB(nil)
+	root, err := n.PutDataTree(bytes.NewReader([]byte("abc")), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x21, root.BID, 0, 0)
+	path := filepath.Join(t.TempDir(), "borrow.pst")
+	dst, err := CreateFileSink(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.CommitTo(dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.WriteAt([]byte{0}, 0); err != nil {
+		t.Fatalf("Close closed borrowed dest: %v", err)
+	}
+	_ = dst.Close()
+}
+
+func TestRollbackCleanupFailureIsVisible(t *testing.T) {
+	n := NewNDB(nil)
+	if err := n.Store().ensureSpool(); err != nil {
+		t.Fatal(err)
+	}
+	n.Store().spool = failTruncate{Sink: n.Store().spool}
+	n.Store().src = n.Store().spool
+	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
+	if !errors.Is(err, ErrIO) {
+		t.Fatalf("got %v", err)
+	}
+	if !strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("cleanup not visible: %v", err)
 	}
 }

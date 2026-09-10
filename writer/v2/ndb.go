@@ -142,21 +142,12 @@ func (n *NDB) blockPayload(e BBTEntry) ([]byte, error) {
 		}
 	}
 	size := BlockDiskSize(uint64(e.CB))
-	raw := make([]byte, size)
-	got := false
-	if n.store != nil && n.store.spool != nil && e.IB != 0 {
-		nr, err := n.store.spool.ReadAt(raw, int64(e.IB))
-		if err != nil && nr < int(size) {
-			return nil, invariant(SectionBlockTrailer, "ib", "spool read BID 0x%x at 0x%x: %v", e.BID, e.IB, err)
-		}
-		got = nr >= int(size)
-	}
-	if !got && n.store != nil && e.IB != 0 && uint64(len(n.store.backing)) >= e.IB+size {
-		copy(raw, n.store.backing[e.IB:e.IB+size])
-		got = true
-	}
-	if !got {
+	if n.store == nil || e.IB == 0 {
 		return nil, invariant(SectionBlockTrailer, "ib", "missing payload for BID 0x%x at 0x%x", e.BID, e.IB)
+	}
+	raw, err := n.store.readExtent(e.IB, int(size))
+	if err != nil {
+		return nil, err
 	}
 	v, err := InspectBlock(raw, e.IB)
 	if err != nil {
@@ -660,9 +651,12 @@ func (n *NDB) CommitTo(dst Sink) error {
 		return ioErr("sink", "sync: %v", err)
 	}
 	if n.store.spool != dst {
-		_ = n.store.closeOwnedSpool()
+		if err := n.store.closeOwned(); err != nil {
+			return err
+		}
+		n.store.src = dst
 		n.store.spool = dst
-		n.store.spoolTmp = false
+		n.store.srcLife = lifeBorrowed
 	}
 	n.store.backing = nil
 	return nil
@@ -1080,6 +1074,7 @@ func OpenNDBFile(path string) (*NDB, error) {
 		_ = f.Close()
 		return nil, err
 	}
+	n.store.ownClose()
 	return n, nil
 }
 
@@ -1171,15 +1166,15 @@ func (n *NDB) reconstructTreeRefs() error {
 				n.dataTreeRefs[child]++
 			}
 		case BlockTypeSubnode:
+			if err := n.validateSubnodeTree(bid); err != nil {
+				return err
+			}
 			sn, err := InspectSubnodeBlock(data)
 			if err != nil {
 				return err
 			}
 			if sn.Level == 0 {
 				for _, ent := range sn.Leaves {
-					if err := n.assertSLEntryRoles(ent); err != nil {
-						return err
-					}
 					if ent.DataBID != 0 {
 						n.subnodeRefs[ent.DataBID]++
 					}

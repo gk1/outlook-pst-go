@@ -477,3 +477,109 @@ func TestOpenNDBRejectsMalformedDataTree(t *testing.T) {
 		t.Fatalf("reopen xx->xx: %v", err)
 	}
 }
+
+func TestOpenNDBRejectsMalformedSubnode(t *testing.T) {
+	t.Run("si-child-is-si", func(t *testing.T) {
+		n := NewNDB(nil)
+		data := mustAlloc(t, n, 8)
+		if err := n.putPayload(data, bytes.Repeat([]byte{1}, 8)); err != nil {
+			t.Fatal(err)
+		}
+		sl, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: data.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		innerp, err := EncodeSIBlock(SIBlockLevel, []SIEntry{{Key: 0x21, Ref: sl.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner, err := n.AllocInternalBlock(uint16(len(innerp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(inner, innerp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddSubnodeRef(sl.BID); err != nil {
+			t.Fatal(err)
+		}
+		outerp, err := EncodeSIBlock(SIBlockLevel, []SIEntry{{Key: 0x21, Ref: inner.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		outer, err := n.AllocInternalBlock(uint16(len(outerp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(outer, outerp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddSubnodeRef(inner.BID); err != nil {
+			t.Fatal(err)
+		}
+		mustNode(t, n, 0x61, 0, outer.BID, 0)
+		file, err := n.Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenNDB(file); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("reopen SI->SI: %v", err)
+		}
+	})
+	t.Run("missing-child", func(t *testing.T) {
+		n := NewNDB(nil)
+		fake := MakeInternalBID(0x1000)
+		payload, err := EncodeSIBlock(SIBlockLevel, []SIEntry{{Key: 0x21, Ref: fake}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blk, err := n.AllocInternalBlock(uint16(len(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(blk, payload); err != nil {
+			t.Fatal(err)
+		}
+		mustNode(t, n, 0x61, 0, blk.BID, 0)
+		file, err := n.Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenNDB(file); !errors.Is(err, ErrInvariant) && !errors.Is(err, ErrInvalidArg) {
+			t.Fatalf("reopen missing SIENTRY: %v", err)
+		}
+	})
+	t.Run("cyclic-si", func(t *testing.T) {
+		n := NewNDB(nil)
+		blk, err := n.AllocInternalBlock(SIBlockHeaderSize + SIEntrySize)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload, err := EncodeSIBlock(SIBlockLevel, []SIEntry{{Key: 0x21, Ref: blk.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uint16(len(payload)) != blk.CB {
+			_ = n.dropBlock(blk.BID)
+			blk, err = n.AllocInternalBlock(uint16(len(payload)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload, err = EncodeSIBlock(SIBlockLevel, []SIEntry{{Key: 0x21, Ref: blk.BID}})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := n.putPayload(blk, payload); err != nil {
+			t.Fatal(err)
+		}
+		mustNode(t, n, 0x61, 0, blk.BID, 0)
+		file, err := n.Commit()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenNDB(file); !errors.Is(err, ErrInvariant) {
+			t.Fatalf("reopen cyclic SI: %v", err)
+		}
+	})
+}
