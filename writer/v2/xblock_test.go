@@ -504,31 +504,72 @@ func TestXXBlockMalformedChildCycleDuplicate(t *testing.T) {
 	})
 }
 
+// fillRegionZero occupies remaining region-0 user slots so later
+// allocations land in AMap 1, then sets lastAllocAMap to 0 so a failed
+// write's DList cursor change is observable.
+func fillRegionZero(t *testing.T, n *NDB) {
+	t.Helper()
+	s := n.Store()
+	if s.RegionCount() < 2 {
+		if err := s.Grow(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := s.Allocate(BytesPerSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, _ := AMapIndexForOffset(first)
+	if idx == 0 {
+		fillStart := first + BytesPerSlot
+		end := AMapRegionEnd(0)
+		if fillStart < end {
+			if err := s.mark(fillStart, end-fillStart, true); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	s.lastAllocAMap = 0
+}
+
+func assertAllocatorRestored(t *testing.T, n *NDB, regions int, eof, bid, ids uint64, amap uint32) {
+	t.Helper()
+	if len(n.blocks) != 0 {
+		t.Fatalf("leaked %d blocks", len(n.blocks))
+	}
+	if n.Store().RegionCount() != regions {
+		t.Fatalf("regions %d want %d", n.Store().RegionCount(), regions)
+	}
+	if n.Store().FileEOF() != eof {
+		t.Fatalf("eof 0x%x want 0x%x", n.Store().FileEOF(), eof)
+	}
+	if n.Store().bidNextB != bid {
+		t.Fatalf("bidNextB 0x%x want 0x%x", n.Store().bidNextB, bid)
+	}
+	if n.ids.nextBlock != ids {
+		t.Fatalf("ids.nextBlock 0x%x want 0x%x", n.ids.nextBlock, ids)
+	}
+	if n.Store().lastAllocAMap != amap {
+		t.Fatalf("lastAllocAMap %d want %d", n.Store().lastAllocAMap, amap)
+	}
+}
+
 func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 	n := NewNDB(nil)
+	fillRegionZero(t, n)
 	beforeR := n.Store().RegionCount()
 	beforeEOF := n.Store().FileEOF()
 	beforeBid := n.Store().bidNextB
 	beforeIDs := n.ids.nextBlock
+	beforeAMap := n.Store().lastAllocAMap
+	if beforeAMap != 0 {
+		t.Fatalf("setup lastAllocAMap %d", beforeAMap)
+	}
 	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
 	if !errors.Is(err, ErrIO) {
 		t.Fatalf("got %v", err)
 	}
-	if len(n.blocks) != 0 {
-		t.Fatalf("leaked %d blocks", len(n.blocks))
-	}
-	if n.Store().RegionCount() != beforeR {
-		t.Fatalf("regions %d want %d", n.Store().RegionCount(), beforeR)
-	}
-	if n.Store().FileEOF() != beforeEOF {
-		t.Fatalf("eof 0x%x want 0x%x", n.Store().FileEOF(), beforeEOF)
-	}
-	if n.Store().bidNextB != beforeBid {
-		t.Fatalf("bidNextB 0x%x want 0x%x", n.Store().bidNextB, beforeBid)
-	}
-	if n.ids.nextBlock != beforeIDs {
-		t.Fatalf("ids.nextBlock 0x%x want 0x%x", n.ids.nextBlock, beforeIDs)
-	}
+	assertAllocatorRestored(t, n, beforeR, beforeEOF, beforeBid, beforeIDs, beforeAMap)
 	var spoolName string
 	if n.Store().spool != nil {
 		spoolName = n.Store().spool.Name()
@@ -553,14 +594,55 @@ type failTruncate struct {
 
 func (f failTruncate) Truncate(int64) error { return io.ErrClosedPipe }
 
-func TestOpenNDBFromReaderAtOnly(t *testing.T) {
-	n := NewNDB(nil)
-	payload := bytes.Repeat([]byte{0x5A}, 200)
-	root, err := n.PutDataTree(bytes.NewReader(payload), int64(len(payload)))
+func mustTinyXX(t *testing.T, n *NDB) (BBTEntry, []byte) {
+	t.Helper()
+	var xbs []uint64
+	var payload []byte
+	for i := 0; i < 2; i++ {
+		chunk := []byte{byte('A' + i), byte('A' + i)}
+		leaf := mustAlloc(t, n, uint16(len(chunk)))
+		if err := n.putPayload(leaf, chunk); err != nil {
+			t.Fatal(err)
+		}
+		xp, err := EncodeXBlock(XBlockLevel, uint32(len(chunk)), []uint64{leaf.BID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		xb, err := n.AllocInternalBlock(uint16(len(xp)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := n.putPayload(xb, xp); err != nil {
+			t.Fatal(err)
+		}
+		if err := n.AddDataTreeRef(leaf.BID); err != nil {
+			t.Fatal(err)
+		}
+		xbs = append(xbs, xb.BID)
+		payload = append(payload, chunk...)
+	}
+	xxp, err := EncodeXBlock(XXBlockLevel, uint32(len(payload)), xbs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustNode(t, n, 0x21, root.BID, 0, 0)
+	xx, err := n.AllocInternalBlock(uint16(len(xxp)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := n.putPayload(xx, xxp); err != nil {
+		t.Fatal(err)
+	}
+	for _, bid := range xbs {
+		if err := n.AddDataTreeRef(bid); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return xx, payload
+}
+
+func reopenReaderAt(t *testing.T, n *NDB, dataBID, subBID uint64, payload []byte) {
+	t.Helper()
+	mustNode(t, n, 0x41, dataBID, subBID, 0)
 	file, err := n.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -572,11 +654,15 @@ func TestOpenNDBFromReaderAtOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer n2.Close()
+	t.Cleanup(func() { _ = n2.Close() })
 	if n2.Store().spool != nil {
 		t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().spool)
 	}
-	rd, err := n2.OpenDataTree(root.BID)
+	gotNode, ok := n2.LookupNode(0x41)
+	if !ok || gotNode.DataBID != dataBID || gotNode.SubBID != subBID {
+		t.Fatalf("reopen node %+v ok=%v", gotNode, ok)
+	}
+	rd, err := n2.OpenDataTree(dataBID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,8 +671,71 @@ func TestOpenNDBFromReaderAtOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(got, payload) {
-		t.Fatalf("got %d bytes", len(got))
+		t.Fatalf("got %d bytes want %d", len(got), len(payload))
 	}
+	if subBID == 0 {
+		return
+	}
+	var kids []SLEntry
+	if err := n2.WalkSubnodes(subBID, func(e SLEntry) error {
+		kids = append(kids, e)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(kids) != 1 {
+		t.Fatalf("subnode %+v", kids)
+	}
+}
+
+func TestOpenNDBFromReaderAtOnly(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		n := NewNDB(nil)
+		payload := bytes.Repeat([]byte{0x5A}, 200)
+		root, err := n.PutDataTree(bytes.NewReader(payload), int64(len(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		innerData := mustAlloc(t, n, 8)
+		if err := n.putPayload(innerData, []byte("innersub")); err != nil {
+			t.Fatal(err)
+		}
+		inner, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: innerData.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reopenReaderAt(t, n, root.BID, inner.BID, payload)
+	})
+	t.Run("xblock", func(t *testing.T) {
+		n := NewNDB(nil)
+		payload := bytes.Repeat([]byte{0x5A}, MaxDataBlockCB+100)
+		root, err := n.PutDataTree(bytes.NewReader(payload), int64(len(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		innerData := mustAlloc(t, n, 8)
+		if err := n.putPayload(innerData, []byte("innersub")); err != nil {
+			t.Fatal(err)
+		}
+		inner, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: innerData.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reopenReaderAt(t, n, root.BID, inner.BID, payload)
+	})
+	t.Run("xxblock", func(t *testing.T) {
+		n := NewNDB(nil)
+		root, payload := mustTinyXX(t, n)
+		innerData := mustAlloc(t, n, 8)
+		if err := n.putPayload(innerData, []byte("innersub")); err != nil {
+			t.Fatal(err)
+		}
+		inner, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: innerData.BID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reopenReaderAt(t, n, root.BID, inner.BID, payload)
+	})
 }
 
 func TestCommitToDoesNotCloseBorrowedSink(t *testing.T) {
@@ -615,9 +764,16 @@ func TestCommitToDoesNotCloseBorrowedSink(t *testing.T) {
 
 func TestRollbackCleanupFailureIsVisible(t *testing.T) {
 	n := NewNDB(nil)
+	fillRegionZero(t, n)
+	beforeR := n.Store().RegionCount()
+	beforeEOF := n.Store().FileEOF()
+	beforeBid := n.Store().bidNextB
+	beforeIDs := n.ids.nextBlock
+	beforeAMap := n.Store().lastAllocAMap
 	if err := n.Store().ensureSpool(); err != nil {
 		t.Fatal(err)
 	}
+	spoolName := n.Store().spool.Name()
 	n.Store().spool = failTruncate{Sink: n.Store().spool}
 	n.Store().src = n.Store().spool
 	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
@@ -626,5 +782,12 @@ func TestRollbackCleanupFailureIsVisible(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "rollback") {
 		t.Fatalf("cleanup not visible: %v", err)
+	}
+	assertAllocatorRestored(t, n, beforeR, beforeEOF, beforeBid, beforeIDs, beforeAMap)
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(spoolName); !os.IsNotExist(statErr) {
+		t.Fatalf("leaked spool %s: %v", spoolName, statErr)
 	}
 }

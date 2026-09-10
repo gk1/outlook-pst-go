@@ -212,13 +212,17 @@ func TestSIBlockCapacityExceeded(t *testing.T) {
 
 func TestPutSubnodeTreeRollsBackOnMissingChild(t *testing.T) {
 	n := NewNDB(nil)
+	fillRegionZero(t, n)
+	beforeR := n.Store().RegionCount()
+	beforeEOF := n.Store().FileEOF()
+	beforeBid := n.Store().bidNextB
+	beforeIDs := n.ids.nextBlock
+	beforeAMap := n.Store().lastAllocAMap
 	_, err := n.PutSubnodeTree([]SLEntry{{NID: 0x21, DataBID: 4}})
 	if err == nil {
 		t.Fatal("missing DataBID accepted")
 	}
-	if len(n.blocks) != 0 {
-		t.Fatalf("leaked %d blocks", len(n.blocks))
-	}
+	assertAllocatorRestored(t, n, beforeR, beforeEOF, beforeBid, beforeIDs, beforeAMap)
 }
 
 func TestSLEntryRejectsReversedRoles(t *testing.T) {

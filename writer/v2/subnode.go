@@ -305,6 +305,7 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	startRegions := n.store.RegionCount()
 	startBidB := n.store.bidNextB
 	startIDs := n.ids.nextBlock
+	startAMap := n.store.lastAllocAMap
 	var staged []uint64
 	rollback := func() error {
 		var rb error
@@ -318,6 +319,7 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 		}
 		n.store.bidNextB = startBidB
 		n.ids.nextBlock = startIDs
+		n.store.lastAllocAMap = startAMap
 		return rb
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }

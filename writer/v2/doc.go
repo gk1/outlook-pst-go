@@ -17,7 +17,8 @@
 // Sink). Close/remove applies only to owned temp/file handles. Reopen
 // recursively validates XXBLOCK->XBLOCK->data and SIBLOCK->SLBLOCK
 // (lcbTotal, child existence, duplicates/cycles). Failed tree writes
-// restore bidNextB and surface cleanup errors.
+// restore bidNextB, ids.nextBlock, lastAllocAMap, and surface cleanup
+// errors.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

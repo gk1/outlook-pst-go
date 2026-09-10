@@ -115,6 +115,7 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	startRegions := n.store.RegionCount()
 	startBidB := n.store.bidNextB
 	startIDs := n.ids.nextBlock
+	startAMap := n.store.lastAllocAMap
 	var staged []uint64
 	var fail error
 	rollback := func() error {
@@ -129,6 +130,7 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 		}
 		n.store.bidNextB = startBidB
 		n.ids.nextBlock = startIDs
+		n.store.lastAllocAMap = startAMap
 		return rb
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
