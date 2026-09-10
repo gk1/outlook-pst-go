@@ -620,14 +620,12 @@ func (n *NDB) CommitTo(dst Sink) error {
 	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
-	img, err := n.Encode()
+	img, err := encodeImage(n)
 	if err != nil {
-		_ = discardStage(stage)
-		return n.abortTxn(snap, err)
+		return n.abortTxn(snap, rollbackErr(err, discardStage(stage)))
 	}
 	if err := n.writeCommit(stage, img); err != nil {
-		_ = discardStage(stage)
-		return n.abortTxn(snap, err)
+		return n.abortTxn(snap, rollbackErr(err, discardStage(stage)))
 	}
 	// Stage is a complete VALID image. Install it as the authoritative
 	// source before any dest write so a hidden alias of the previous source
@@ -642,13 +640,7 @@ func (n *NDB) CommitTo(dst Sink) error {
 		if oldWork != nil {
 			cl = oldWork.close()
 		}
-		if oldIO != nil {
-			if mayAlias(dst, oldIO.w) || mayAlias(dst, oldIO.r) {
-				n.store.hold = oldIO
-			} else {
-				cl = errorsJoin(cl, oldIO.close())
-			}
-		}
+		cl = errorsJoin(cl, n.store.retainOwned(oldIO, dst))
 		return rollbackErr(err, cl)
 	}
 	return n.adoptPublished(dst, oldWork, oldIO)
@@ -681,7 +673,7 @@ func (n *NDB) CommitFile(path string) error {
 	cleanupTmp := func() error {
 		return errorsJoin(closeSink(dst), removeFile(tmp))
 	}
-	img, err := n.Encode()
+	img, err := encodeImage(n)
 	if err != nil {
 		return n.abortTxn(snap, rollbackErr(err, cleanupTmp()))
 	}

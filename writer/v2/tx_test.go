@@ -1981,3 +1981,217 @@ func TestStageCloseRemoveAfterDestSync(t *testing.T) {
 	}
 	assertNDBReadable(t, n, 0x21, "cleanup-stage")
 }
+
+func trackSinkCloses(t *testing.T, want Sink) *int {
+	t.Helper()
+	n := 0
+	old := closeWork
+	closeWork = func(s Sink) error {
+		if sameIO(s, want) {
+			n++
+		}
+		return old(s)
+	}
+	t.Cleanup(func() { closeWork = old })
+	return &n
+}
+
+func openOwnedFileNDB(t *testing.T, payload string) (*NDB, *FileSink) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "owned.pst")
+	n, _, _ := seedNDB(t, []byte(payload), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = n2.Close() })
+	fs, ok := n2.store.io.w.(*FileSink)
+	if !ok {
+		t.Fatalf("owned source %T", n2.store.io.w)
+	}
+	return n2, fs
+}
+
+func TestRepeatedSuccessfulOpaqueOwnedAlias(t *testing.T) {
+	n, fs := openOwnedFileNDB(t, "owned-src")
+	closes := trackSinkCloses(t, fs)
+	wrap := opaqueFileWrap{Sink: fs}
+	if reflect.TypeOf(wrap).Comparable() {
+		t.Fatal("opaqueFileWrap must not be comparable")
+	}
+	for i := 0; i < 3; i++ {
+		payload := string([]byte{byte('a' + i)})
+		extra, err := n.PutDataTree(bytes.NewReader([]byte(payload)), int64(len(payload)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nid := uint64(0x61 + i*0x20)
+		mustNode(t, n, nid, extra.BID, 0, 0)
+		if err := n.CommitTo(wrap); err != nil && !errors.Is(err, ErrCleanup) {
+			t.Fatal(err)
+		}
+		if *closes != 0 {
+			t.Fatalf("owned file closed %d times before Close", *closes)
+		}
+		assertNDBReadable(t, n, 0x21, "owned-src")
+		assertNDBReadable(t, n, nid, payload)
+		if n.store.hold == nil || !sameIO(n.store.hold.w, fs) {
+			t.Fatal("lost held owned file")
+		}
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if *closes != 1 {
+		t.Fatalf("owned file closed %d times, want 1", *closes)
+	}
+}
+
+func TestRepeatedPublishFailureKeepsHold(t *testing.T) {
+	n, fs := openOwnedFileNDB(t, "hold-src")
+	closes := trackSinkCloses(t, fs)
+	for i := 0; i < 2; i++ {
+		fsink := &faultSink{Sink: fs, failWrite: 1}
+		wrap := opaqueFileWrap{Sink: fsink}
+		if err := n.CommitTo(wrap); err == nil {
+			t.Fatal("expected publish failure")
+		}
+		if destIsIO(n, fs) || destIsIO(n, wrap) || destIsIO(n, fsink) {
+			t.Fatal("adopted failed dest")
+		}
+		if n.store.io == nil {
+			t.Fatal("lost complete stage")
+		}
+		assertNDBReadable(t, n, 0x21, "hold-src")
+		if n.store.hold == nil || !sameIO(n.store.hold.w, fs) {
+			t.Fatal("hold overwritten or leaked")
+		}
+		if *closes != 0 {
+			t.Fatalf("owned file closed during failed publish: %d", *closes)
+		}
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if *closes != 1 {
+		t.Fatalf("owned file closed %d times, want 1", *closes)
+	}
+}
+
+func TestDestinationAliasesExistingHold(t *testing.T) {
+	n, fs := openOwnedFileNDB(t, "alias-hold")
+	closes := trackSinkCloses(t, fs)
+	wrap1 := opaqueFileWrap{Sink: fs}
+	if err := n.CommitTo(wrap1); err != nil && !errors.Is(err, ErrCleanup) {
+		t.Fatal(err)
+	}
+	if n.store.hold == nil || !sameIO(n.store.hold.w, fs) {
+		t.Fatal("expected hold after first opaque commit")
+	}
+	extra, err := n.PutDataTree(bytes.NewReader([]byte("more")), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x61, extra.BID, 0, 0)
+	wrap2 := opaqueFileWrap{Sink: fs}
+	if err := n.CommitTo(wrap2); err != nil && !errors.Is(err, ErrCleanup) {
+		t.Fatal(err)
+	}
+	if *closes != 0 {
+		t.Fatalf("closed held file on dest-alias commit: %d", *closes)
+	}
+	assertNDBReadable(t, n, 0x21, "alias-hold")
+	assertNDBReadable(t, n, 0x61, "more")
+	if n.store.hold == nil || !sameIO(n.store.hold.w, fs) {
+		t.Fatal("hold lost after dest-alias commit")
+	}
+	if err := n.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if *closes != 1 {
+		t.Fatalf("owned file closed %d times, want 1", *closes)
+	}
+}
+
+func TestDiscardStageJoinedOnPrePublish(t *testing.T) {
+	errEncode := errors.New("encode-fail")
+	errClose := errors.New("stage-close")
+	errRemove := errors.New("stage-remove")
+	install := func(t *testing.T) {
+		oldC := closeSink
+		closeSink = func(s Sink) error {
+			_ = s.Close()
+			return errClose
+		}
+		oldR := removeFile
+		removeFile = func(string) error { return errRemove }
+		t.Cleanup(func() {
+			closeSink = oldC
+			removeFile = oldR
+		})
+	}
+	t.Run("encode", func(t *testing.T) {
+		n, _, _ := seedNDB(t, []byte("enc"), false)
+		ms := NewMemSink("dst")
+		install(t)
+		oldE := encodeImage
+		encodeImage = func(*NDB) (*TreeImage, error) { return nil, errEncode }
+		t.Cleanup(func() { encodeImage = oldE })
+		err := n.CommitTo(ms)
+		if err == nil {
+			t.Fatal("expected encode failure")
+		}
+		if !errors.Is(err, errEncode) {
+			t.Fatalf("missing encode: %v", err)
+		}
+		if !errors.Is(err, errClose) {
+			t.Fatalf("missing close: %v", err)
+		}
+		if !errors.Is(err, errRemove) {
+			t.Fatalf("missing remove: %v", err)
+		}
+		if destIsIO(n, ms) {
+			t.Fatal("adopted dest after encode failure")
+		}
+		if len(ms.Bytes()) != 0 {
+			t.Fatal("dest mutated after encode failure")
+		}
+	})
+	t.Run("writeCommit", func(t *testing.T) {
+		n, _, _ := seedNDB(t, []byte("wr"), false)
+		ms := NewMemSink("dst")
+		install(t)
+		oldS := newStageSink
+		newStageSink = func() (Sink, error) {
+			s, err := oldS()
+			if err != nil {
+				return nil, err
+			}
+			return &faultSink{Sink: s, failWrite: 1}, nil
+		}
+		t.Cleanup(func() { newStageSink = oldS })
+		err := n.CommitTo(ms)
+		if err == nil {
+			t.Fatal("expected writeCommit failure")
+		}
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("missing write: %v", err)
+		}
+		if !errors.Is(err, errClose) {
+			t.Fatalf("missing close: %v", err)
+		}
+		if !errors.Is(err, errRemove) {
+			t.Fatalf("missing remove: %v", err)
+		}
+		if destIsIO(n, ms) {
+			t.Fatal("adopted dest after stage write failure")
+		}
+		if len(ms.Bytes()) != 0 {
+			t.Fatal("dest mutated after stage write failure")
+		}
+	})
+}

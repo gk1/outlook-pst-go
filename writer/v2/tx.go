@@ -52,6 +52,9 @@ var createCommitTemp = func(path string) (Sink, error) { return CreateFileSink(p
 // not a RAM copy of FileEOF. Tests inject failures.
 var newStageSink = createStageSink
 
+// encodeImage builds the NBT/BBT page image for a commit. Tests inject failures.
+var encodeImage = func(n *NDB) (*TreeImage, error) { return n.Encode() }
+
 // truncWork truncates the work spool to the restored EOF. Tests inject failures.
 var truncWork = truncSink
 
@@ -82,12 +85,12 @@ func discardStage(stage Sink) error {
 	if stage == nil {
 		return nil
 	}
+	name := stage.Name()
 	err := closeSink(stage)
-	if _, ok := stage.(*FileSink); ok {
-		if name := stage.Name(); name != "" {
-			if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
-				err = errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
-			}
+	// File-backed stages use an absolute path. MemSink labels are not paths.
+	if filepath.IsAbs(name) {
+		if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
+			err = errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
 		}
 	}
 	return err
@@ -105,14 +108,46 @@ func knownCore(v any) bool {
 	return false
 }
 
-func mayAlias(dst, src any) bool {
-	if dst == nil || src == nil {
-		return false
+// retainOwned keeps at most one owned OpenNDBFile source that dest may still
+// write through. Stages and work spools are always closed: dest cannot wrap a
+// sink we created. An existing hold is never overwritten or leaked.
+func (s *Store) retainOwned(h *ioHandle, dst Sink) error {
+	if s == nil || h == nil {
+		return nil
 	}
-	if sameIO(dst, src) {
-		return true
+	if h.life != lifeClose {
+		return h.close()
 	}
-	return !knownCore(dst)
+	if knownCore(dst) && !sameIO(dst, h.w) && !sameIO(dst, h.r) {
+		return h.close()
+	}
+	if s.hold == h {
+		return nil
+	}
+	if s.hold != nil {
+		return h.close()
+	}
+	s.hold = h
+	return nil
+}
+
+func (s *Store) closeHold() error {
+	if s == nil || s.hold == nil {
+		return nil
+	}
+	err := s.hold.close()
+	s.hold = nil
+	return err
+}
+
+func (s *Store) releaseHoldIfDistinct(dst Sink) error {
+	if s == nil || s.hold == nil {
+		return nil
+	}
+	if !knownCore(dst) || sameIO(dst, s.hold.w) || sameIO(dst, s.hold.r) {
+		return nil
+	}
+	return s.closeHold()
 }
 
 func truncSink(w Sink, eof int64) error {
@@ -545,16 +580,8 @@ func (n *NDB) adoptPublished(dst Sink, oldWork, oldIO *ioHandle) error {
 	if oldWork != nil {
 		err = errorsJoin(err, oldWork.close())
 	}
-	if oldIO != nil {
-		if mayAlias(dst, oldIO.w) || mayAlias(dst, oldIO.r) {
-			if n.store.hold != nil && n.store.hold != oldIO {
-				err = errorsJoin(err, n.store.hold.close())
-			}
-			n.store.hold = oldIO
-		} else {
-			err = errorsJoin(err, oldIO.close())
-		}
-	}
+	err = errorsJoin(err, n.store.retainOwned(oldIO, dst))
+	err = errorsJoin(err, n.store.releaseHoldIfDistinct(dst))
 	if err != nil {
 		return cleanupErr(err)
 	}
@@ -593,6 +620,7 @@ func (n *NDB) adopt(dst Sink, life srcLife) error {
 	if oldIO != nil {
 		err = errorsJoin(err, oldIO.close())
 	}
+	err = errorsJoin(err, n.store.closeHold())
 	if err != nil {
 		return cleanupErr(err)
 	}

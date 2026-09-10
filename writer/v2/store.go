@@ -22,7 +22,7 @@ type Store struct {
 	bbtRoot       BREF
 	io            *ioHandle // last committed source
 	work          *ioHandle // uncommitted writable spool
-	hold          *ioHandle // previous owned source dest may alias; closed on Close
+	hold          *ioHandle // at most one owned OpenNDBFile dest may alias; closed on Close
 	undo          *undoLog  // extent journal for the active transaction
 }
 

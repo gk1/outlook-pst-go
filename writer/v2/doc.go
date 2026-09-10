@@ -23,8 +23,10 @@
 // that stage as the authoritative source, then publishes onto dest with the
 // same INVALID-first protocol. A dest publish failure keeps the complete
 // stage readable and cannot destroy the only valid source through a hidden
-// alias. An opaque wrapper around an owned OpenNDBFile source does not
-// close that file on success. sameIO compares only *MemSink/*FileSink/*os.File
+// alias. Store.hold retains at most one owned OpenNDBFile source an opaque
+// dest may still write through; replaced stages are closed and hold is never
+// overwritten. Encode/writeCommit failures join discardStage close/remove.
+// sameIO compares only *MemSink/*FileSink/*os.File
 // pointers and never uses interface ==. CommitFile writes a sibling
 // temp, renames, and fsyncs the parent directory. A post-rename dirsync or
 // reopen failure returns ErrAdopt, keeps the work spool as the usable
