@@ -112,62 +112,48 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	if expected > int64(^uint32(0)) {
 		return BBTEntry{}, limitErr("lcbTotal", "logical size %d exceeds uint32 lcbTotal (MS-PST %s)", expected, SectionXBlock)
 	}
-	snap := n.capture()
-	var staged []uint64
-	var fail error
-	rollback := func() error {
-		return n.restore(snap)
-	}
-	note := func(e BBTEntry) { staged = append(staged, e.BID) }
-
-	var leaves []BBTEntry
-	var total uint64
-	buf := make([]byte, MaxDataBlockCB)
-	for {
-		nr, err := io.ReadFull(r, buf)
-		if nr > 0 {
-			e, aerr := n.AllocBlock(uint16(nr))
-			if aerr != nil {
-				fail = aerr
+	var root BBTEntry
+	err := n.runTxn(func() error {
+		var leaves []BBTEntry
+		var total uint64
+		buf := make([]byte, MaxDataBlockCB)
+		for {
+			nr, err := io.ReadFull(r, buf)
+			if nr > 0 {
+				e, aerr := n.AllocBlock(uint16(nr))
+				if aerr != nil {
+					return aerr
+				}
+				if err := n.putPayload(e, buf[:nr]); err != nil {
+					return err
+				}
+				leaves = append(leaves, e)
+				total += uint64(nr)
+				if total > uint64(^uint32(0)) {
+					return limitErr("lcbTotal", "logical size exceeds uint32 lcbTotal (MS-PST %s)", SectionXBlock)
+				}
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			note(e)
-			if err := n.putPayload(e, buf[:nr]); err != nil {
-				fail = err
-				break
-			}
-			leaves = append(leaves, e)
-			total += uint64(nr)
-			if total > uint64(^uint32(0)) {
-				fail = limitErr("lcbTotal", "logical size exceeds uint32 lcbTotal (MS-PST %s)", SectionXBlock)
-				break
+			if err != nil {
+				return ioErr("reader", "data tree read: %v", err)
 			}
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
+		if expected > 0 && int64(total) != expected {
+			return invalidArg("size", "read %d bytes, expected %d", total, expected)
 		}
-		if err != nil {
-			fail = ioErr("reader", "data tree read: %v", err)
-			break
+		if len(leaves) == 0 {
+			return nil
 		}
-	}
-	if fail != nil {
-		return BBTEntry{}, rollbackErr(fail, rollback())
-	}
-	if expected > 0 && int64(total) != expected {
-		return BBTEntry{}, rollbackErr(invalidArg("size", "read %d bytes, expected %d", total, expected), rollback())
-	}
-	if len(leaves) == 0 {
-		return BBTEntry{}, nil
-	}
-	root, err := n.buildDataTree(leaves, uint32(total), note)
-	if err != nil {
-		return BBTEntry{}, rollbackErr(err, rollback())
-	}
-	return root, nil
+		var err error
+		root, err = n.buildDataTree(leaves, uint32(total))
+		return err
+	})
+	return root, err
 }
 
-func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32, note func(BBTEntry)) (BBTEntry, error) {
+func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32) (BBTEntry, error) {
 	if len(leaves) == 1 {
 		return leaves[0], nil
 	}
@@ -192,7 +178,6 @@ func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32, note func(BBTEntry)
 		if err != nil {
 			return BBTEntry{}, err
 		}
-		note(blk)
 		if err := n.putPayload(blk, payload); err != nil {
 			return BBTEntry{}, err
 		}
@@ -221,7 +206,6 @@ func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32, note func(BBTEntry)
 	if err != nil {
 		return BBTEntry{}, err
 	}
-	note(root)
 	if err := n.putPayload(root, payload); err != nil {
 		return BBTEntry{}, err
 	}

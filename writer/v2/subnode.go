@@ -302,20 +302,16 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	}
 	sorted := append([]SLEntry(nil), entries...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NID < sorted[j].NID })
-	snap := n.capture()
-	var staged []uint64
-	rollback := func() error {
-		return n.restore(snap)
-	}
-	note := func(e BBTEntry) { staged = append(staged, e.BID) }
-	root, err := n.buildSubnodeTree(sorted, note)
-	if err != nil {
-		return BBTEntry{}, rollbackErr(err, rollback())
-	}
-	return root, nil
+	var root BBTEntry
+	err := n.runTxn(func() error {
+		var err error
+		root, err = n.buildSubnodeTree(sorted)
+		return err
+	})
+	return root, err
 }
 
-func (n *NDB) buildSubnodeTree(entries []SLEntry, note func(BBTEntry)) (BBTEntry, error) {
+func (n *NDB) buildSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	var leaves []SIEntry
 	for i := 0; i < len(entries); i += MaxSLBlockEntries {
 		end := i + MaxSLBlockEntries
@@ -331,7 +327,6 @@ func (n *NDB) buildSubnodeTree(entries []SLEntry, note func(BBTEntry)) (BBTEntry
 		if err != nil {
 			return BBTEntry{}, err
 		}
-		note(blk)
 		if err := n.putPayload(blk, payload); err != nil {
 			return BBTEntry{}, err
 		}
@@ -352,10 +347,10 @@ func (n *NDB) buildSubnodeTree(entries []SLEntry, note func(BBTEntry)) (BBTEntry
 		}
 		leaves = append(leaves, SIEntry{Key: chunk[0].NID, Ref: blk.BID})
 	}
-	return n.buildSIRoot(leaves, note)
+	return n.buildSIRoot(leaves)
 }
 
-func (n *NDB) buildSIRoot(kids []SIEntry, note func(BBTEntry)) (BBTEntry, error) {
+func (n *NDB) buildSIRoot(kids []SIEntry) (BBTEntry, error) {
 	if len(kids) == 1 {
 		e, _ := n.LookupBlock(kids[0].Ref)
 		return e, nil
@@ -371,7 +366,6 @@ func (n *NDB) buildSIRoot(kids []SIEntry, note func(BBTEntry)) (BBTEntry, error)
 	if err != nil {
 		return BBTEntry{}, err
 	}
-	note(blk)
 	if err := n.putPayload(blk, payload); err != nil {
 		return BBTEntry{}, err
 	}

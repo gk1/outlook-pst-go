@@ -28,6 +28,7 @@ type NDB struct {
 	subnodeRefs  map[uint64]int
 	opaqueRefs   map[uint64]int
 	livePages    []uint64
+	pendingPath  string
 }
 
 // NewNDB returns an empty catalog. Page BIDs and IBs come from store (or a
@@ -609,8 +610,8 @@ func (n *NDB) Commit() ([]byte, error) {
 }
 
 func (n *NDB) CommitTo(dst Sink) error {
-	if dst == nil {
-		return invalidArg("sink", "nil commit sink")
+	if err := n.rejectInPlace(dst); err != nil {
+		return err
 	}
 	snap := n.capture()
 	img, err := n.Encode()
@@ -625,8 +626,18 @@ func (n *NDB) CommitTo(dst Sink) error {
 	return n.adopt(dst, lifeBorrowed)
 }
 
-// CommitFile writes a two-phase PST to a sibling temp file, syncs, then
-// atomically replaces path. A crash before rename leaves the previous file.
+// PendingPath is a CommitFile path that is durable on disk but not yet
+// adopted as store.io (dirsync/reopen failure). Empty after a successful adopt.
+func (n *NDB) PendingPath() string {
+	if n == nil {
+		return ""
+	}
+	return n.pendingPath
+}
+
+// CommitFile writes a two-phase PST to a sibling temp file, syncs, renames,
+// then fsyncs the parent directory. A crash before rename leaves the previous
+// file. After rename the new file is the committed image even if reopen fails.
 func (n *NDB) CommitFile(path string) error {
 	if path == "" {
 		return invalidArg("path", "empty commit path")
@@ -650,7 +661,7 @@ func (n *NDB) CommitFile(path string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := dst.Close(); err != nil {
+	if err := closeSink(dst); err != nil {
 		_ = n.restore(snap)
 		_ = os.Remove(tmp)
 		return ioErr("file", "close %s: %v", tmp, err)
@@ -660,27 +671,14 @@ func (n *NDB) CommitFile(path string) error {
 		_ = os.Remove(tmp)
 		return ioErr("file", "rename %s -> %s: %v", tmp, path, err)
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err := syncDir(path); err != nil {
+		return n.failAdopt(path, err)
+	}
+	sk, err := openCommitted(path)
 	if err != nil {
-		n.store.io = nil
-		return ioErr("file", "reopen %s: %v", path, err)
+		return n.failAdopt(path, err)
 	}
-	sk := &FileSink{f: f}
-	oldWork := n.store.work
-	oldIO := n.store.io
-	n.store.work = nil
-	n.store.io = &ioHandle{r: sk, w: sk, life: lifeClose}
-	var cerr error
-	if oldWork != nil {
-		cerr = oldWork.close()
-	}
-	if oldIO != nil {
-		cerr = errorsJoin(cerr, oldIO.close())
-	}
-	if cerr != nil {
-		return cleanupErr(cerr)
-	}
-	return nil
+	return n.adopt(sk, lifeClose)
 }
 
 func encodeTree[T interface{ key() uint64 }](ptype byte, leaves []T, alloc func([]byte, byte) (BREF, error), encodeLeaf func([]T) ([]byte, error), maxLeaf int) (BREF, error) {

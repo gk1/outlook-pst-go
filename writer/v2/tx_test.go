@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -90,6 +91,16 @@ func seedNDB(t *testing.T, payload []byte, withSub bool) (*NDB, BBTEntry, BBTEnt
 	return n, root, sub
 }
 
+func destHeader(t *testing.T, ms *MemSink) error {
+	t.Helper()
+	b := ms.Bytes()
+	if len(b) < UnicodeHeaderSize {
+		return io.ErrUnexpectedEOF
+	}
+	_, err := InspectHeader(b[:UnicodeHeaderSize])
+	return err
+}
+
 func TestSnapshotRestoresCompleteCatalog(t *testing.T) {
 	n := NewNDB(nil)
 	root, err := n.PutDataTree(bytes.NewReader([]byte("abc")), 3)
@@ -123,6 +134,122 @@ func TestSnapshotRestoresCompleteCatalog(t *testing.T) {
 	}
 }
 
+func TestSnapshotCoversMutableFields(t *testing.T) {
+	snap := reflect.TypeOf(snapshot{})
+	names := make(map[string]bool, snap.NumField())
+	for i := 0; i < snap.NumField(); i++ {
+		names[snap.Field(i).Name] = true
+	}
+	skipStore := map[string]bool{"io": true, "work": true}
+	st := reflect.TypeOf(Store{})
+	for i := 0; i < st.NumField(); i++ {
+		f := st.Field(i)
+		if skipStore[f.Name] {
+			continue
+		}
+		if !names[f.Name] {
+			t.Errorf("Store.%s missing from snapshot", f.Name)
+		}
+	}
+	skipNDB := map[string]bool{"store": true, "pendingPath": true}
+	nd := reflect.TypeOf(NDB{})
+	for i := 0; i < nd.NumField(); i++ {
+		f := nd.Field(i)
+		if skipNDB[f.Name] {
+			continue
+		}
+		if !names[f.Name] {
+			t.Errorf("NDB.%s missing from snapshot", f.Name)
+		}
+	}
+}
+
+func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "extent.pst")
+	n, root, _ := seedNDB(t, []byte("keep-bytes"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	e, ok := n2.LookupBlock(root.BID)
+	if !ok {
+		t.Fatal("missing block")
+	}
+	size := int(BlockDiskSize(uint64(e.CB)))
+	orig, err := n2.store.readExtent(e.IB, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eof := n2.store.FileEOF()
+	snap := n2.capture()
+	if !snap.hadWork {
+		if err := n2.store.ensureSpool(); err != nil {
+			t.Fatal(err)
+		}
+		snap = n2.capture()
+		if !snap.hadWork {
+			t.Fatal("expected work spool")
+		}
+	}
+	z := bytes.Repeat([]byte{0xA5}, size)
+	if err := n2.store.writeExtent(e.IB, z); err != nil {
+		t.Fatal(err)
+	}
+	mut, err := n2.store.readExtent(e.IB, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(mut, orig) {
+		t.Fatal("mutation did not land on work spool")
+	}
+	if err := n2.store.Grow(); err != nil {
+		t.Fatal(err)
+	}
+	if n2.store.FileEOF() <= eof {
+		t.Fatal("grow did not extend EOF")
+	}
+	if err := n2.restore(snap); err != nil {
+		t.Fatal(err)
+	}
+	if n2.store.FileEOF() != eof {
+		t.Fatalf("EOF %d want %d", n2.store.FileEOF(), eof)
+	}
+	got, err := n2.store.readExtent(e.IB, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, orig) {
+		t.Fatal("retained extent not restored from committed source")
+	}
+}
+
+func TestCommitToRejectsInPlaceBeforeWrite(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("first"), false)
+	ms := NewMemSink("same")
+	fs := &faultSink{Sink: ms}
+	if err := n.CommitTo(fs); err != nil {
+		t.Fatal(err)
+	}
+	writes := fs.writes
+	off0 := fs.off0
+	extra, err := n.PutDataTree(bytes.NewReader([]byte("more")), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x61, extra.BID, 0, 0)
+	if err := n.CommitTo(fs); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("in-place CommitTo: %v", err)
+	}
+	if fs.writes != writes || fs.off0 != off0 {
+		t.Fatalf("in-place CommitTo mutated dest writes=%d->%d off0=%d->%d", writes, fs.writes, off0, fs.off0)
+	}
+}
+
 func TestCommitTwoPhaseRejectsInvalidHeader(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("phase"), false)
 	ms := NewMemSink("partial")
@@ -130,7 +257,7 @@ func TestCommitTwoPhaseRejectsInvalidHeader(t *testing.T) {
 	if err := n.CommitTo(fs); err == nil {
 		t.Fatal("expected header-transition failure")
 	}
-	if _, err := InspectHeader(ms.Bytes()[:UnicodeHeaderSize]); err == nil {
+	if err := destHeader(t, ms); err == nil {
 		t.Fatal("INVALID_AMAP (or truncated header) accepted")
 	}
 }
@@ -224,9 +351,30 @@ func TestCommitCleanupFailureKeepsNewSource(t *testing.T) {
 	}
 }
 
+func TestCommitCleanupRemoveFailureKeepsNewSource(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("rm"), false)
+	if err := n.store.ensureSpool(); err != nil {
+		t.Fatal(err)
+	}
+	old := removeFile
+	removeFile = func(string) error { return io.ErrClosedPipe }
+	defer func() { removeFile = old }()
+	dst := NewMemSink("new")
+	err := n.CommitTo(dst)
+	if !errors.Is(err, ErrCleanup) {
+		t.Fatalf("got %v", err)
+	}
+	if n.store.io == nil || !sameIO(n.store.io.w, dst) {
+		t.Fatal("NDB lost the successfully written destination")
+	}
+}
+
 func TestNonComparableSinkCommit(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("nc"), false)
-	dst := &ncSink{MemSink: NewMemSink("nc")}
+	dst := ncSink{MemSink: NewMemSink("nc")}
+	if reflect.TypeOf(dst).Comparable() {
+		t.Fatal("ncSink dynamic type must not be comparable")
+	}
 	if err := n.CommitTo(dst); err != nil {
 		t.Fatal(err)
 	}
@@ -247,10 +395,8 @@ func TestReaderAtOnlyMutateCommitReopen(t *testing.T) {
 	}{
 		{"direct", 200},
 		{"xblock", MaxDataBlockCB + 100},
-		{"xxblock", MaxXBlockEntries + 1}, // tiny synthetic via repeated 1-byte? no: use real size
+		{"xxblock", int((MaxXBlockEntries + 1) * MaxDataBlockCB)},
 	}
-	// xxblock uses full leaves; keep it last and smaller-named run uses PutDataTree size.
-	cases[2].n = int((MaxXBlockEntries + 1) * MaxDataBlockCB)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			n := NewNDB(nil)
@@ -347,7 +493,7 @@ func TestFaultWriteDoesNotAdoptDestination(t *testing.T) {
 	if n.store.bidNextB != before.bidNextB || len(n.nodes) != len(before.nodes) {
 		t.Fatal("in-memory state not restored after write fault")
 	}
-	if sameIO(n.store.writer(), fs) {
+	if sameIO(n.store.writer(), fs) || (n.store.io != nil && sameIO(n.store.io.w, fs)) {
 		t.Fatal("adopted a failed destination")
 	}
 }
@@ -407,5 +553,184 @@ func TestOwnedFileClosedBorrowedLeftOpen(t *testing.T) {
 	}
 	if _, err := ms.WriteAt([]byte{0}, 0); err != nil {
 		t.Fatalf("Close closed borrowed sink: %v", err)
+	}
+}
+
+func TestCommitToInjectedBoundaries(t *testing.T) {
+	cases := []struct {
+		name      string
+		failWrite int
+		failOff0  int
+		failSync  int
+		failTrunc int
+		accept    bool
+	}{
+		{name: "invalid-header", failOff0: 1},
+		{name: "sync-invalid", failSync: 1},
+		{name: "body-write", failWrite: 2},
+		{name: "truncate", failTrunc: 1},
+		{name: "valid-header", failOff0: 2},
+		{name: "sync-valid", failSync: 2, accept: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n, _, _ := seedNDB(t, []byte("inj"), false)
+			ms := NewMemSink(tc.name)
+			fs := &faultSink{
+				Sink:      ms,
+				failWrite: tc.failWrite,
+				failOff0:  tc.failOff0,
+				failSync:  tc.failSync,
+				failTrunc: tc.failTrunc,
+			}
+			err := n.CommitTo(fs)
+			if err == nil {
+				t.Fatal("expected injected failure")
+			}
+			if n.store.io != nil && sameIO(n.store.io.w, fs) {
+				t.Fatal("adopted failed dest")
+			}
+			herr := destHeader(t, ms)
+			if tc.accept {
+				if herr != nil {
+					t.Fatalf("dest should be new-valid after %s: %v", tc.name, herr)
+				}
+				return
+			}
+			if herr == nil {
+				t.Fatal("mixed/VALID dest accepted after injected failure")
+			}
+			if tc.failOff0 == 0 && tc.failTrunc == 0 && tc.failWrite == 0 && tc.failSync == 0 {
+				t.Fatal("no fault configured")
+			}
+			if tc.failOff0 > 0 && fs.off0 < tc.failOff0 && tc.failWrite == 0 {
+				t.Fatalf("failOff0 unused: off0=%d", fs.off0)
+			}
+			if tc.failTrunc > 0 && fs.truncs < tc.failTrunc {
+				t.Fatalf("failTrunc unused: truncs=%d", fs.truncs)
+			}
+		})
+	}
+}
+
+func TestCommitFileInjectedBoundaries(t *testing.T) {
+	type kind int
+	const (
+		kClose kind = iota
+		kRename
+		kDirSync
+		kReopen
+	)
+	cases := []struct {
+		name    string
+		kind    kind
+		prior   bool
+		adopt   bool
+		keepOld bool
+	}{
+		{name: "close", kind: kClose, prior: true, keepOld: true},
+		{name: "rename", kind: kRename, prior: true, keepOld: true},
+		{name: "dirsync", kind: kDirSync, prior: true, adopt: true},
+		{name: "reopen", kind: kReopen, prior: true, adopt: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tc.name+".pst")
+			n, _, _ := seedNDB(t, []byte("old"), false)
+			if err := n.CommitFile(path); err != nil {
+				t.Fatal(err)
+			}
+			_ = n.Close()
+			prior, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n2, err := OpenNDBFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer n2.Close()
+			extra, err := n2.PutDataTree(bytes.NewReader([]byte("newx")), 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustNode(t, n2, 0x61, extra.BID, 0, 0)
+
+			switch tc.kind {
+			case kClose:
+				old := closeSink
+				closeSink = func(Sink) error { return io.ErrClosedPipe }
+				defer func() { closeSink = old }()
+			case kRename:
+				old := replacePath
+				replacePath = func(string, string) error { return io.ErrClosedPipe }
+				defer func() { replacePath = old }()
+			case kDirSync:
+				old := syncDir
+				syncDir = func(string) error { return io.ErrClosedPipe }
+				defer func() { syncDir = old }()
+			case kReopen:
+				old := openCommitted
+				openCommitted = func(string) (Sink, error) { return nil, io.ErrClosedPipe }
+				defer func() { openCommitted = old }()
+			}
+
+			commitErr := n2.CommitFile(path)
+			if commitErr == nil {
+				t.Fatal("expected injected failure")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.keepOld {
+				if !bytes.Equal(got, prior) {
+					t.Fatal("prior file mutated")
+				}
+				n3, err := OpenNDBFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer n3.Close()
+				if _, ok := n3.LookupNode(0x61); ok {
+					t.Fatal("uncommitted node in prior file")
+				}
+				return
+			}
+			if !tc.adopt {
+				return
+			}
+			if !errors.Is(commitErr, ErrAdopt) {
+				t.Fatalf("got %v want ErrAdopt", commitErr)
+			}
+			if n2.PendingPath() != path {
+				t.Fatalf("PendingPath %q", n2.PendingPath())
+			}
+			if n2.store.io == nil {
+				t.Fatal("cleared store.io after adopt failure")
+			}
+			if n2.store.work == nil || n2.store.work.r == nil {
+				t.Fatal("lost work spool after adopt failure")
+			}
+			n3, err := OpenNDBFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer n3.Close()
+			if _, ok := n3.LookupNode(0x61); !ok {
+				t.Fatal("committed file missing new node")
+			}
+			rd, err := n2.OpenDataTree(extra.BID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotb, err := io.ReadAll(rd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotb) != "newx" {
+				t.Fatalf("work spool unreadable: %q", gotb)
+			}
+		})
 	}
 }

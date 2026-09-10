@@ -42,11 +42,6 @@ func (r repeatByte) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func payloadBytes(n *NDB) int {
-	// Encoded blocks live on the Store source; NDB no longer retains logical copies.
-	return 0
-}
-
 func TestXBlockLayoutRoundTrip(t *testing.T) {
 	bids := []uint64{4, 8, 12}
 	raw, err := EncodeXBlock(XBlockLevel, 24, bids)
@@ -166,8 +161,11 @@ func TestXXBlockTransition(t *testing.T) {
 	if xb.Level != XXBlockLevel || xb.Count != 2 {
 		t.Fatalf("xx %+v", xb)
 	}
-	if held := payloadBytes(n); held != 0 {
-		t.Fatalf("XXBLOCK PutDataTree retained %d payload bytes", held)
+	if n.Store().residentImageBytes() != 0 {
+		t.Fatalf("XXBLOCK PutDataTree assembled %d resident bytes", n.Store().residentImageBytes())
+	}
+	if _, ok := n.Store().writer().(*FileSink); !ok {
+		t.Fatalf("spool %T, want FileSink", n.Store().writer())
 	}
 	mustNode(t, n, 0x21, root.BID, 0, 0)
 	file, err := n.Commit()
@@ -206,9 +204,6 @@ func TestDataTreeHashReopenBounded(t *testing.T) {
 	root, err := n.PutDataTree(io.LimitReader(repeatByte(0x7E), nBytes), nBytes)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if held := payloadBytes(n); held != 0 {
-		t.Fatalf("PutDataTree retained %d payload bytes", held)
 	}
 	if n.Store().residentImageBytes() != 0 {
 		t.Fatalf("resident image %d; want FileSink spool only", n.Store().residentImageBytes())

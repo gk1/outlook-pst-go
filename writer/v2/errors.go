@@ -16,6 +16,7 @@ var (
 	ErrInvalidArg     = errors.New("invalid argument")
 	ErrIO             = errors.New("sink i/o")
 	ErrCleanup        = errors.New("commit cleanup")
+	ErrAdopt          = errors.New("commit adopt")
 )
 
 // Code classifies a writer or inspector failure.
@@ -30,6 +31,7 @@ const (
 	CodeInvalidArg     Code = "invalid-argument"
 	CodeIO             Code = "io"
 	CodeCleanup        Code = "cleanup"
+	CodeAdopt          Code = "adopt"
 )
 
 // Error is the structured error taxonomy for writer v2.
@@ -100,6 +102,8 @@ func (e *Error) sentinel() error {
 		return ErrIO
 	case CodeCleanup:
 		return ErrCleanup
+	case CodeAdopt:
+		return ErrAdopt
 	default:
 		return ErrInvalidArg
 	}
@@ -152,6 +156,15 @@ func invalidArg(field, format string, args ...any) *Error {
 		Field:  field,
 		Detail: fmt.Sprintf(format, args...),
 		Err:    ErrInvalidArg,
+	}
+}
+
+func adoptErr(field, format string, args ...any) *Error {
+	return &Error{
+		Code:   CodeAdopt,
+		Field:  field,
+		Detail: fmt.Sprintf(format, args...),
+		Err:    ErrAdopt,
 	}
 }
 

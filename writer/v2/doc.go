@@ -15,14 +15,19 @@
 // into a FileSink spool, commits through CommitTo without assembling
 // FileEOF, and reopens via OpenNDBFrom from any io.ReaderAt (not only
 // Sink). PST-007 is the transaction/crash-safety boundary: one snapshot
-// covers allocator, catalog, refs, live pages, and roots; failed tree
-// writes restore that snapshot. CommitTo uses the MS-PST 2.6.1.3.7
-// two-phase header (INVALID_AMAP then VALID_AMAP2) with a sync at each
-// step. CommitFile writes a sibling temp and renames. The payload source
-// is one owned/borrowed ioHandle: borrowed readers are never closed, owned
-// files are closed, owned temp spools are closed and removed. VALID_AMAP1
-// is rejected. Close/remove failures after a successful dest sync return a
-// cleanup error without pointing NDB at a closed old source.
+// covers allocator, catalog, refs, live pages, roots, and whether a work
+// spool exists; failed tree writes restore that snapshot and rewind the
+// work spool from the last committed source (or drop it). CommitTo
+// rejects the last committed source before any dest write. It writes
+// INVALID_AMAP + sync, then body/pages (header bytes skipped on copy),
+// then VALID_AMAP2 + sync (MS-PST 2.6.1.3.7). CommitFile writes a sibling
+// temp, renames, and fsyncs the parent directory. A post-rename dirsync or
+// reopen failure returns ErrAdopt, keeps the work spool as the usable
+// source, and records PendingPath. The payload source is one owned/borrowed
+// ioHandle: borrowed readers are never closed, owned files are closed,
+// owned temp spools are closed and removed. VALID_AMAP1 is rejected.
+// Close/remove failures after a successful dest sync return a cleanup error
+// without pointing NDB at a closed old source.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

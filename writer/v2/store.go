@@ -754,9 +754,19 @@ func readAtFull(r io.ReaderAt, off int64, n int) ([]byte, error) {
 }
 
 func copyReaderAt(dst io.WriterAt, src io.ReaderAt, n int64) error {
+	return copyReaderAtFrom(dst, src, 0, n)
+}
+
+func copyReaderAtFrom(dst io.WriterAt, src io.ReaderAt, from, n int64) error {
+	if from < 0 || n < 0 {
+		return invalidArg("offset", "copy range from=%d n=%d", from, n)
+	}
+	if from >= n {
+		return nil
+	}
 	const chunk = 64 << 10
 	buf := make([]byte, chunk)
-	for off := int64(0); off < n; off += int64(chunk) {
+	for off := from; off < n; off += int64(chunk) {
 		c := chunk
 		if rem := n - off; rem < int64(c) {
 			c = int(rem)
@@ -796,6 +806,12 @@ func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
 
 // WriteTo materializes a complete VALID_AMAP2 PST onto dst without allocating FileEOF.
 func (s *Store) WriteTo(dst Sink) error {
+	if err := s.writeHeader(dst, AMapInvalid); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
 	if err := s.writeBody(dst); err != nil {
 		return err
 	}
@@ -805,6 +821,7 @@ func (s *Store) WriteTo(dst Sink) error {
 	if err := syncSink(dst); err != nil {
 		return err
 	}
+	s.valid = AMapValid2
 	return nil
 }
 

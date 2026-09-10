@@ -3,11 +3,41 @@ package writer
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 )
 
 // replacePath is the commit-file rename. Tests inject failures here.
 var replacePath = os.Rename
+
+// removeFile removes a temp spool or failed commit temp. Tests inject failures.
+var removeFile = os.Remove
+
+// syncDir fsyncs the parent directory after rename. Tests inject failures.
+var syncDir = syncParentDir
+
+func syncParentDir(path string) error {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
+// openCommitted reopens a renamed CommitFile path. Tests inject failures.
+var openCommitted = openCommittedFile
+
+// closeSink closes a commit temp. Tests inject failures.
+var closeSink = func(s Sink) error { return s.Close() }
+
+func openCommittedFile(path string) (Sink, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &FileSink{f: f}, nil
+}
 
 // ioHandle is the single owned/borrowed payload source.
 // r is the authoritative byte source. w is set when the handle is writable.
@@ -33,7 +63,7 @@ func (h *ioHandle) close() error {
 	h.w = nil
 	h.life = lifeBorrowed
 	if life == lifeTemp && name != "" {
-		if rerr := os.Remove(name); rerr != nil && !os.IsNotExist(rerr) {
+		if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
 			return errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
 		}
 	}
@@ -93,6 +123,9 @@ func sameIO(a, b any) bool {
 	return va.Pointer() == vb.Pointer()
 }
 
+// snapshot is the one transaction boundary. Field names for Store/NDB value
+// state match the live structs so TestSnapshotCoversMutableFields can catch
+// omissions. io/work handles are represented by hadWork, not cloned bytes.
 type snapshot struct {
 	regions       []region
 	lastAllocAMap uint32
@@ -110,6 +143,7 @@ type snapshot struct {
 	subnodeRefs   map[uint64]int
 	opaqueRefs    map[uint64]int
 	livePages     []uint64
+	hadWork       bool
 }
 
 func cloneRegions(in []region) []region {
@@ -159,6 +193,7 @@ func (n *NDB) capture() *snapshot {
 		subnodeRefs:   cloneMap(n.subnodeRefs),
 		opaqueRefs:    cloneMap(n.opaqueRefs),
 		livePages:     cloneU64(n.livePages),
+		hadWork:       s.work != nil && s.work.w != nil,
 	}
 	if n.ids != nil {
 		snap.ids = *n.ids
@@ -192,9 +227,35 @@ func (n *NDB) restore(snap *snapshot) error {
 	n.subnodeRefs = cloneMap(snap.subnodeRefs)
 	n.opaqueRefs = cloneMap(snap.opaqueRefs)
 	n.livePages = cloneU64(snap.livePages)
-	if w := s.writer(); w != nil {
-		if tr, ok := w.(interface{ Truncate(int64) error }); ok {
-			if err := tr.Truncate(int64(s.FileEOF())); err != nil {
+	return n.restoreSource(snap)
+}
+
+func (n *NDB) restoreSource(snap *snapshot) error {
+	s := n.store
+	if !snap.hadWork {
+		if s.work != nil {
+			err := s.work.close()
+			s.work = nil
+			return err
+		}
+		return nil
+	}
+	if err := s.ensureSpool(); err != nil {
+		return err
+	}
+	eof := int64(s.FileEOF())
+	if s.io != nil && s.io.r != nil && s.work != nil && s.work.w != nil && !sameIO(s.io.r, s.work.w) {
+		if err := copyReaderAt(s.work.w, s.io.r, eof); err != nil {
+			return ioErr("spool", "restore from committed source: %v", err)
+		}
+	} else if s.work != nil && s.work.w != nil {
+		if err := s.zeroFreeSlotsAt(s.work.w); err != nil {
+			return ioErr("spool", "restore zero free slots: %v", err)
+		}
+	}
+	if s.work != nil && s.work.w != nil {
+		if tr, ok := s.work.w.(interface{ Truncate(int64) error }); ok {
+			if err := tr.Truncate(eof); err != nil {
 				return ioErr("spool", "truncate: %v", err)
 			}
 		}
@@ -229,6 +290,19 @@ func syncSink(dst Sink) error {
 	return nil
 }
 
+func (n *NDB) rejectInPlace(dst Sink) error {
+	if dst == nil {
+		return invalidArg("sink", "nil commit sink")
+	}
+	if n == nil || n.store == nil || n.store.io == nil {
+		return nil
+	}
+	if sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r) {
+		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the last committed source; use CommitFile")
+	}
+	return nil
+}
+
 func (s *Store) writeHeader(dst Sink, valid byte) error {
 	prev := s.valid
 	s.valid = valid
@@ -250,7 +324,7 @@ func (s *Store) writeBody(dst Sink) error {
 	eof := int64(s.FileEOF())
 	src := s.reader()
 	if src != nil && !sameIO(dst, src) && !sameIO(dst, s.writer()) {
-		if err := copyReaderAt(dst, src, eof); err != nil {
+		if err := copyReaderAtFrom(dst, src, int64(UnicodeHeaderSize), eof); err != nil {
 			return ioErr("spool", "copy: %v", err)
 		}
 	}
@@ -288,6 +362,14 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 	if n.store.unique == 0 {
 		n.store.unique = 1
 	}
+	// MS-PST 2.6.1.3.7: INVALID_AMAP + sync before any body/page mutation so a
+	// crash cannot leave mixed bytes under a VALID header.
+	if err := n.store.writeHeader(dst, AMapInvalid); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
 	if err := n.store.writeBody(dst); err != nil {
 		return err
 	}
@@ -296,15 +378,6 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 			return ioErr("page", "write at 0x%x: %v", ib, err)
 		}
 	}
-	// MS-PST 2.6.1.3.7 phase 1: persist data with INVALID_AMAP, then sync.
-	if err := n.store.writeHeader(dst, AMapInvalid); err != nil {
-		return err
-	}
-	if err := syncSink(dst); err != nil {
-		return err
-	}
-	// Phase 2: advertise VALID_AMAP2 and sync. A crash between the two
-	// header writes leaves InspectHeader rejecting the file.
 	if err := n.store.writeHeader(dst, AMapValid2); err != nil {
 		return err
 	}
@@ -315,17 +388,23 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 	return nil
 }
 
+func (n *NDB) failAdopt(path string, cause error) error {
+	n.pendingPath = path
+	return adoptErr("file", "committed %s but source not adopted: %v", path, cause)
+}
+
 func (n *NDB) adopt(dst Sink, life srcLife) error {
 	if dst == nil {
 		return invalidArg("sink", "nil commit sink")
 	}
 	if n.store.io != nil && sameIO(dst, n.store.io.w) {
-		return invalidArg("sink", "in-place commit of the last committed source; use CommitFile")
+		return unsupported(FeatureInPlaceMutation, "in-place commit of the last committed source; use CommitFile")
 	}
 	oldWork := n.store.work
 	oldIO := n.store.io
 	n.store.work = nil
 	n.store.io = &ioHandle{r: dst, w: dst, life: life}
+	n.pendingPath = ""
 	var err error
 	if oldWork != nil {
 		err = oldWork.close()
