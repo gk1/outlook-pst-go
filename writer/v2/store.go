@@ -334,15 +334,15 @@ func (s *Store) mark(ib, size uint64, alloc bool) error {
 			return invariant(SectionAMap, "slot", "slot at 0x%x already free", slotOffset(idx, start+i))
 		}
 	}
+	if err := s.clearBacking(ib, size); err != nil {
+		return err
+	}
 	for i := 0; i < n; i++ {
 		if alloc {
 			setBit(bm, start+i)
 		} else {
 			clearBit(bm, start+i)
 		}
-	}
-	if err := s.clearBacking(ib, size); err != nil {
-		return err
 	}
 	return nil
 }
@@ -797,43 +797,67 @@ func (s *Store) attachSource(r io.ReaderAt) {
 	s.io = h
 }
 
+func (s *Store) undoRangeFree(ib, size uint64) bool {
+	if size == 0 {
+		return true
+	}
+	end := ib + size
+	for off := ib; off < end; {
+		idx, ok := AMapIndexForOffset(off)
+		if !ok || int(idx) >= len(s.regions) {
+			return false
+		}
+		slot := off - (off % BytesPerSlot)
+		start := slotIndex(slot, idx)
+		if bitIsSet(s.regions[idx].bitmap[:], start) {
+			return false
+		}
+		next := slot + BytesPerSlot
+		if next <= off {
+			return false
+		}
+		off = next
+	}
+	return true
+}
+
 func (s *Store) readUndoBytes(ib uint64, size int) ([]byte, error) {
 	if size <= 0 {
 		return nil, nil
 	}
+	var r io.ReaderAt
+	if s.work != nil && s.work.r != nil {
+		r = s.work.r
+	} else if s.io != nil {
+		r = s.io.r
+	}
+	if r == nil {
+		if s.undoRangeFree(ib, uint64(size)) {
+			return make([]byte, size), nil
+		}
+		return nil, invariant(SectionBlockTrailer, "ib", "missing payload at 0x%x", ib)
+	}
 	raw := make([]byte, size)
-	try := func(r io.ReaderAt) (done bool, err error) {
-		if r == nil {
-			return false, nil
-		}
-		nr, rerr := r.ReadAt(raw, int64(ib))
-		if nr >= size {
-			return true, nil
-		}
-		if rerr == nil || rerr == io.EOF {
-			return false, nil
-		}
-		return false, rerr
+	nr, err := r.ReadAt(raw, int64(ib))
+	if nr < 0 {
+		nr = 0
 	}
-	if s.work != nil {
-		done, err := try(s.work.r)
-		if err != nil {
-			return nil, err
-		}
-		if done {
-			return raw, nil
-		}
+	if nr > size {
+		nr = size
 	}
-	if s.io != nil {
-		done, err := try(s.io.r)
-		if err != nil {
-			return nil, err
-		}
-		if done {
-			return raw, nil
-		}
+	if err != nil && err != io.EOF {
+		return nil, err
 	}
-	return make([]byte, size), nil
+	if nr == size {
+		return raw, nil
+	}
+	if s.undoRangeFree(ib+uint64(nr), uint64(size-nr)) {
+		return raw, nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return nil, err
 }
 
 func (s *Store) readExtent(ib uint64, size int) ([]byte, error) {
@@ -869,7 +893,7 @@ func errorsJoin(a, b error) error {
 	if b == nil {
 		return a
 	}
-	return fmt.Errorf("%w; %v", a, b)
+	return fmt.Errorf("%w; %w", a, b)
 }
 
 func readAtFull(r io.ReaderAt, off int64, n int) ([]byte, error) {

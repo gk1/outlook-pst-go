@@ -37,6 +37,14 @@ var openCommitted = openCommittedFile
 // closeSink closes a commit temp. Tests inject failures.
 var closeSink = func(s Sink) error { return s.Close() }
 
+// closeWork closes a work spool or owned file. Tests inject failures.
+var closeWork = func(s Sink) error {
+	if s == nil {
+		return nil
+	}
+	return s.Close()
+}
+
 // createCommitTemp creates the CommitFile sibling. Tests inject failures.
 var createCommitTemp = func(path string) (Sink, error) { return CreateFileSink(path) }
 
@@ -94,7 +102,7 @@ func (h *ioHandle) close() error {
 	if h.life == lifeTemp {
 		name = h.w.Name()
 	}
-	err := h.w.Close()
+	err := closeWork(h.w)
 	life := h.life
 	h.r = nil
 	h.w = nil
@@ -137,67 +145,105 @@ func (s *Store) setWriter(w Sink) {
 	}
 }
 
-// UnwrapSink is the identity contract for Sink wrappers. Core types
-// (*MemSink, *FileSink, *os.File) are themselves. Wrappers unwrap until a core.
+// UnwrapSink is an optional identity hint for Sink wrappers. Correctness
+// does not require it; sameIO also walks pointer fields.
 type UnwrapSink interface {
 	UnwrapSink() Sink
 }
 
-// UnwrapReaderAt is the identity contract for ReaderAt wrappers.
+// UnwrapReaderAt is an optional identity hint for ReaderAt wrappers.
 type UnwrapReaderAt interface {
 	UnwrapReaderAt() io.ReaderAt
 }
 
-// sameIO reports whether a and b are the same known payload object.
-// Interface values are never compared with ==. Unknown or non-comparable
-// types yield identity 0 and never match.
+// sameIO reports whether a and b share a payload object. Interface values
+// are never compared with ==. Identity is the set of non-nil pointer keys
+// found by optional unwrap plus a bounded walk of pointer/struct fields.
 func sameIO(a, b any) bool {
-	ia, ib := knownID(a), knownID(b)
-	return ia != 0 && ia == ib
-}
-
-func knownID(v any) uintptr {
-	v = unwrapIO(v)
-	switch x := v.(type) {
-	case *MemSink:
-		return ptrID(x)
-	case *FileSink:
-		return ptrID(x)
-	case *os.File:
-		return ptrID(x)
+	if a == nil || b == nil {
+		return false
 	}
-	return 0
-}
-
-func ptrID(p any) uintptr {
-	rv := reflect.ValueOf(p)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return 0
+	ka, kb := ioKeys(a), ioKeys(b)
+	if len(ka) == 0 || len(kb) == 0 {
+		return false
 	}
-	return rv.Pointer()
-}
-
-func unwrapIO(v any) any {
-	for hops := 0; hops < 8 && v != nil; hops++ {
-		switch x := v.(type) {
-		case UnwrapSink:
-			next := x.UnwrapSink()
-			if next == nil {
-				return nil
-			}
-			v = next
-			continue
-		case UnwrapReaderAt:
-			next := x.UnwrapReaderAt()
-			if next == nil {
-				return nil
-			}
-			v = next
-			continue
+	for p := range ka {
+		if kb[p] {
+			return true
 		}
-		return v
 	}
-	return nil
+	return false
+}
+
+func ioKeys(v any) map[uintptr]bool {
+	out := map[uintptr]bool{}
+	seen := map[uintptr]bool{}
+	collectIOKeys(v, 0, out, seen)
+	return out
+}
+
+func collectIOKeys(v any, depth int, out, seen map[uintptr]bool) {
+	if v == nil || depth > 8 {
+		return
+	}
+	switch x := v.(type) {
+	case UnwrapSink:
+		if next := x.UnwrapSink(); next != nil {
+			collectIOKeys(next, depth+1, out, seen)
+		}
+	case UnwrapReaderAt:
+		if next := x.UnwrapReaderAt(); next != nil {
+			collectIOKeys(next, depth+1, out, seen)
+		}
+	}
+	rv := reflect.ValueOf(v)
+	if !rv.IsValid() {
+		return
+	}
+	switch rv.Kind() {
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return
+		}
+		p := rv.Pointer()
+		if seen[p] {
+			return
+		}
+		seen[p] = true
+		out[p] = true
+		el := rv.Elem()
+		if el.IsValid() && el.CanInterface() {
+			collectIOKeys(el.Interface(), depth+1, out, seen)
+		}
+	case reflect.Struct:
+		for i := 0; i < rv.NumField(); i++ {
+			f := rv.Field(i)
+			switch f.Kind() {
+			case reflect.Pointer:
+				if f.IsNil() {
+					continue
+				}
+				p := f.Pointer()
+				if !seen[p] {
+					seen[p] = true
+					out[p] = true
+					el := f.Elem()
+					if el.IsValid() && el.CanInterface() {
+						collectIOKeys(el.Interface(), depth+1, out, seen)
+					}
+				}
+			case reflect.Interface, reflect.Struct:
+				if f.CanInterface() {
+					collectIOKeys(f.Interface(), depth+1, out, seen)
+				}
+			}
+		}
+	case reflect.Interface:
+		if rv.IsNil() {
+			return
+		}
+		collectIOKeys(rv.Elem().Interface(), depth+1, out, seen)
+	}
 }
 
 // snapshot is the one transaction boundary. Field names for Store/NDB value
@@ -381,9 +427,6 @@ func (n *NDB) rejectInPlace(dst Sink) error {
 	}
 	if n.store.io != nil && (sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r)) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the last committed source; use CommitFile")
-	}
-	if n.store.io != nil && knownID(dst) == 0 && knownID(n.store.io.w) == 0 && knownID(n.store.io.r) == 0 && (n.store.io.w != nil || n.store.io.r != nil) {
-		return unsupported(FeatureInPlaceMutation, "CommitTo destination has no comparable identity; use CommitFile")
 	}
 	if n.store.work != nil && (sameIO(dst, n.store.work.w) || sameIO(dst, n.store.work.r)) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the work spool; use CommitFile")

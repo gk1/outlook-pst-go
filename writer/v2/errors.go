@@ -175,14 +175,20 @@ func rollbackErr(op, rb error) error {
 	if rb == nil {
 		return op
 	}
-	return fmt.Errorf("%w (rollback: %v)", op, rb)
+	return fmt.Errorf("%w (rollback: %w)", op, rb)
 }
 
 func ioErr(field, format string, args ...any) *Error {
-	return &Error{
+	e := &Error{
 		Code:   CodeIO,
 		Field:  field,
 		Detail: fmt.Sprintf(format, args...),
 		Err:    ErrIO,
 	}
+	if n := len(args); n > 0 {
+		if cause, ok := args[n-1].(error); ok && cause != nil {
+			e.Err = fmt.Errorf("%w: %w", ErrIO, cause)
+		}
+	}
+	return e
 }
