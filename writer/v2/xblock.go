@@ -106,51 +106,55 @@ func InspectXBlock(data []byte) (*XBlockView, error) {
 // expected==0 means unknown length; a positive expected must match bytes read.
 // On any error, newly allocated blocks are dropped (no partial commit).
 func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
+	var root BBTEntry
+	err := n.runTxn(func() error {
+		var err error
+		root, err = n.streamDataTree(r, expected)
+		return err
+	})
+	return root, err
+}
+
+func (n *NDB) streamDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	if r == nil {
 		return BBTEntry{}, invalidArg("reader", "data tree reader is nil")
 	}
 	if expected > int64(^uint32(0)) {
 		return BBTEntry{}, limitErr("lcbTotal", "logical size %d exceeds uint32 lcbTotal (MS-PST %s)", expected, SectionXBlock)
 	}
-	var root BBTEntry
-	err := n.runTxn(func() error {
-		var leaves []BBTEntry
-		var total uint64
-		buf := make([]byte, MaxDataBlockCB)
-		for {
-			nr, err := io.ReadFull(r, buf)
-			if nr > 0 {
-				e, aerr := n.AllocBlock(uint16(nr))
-				if aerr != nil {
-					return aerr
-				}
-				if err := n.putPayload(e, buf[:nr]); err != nil {
-					return err
-				}
-				leaves = append(leaves, e)
-				total += uint64(nr)
-				if total > uint64(^uint32(0)) {
-					return limitErr("lcbTotal", "logical size exceeds uint32 lcbTotal (MS-PST %s)", SectionXBlock)
-				}
+	var leaves []BBTEntry
+	var total uint64
+	buf := make([]byte, MaxDataBlockCB)
+	for {
+		nr, err := io.ReadFull(r, buf)
+		if nr > 0 {
+			e, aerr := n.AllocBlock(uint16(nr))
+			if aerr != nil {
+				return BBTEntry{}, aerr
 			}
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+			if err := n.putPayload(e, buf[:nr]); err != nil {
+				return BBTEntry{}, err
 			}
-			if err != nil {
-				return ioErr("reader", "data tree read: %v", err)
+			leaves = append(leaves, e)
+			total += uint64(nr)
+			if total > uint64(^uint32(0)) {
+				return BBTEntry{}, limitErr("lcbTotal", "logical size exceeds uint32 lcbTotal (MS-PST %s)", SectionXBlock)
 			}
 		}
-		if expected > 0 && int64(total) != expected {
-			return invalidArg("size", "read %d bytes, expected %d", total, expected)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
 		}
-		if len(leaves) == 0 {
-			return nil
+		if err != nil {
+			return BBTEntry{}, ioErr("reader", "data tree read: %v", err)
 		}
-		var err error
-		root, err = n.buildDataTree(leaves, uint32(total))
-		return err
-	})
-	return root, err
+	}
+	if expected > 0 && int64(total) != expected {
+		return BBTEntry{}, invalidArg("size", "read %d bytes, expected %d", total, expected)
+	}
+	if len(leaves) == 0 {
+		return BBTEntry{}, nil
+	}
+	return n.buildDataTree(leaves, uint32(total))
 }
 
 func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32) (BBTEntry, error) {
@@ -217,37 +221,38 @@ func (n *NDB) buildDataTree(leaves []BBTEntry, total uint32) (BBTEntry, error) {
 	return root, nil
 }
 
-// DataTreeReader streams a data tree's leaf bytes in order.
-// At most one XXBLOCK rgbid, one XBLOCK rgbid, and one leaf payload are resident.
-type DataTreeReader struct {
-	n       *NDB
-	leaf    []byte
-	off     int
-	leaves  []uint64
-	leafIdx int
-	xbs     []uint64
-	xbIdx   int
-	total   uint64
-	read    uint64
-	err     error
+// dataTreeIter is the one XXBLOCK -> XBLOCK -> data walker.
+// It keeps at most one XX rgbid list, one XBLOCK rgbid list, and one leaf.
+// Validation, reference reconstruction, flattening, and HN/OpenDataTree
+// readback all use this iterator so shape checks cannot drift.
+type dataTreeIter struct {
+	n      *NDB
+	seen   map[uint64]struct{}
+	xx     []uint64
+	xxIdx  int
+	xb     []uint64
+	xbIdx  int
+	total  uint64
+	walked uint64
+	done   bool
 }
 
-// OpenDataTree returns a reader over root's logical bytes. Walk is lazy over
-// XXBLOCK -> XBLOCK -> data; it does not materialize every leaf BID.
-func (n *NDB) OpenDataTree(root uint64) (*DataTreeReader, error) {
-	r := &DataTreeReader{n: n}
+func (n *NDB) startDataTree(root uint64) (*dataTreeIter, error) {
+	it := &dataTreeIter{n: n, seen: make(map[uint64]struct{})}
 	if root == 0 {
-		return r, nil
+		it.done = true
+		return it, nil
 	}
 	e, ok := n.LookupBlock(root)
 	if !ok {
 		return nil, invalidArg("bid", "missing data-tree root 0x%x", root)
 	}
 	if !BIDIsInternal(root) {
-		r.total = uint64(e.CB)
-		r.leaves = []uint64{root}
-		return r, nil
+		it.xb = []uint64{root}
+		it.total = uint64(e.CB)
+		return it, nil
 	}
+	it.seen[root] = struct{}{}
 	data, err := n.blockPayload(e)
 	if err != nil {
 		return nil, err
@@ -256,58 +261,134 @@ func (n *NDB) OpenDataTree(root uint64) (*DataTreeReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.total = uint64(xb.Total)
+	it.total = uint64(xb.Total)
 	if xb.Level == XBlockLevel {
-		r.leaves = xb.BIDs
-		return r, nil
+		it.xb = xb.BIDs
+		return it, nil
 	}
-	r.xbs = xb.BIDs
-	return r, nil
+	it.xx = xb.BIDs
+	return it, nil
+}
+
+func (it *dataTreeIter) next() (uint64, uint16, error) {
+	if it == nil || it.done {
+		return 0, 0, io.EOF
+	}
+	for {
+		if it.xbIdx < len(it.xb) {
+			bid := it.xb[it.xbIdx]
+			it.xbIdx++
+			if BIDIsInternal(bid) {
+				return 0, 0, invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
+			}
+			if _, dup := it.seen[bid]; dup {
+				return 0, 0, invariant(SectionXBlock, "rgbid", "duplicate BID 0x%x", bid)
+			}
+			it.seen[bid] = struct{}{}
+			child, ok := it.n.LookupBlock(bid)
+			if !ok {
+				return 0, 0, invariant(SectionXBlock, "rgbid", "missing data BID 0x%x", bid)
+			}
+			it.walked += uint64(child.CB)
+			return bid, child.CB, nil
+		}
+		if it.xxIdx >= len(it.xx) {
+			it.done = true
+			if it.walked != it.total {
+				return 0, 0, invariant(SectionXBlock, "lcbTotal", "walked %d want lcbTotal %d", it.walked, it.total)
+			}
+			return 0, 0, io.EOF
+		}
+		bid := it.xx[it.xxIdx]
+		it.xxIdx++
+		if _, dup := it.seen[bid]; dup {
+			return 0, 0, invariant(SectionXXBlock, "rgbid", "cycle or duplicate BID 0x%x", bid)
+		}
+		it.seen[bid] = struct{}{}
+		child, ok := it.n.LookupBlock(bid)
+		if !ok {
+			return 0, 0, invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
+		}
+		if !BIDIsInternal(bid) {
+			return 0, 0, invariant(SectionXXBlock, "rgbid", "XXBLOCK child 0x%x is not internal", bid)
+		}
+		cdata, err := it.n.blockPayload(child)
+		if err != nil {
+			return 0, 0, err
+		}
+		cx, err := InspectXBlock(cdata)
+		if err != nil {
+			return 0, 0, err
+		}
+		if cx.Level != XBlockLevel {
+			return 0, 0, invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, cx.Level)
+		}
+		it.xb = cx.BIDs
+		it.xbIdx = 0
+	}
+}
+
+// walkDataTree visits every external leaf in order. fn may be nil.
+// The walker never retains more than one XBLOCK rgbid list of leaves.
+func (n *NDB) walkDataTree(root uint64, fn func(bid uint64, cb uint16) error) (uint64, error) {
+	it, err := n.startDataTree(root)
+	if err != nil {
+		return 0, err
+	}
+	for {
+		bid, cb, err := it.next()
+		if err == io.EOF {
+			return it.total, nil
+		}
+		if err != nil {
+			return it.walked, err
+		}
+		if fn != nil {
+			if err := fn(bid, cb); err != nil {
+				return it.walked, err
+			}
+		}
+	}
+}
+
+// DataTreeReader streams a data tree's leaf bytes in order.
+// At most one XXBLOCK rgbid, one XBLOCK rgbid, and one leaf payload are resident.
+type DataTreeReader struct {
+	n     *NDB
+	it    *dataTreeIter
+	leaf  []byte
+	off   int
+	read  uint64
+	total uint64
+	err   error
+}
+
+// OpenDataTree returns a reader over root's logical bytes. Walk is lazy over
+// XXBLOCK -> XBLOCK -> data; it does not materialize every leaf BID.
+func (n *NDB) OpenDataTree(root uint64) (*DataTreeReader, error) {
+	it, err := n.startDataTree(root)
+	if err != nil {
+		return nil, err
+	}
+	return &DataTreeReader{n: n, it: it, total: it.total}, nil
 }
 
 func (r *DataTreeReader) nextLeaf() error {
-	for {
-		if r.leafIdx < len(r.leaves) {
-			bid := r.leaves[r.leafIdx]
-			r.leafIdx++
-			if BIDIsInternal(bid) {
-				return invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
-			}
-			e, ok := r.n.LookupBlock(bid)
-			if !ok {
-				return invariant(SectionXBlock, "rgbid", "missing leaf BID 0x%x", bid)
-			}
-			data, err := r.n.blockPayload(e)
-			if err != nil {
-				return err
-			}
-			r.leaf = data
-			r.off = 0
-			return nil
-		}
-		if r.xbIdx >= len(r.xbs) {
-			return io.EOF
-		}
-		bid := r.xbs[r.xbIdx]
-		r.xbIdx++
-		child, ok := r.n.LookupBlock(bid)
-		if !ok {
-			return invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
-		}
-		data, err := r.n.blockPayload(child)
-		if err != nil {
-			return err
-		}
-		xb, err := InspectXBlock(data)
-		if err != nil {
-			return err
-		}
-		if xb.Level != XBlockLevel {
-			return invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, xb.Level)
-		}
-		r.leaves = xb.BIDs
-		r.leafIdx = 0
+	bid, _, err := r.it.next()
+	if err != nil {
+		return err
 	}
+	e, ok := r.n.LookupBlock(bid)
+	if !ok {
+		return invariant(SectionXBlock, "rgbid", "missing leaf BID 0x%x", bid)
+	}
+	data, err := r.n.blockPayload(e)
+	if err != nil {
+		return err
+	}
+	r.leaf = data
+	r.off = 0
+	return nil
 }
 
 func (r *DataTreeReader) Read(p []byte) (int, error) {
@@ -336,190 +417,15 @@ func (r *DataTreeReader) Read(p []byte) (int, error) {
 }
 
 func (n *NDB) validateDataTree(root uint64) error {
-	_, err := n.walkDataTreeSum(root, map[uint64]struct{}{}, 0)
+	_, err := n.walkDataTree(root, nil)
 	return err
 }
 
-func (n *NDB) walkDataTreeSum(root uint64, seen map[uint64]struct{}, depth int) (uint64, error) {
-	if root == 0 {
-		return 0, nil
-	}
-	if depth > 2 {
-		return 0, invariant(SectionXXBlock, "cLevel", "data tree deeper than XXBLOCK->XBLOCK->data (MS-PST %s)", SectionXXBlock)
-	}
-	if _, ok := seen[root]; ok {
-		return 0, invariant(SectionXBlock, "rgbid", "cycle or duplicate BID 0x%x", root)
-	}
-	seen[root] = struct{}{}
-	e, ok := n.LookupBlock(root)
-	if !ok {
-		return 0, invalidArg("bid", "missing data-tree root 0x%x", root)
-	}
-	if !BIDIsInternal(root) {
-		return uint64(e.CB), nil
-	}
-	data, err := n.blockPayload(e)
-	if err != nil {
-		return 0, err
-	}
-	xb, err := InspectXBlock(data)
-	if err != nil {
-		return 0, err
-	}
-	if xb.Level == XBlockLevel {
-		if depth > 1 {
-			return 0, invariant(SectionXXBlock, "cLevel", "XBLOCK nested too deep")
-		}
-		var sum uint64
-		for _, bid := range xb.BIDs {
-			if BIDIsInternal(bid) {
-				return 0, invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
-			}
-			if _, dup := seen[bid]; dup {
-				return 0, invariant(SectionXBlock, "rgbid", "duplicate BID 0x%x", bid)
-			}
-			seen[bid] = struct{}{}
-			child, ok := n.LookupBlock(bid)
-			if !ok {
-				return 0, invariant(SectionXBlock, "rgbid", "missing data BID 0x%x", bid)
-			}
-			sum += uint64(child.CB)
-		}
-		if sum != uint64(xb.Total) {
-			return 0, invariant(SectionXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
-		}
-		return sum, nil
-	}
-	if depth != 0 {
-		return 0, invariant(SectionXXBlock, "cLevel", "XXBLOCK 0x%x is not at tree root", root)
-	}
-	var sum uint64
-	for _, bid := range xb.BIDs {
-		if _, dup := seen[bid]; dup {
-			return 0, invariant(SectionXXBlock, "rgbid", "cycle or duplicate BID 0x%x", bid)
-		}
-		child, ok := n.LookupBlock(bid)
-		if !ok {
-			return 0, invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
-		}
-		if !BIDIsInternal(bid) {
-			return 0, invariant(SectionXXBlock, "rgbid", "XXBLOCK child 0x%x is not internal", bid)
-		}
-		cdata, err := n.blockPayload(child)
-		if err != nil {
-			return 0, err
-		}
-		cx, err := InspectXBlock(cdata)
-		if err != nil {
-			return 0, err
-		}
-		if cx.Level != XBlockLevel {
-			return 0, invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, cx.Level)
-		}
-		sub, err := n.walkDataTreeSum(bid, seen, depth+1)
-		if err != nil {
-			return 0, err
-		}
-		sum += sub
-	}
-	if sum != uint64(xb.Total) {
-		return 0, invariant(SectionXXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
-	}
-	return sum, nil
-}
-
 func (n *NDB) flattenDataTree(root uint64) (uint64, []uint64, error) {
-	return n.flattenDataTreeAt(root, map[uint64]struct{}{}, 0)
-}
-
-func (n *NDB) flattenDataTreeAt(root uint64, seen map[uint64]struct{}, depth int) (uint64, []uint64, error) {
-	if root == 0 {
-		return 0, nil, nil
-	}
-	if depth > 2 {
-		return 0, nil, invariant(SectionXXBlock, "cLevel", "data tree deeper than XXBLOCK->XBLOCK->data (MS-PST %s)", SectionXXBlock)
-	}
-	if _, ok := seen[root]; ok {
-		return 0, nil, invariant(SectionXBlock, "rgbid", "cycle or duplicate BID 0x%x", root)
-	}
-	seen[root] = struct{}{}
-	e, ok := n.LookupBlock(root)
-	if !ok {
-		return 0, nil, invalidArg("bid", "missing data-tree root 0x%x", root)
-	}
-	if !BIDIsInternal(root) {
-		return uint64(e.CB), []uint64{root}, nil
-	}
-	data, err := n.blockPayload(e)
-	if err != nil {
-		return 0, nil, err
-	}
-	xb, err := InspectXBlock(data)
-	if err != nil {
-		return 0, nil, err
-	}
-	if xb.Level == XBlockLevel {
-		if depth > 1 {
-			return 0, nil, invariant(SectionXXBlock, "cLevel", "XBLOCK nested too deep")
-		}
-		var leaves []uint64
-		var sum uint64
-		for _, bid := range xb.BIDs {
-			if BIDIsInternal(bid) {
-				return 0, nil, invariant(SectionXBlock, "rgbid", "XBLOCK child 0x%x is internal", bid)
-			}
-			if _, dup := seen[bid]; dup {
-				return 0, nil, invariant(SectionXBlock, "rgbid", "duplicate BID 0x%x", bid)
-			}
-			seen[bid] = struct{}{}
-			child, ok := n.LookupBlock(bid)
-			if !ok {
-				return 0, nil, invariant(SectionXBlock, "rgbid", "missing data BID 0x%x", bid)
-			}
-			leaves = append(leaves, bid)
-			sum += uint64(child.CB)
-		}
-		if sum != uint64(xb.Total) {
-			return 0, nil, invariant(SectionXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
-		}
-		return sum, leaves, nil
-	}
-	if depth != 0 {
-		return 0, nil, invariant(SectionXXBlock, "cLevel", "XXBLOCK 0x%x is not at tree root", root)
-	}
 	var leaves []uint64
-	var sum uint64
-	for _, bid := range xb.BIDs {
-		if _, dup := seen[bid]; dup {
-			return 0, nil, invariant(SectionXXBlock, "rgbid", "cycle or duplicate BID 0x%x", bid)
-		}
-		child, ok := n.LookupBlock(bid)
-		if !ok {
-			return 0, nil, invariant(SectionXXBlock, "rgbid", "missing XBLOCK BID 0x%x", bid)
-		}
-		if !BIDIsInternal(bid) {
-			return 0, nil, invariant(SectionXXBlock, "rgbid", "XXBLOCK child 0x%x is not internal", bid)
-		}
-		cdata, err := n.blockPayload(child)
-		if err != nil {
-			return 0, nil, err
-		}
-		cx, err := InspectXBlock(cdata)
-		if err != nil {
-			return 0, nil, err
-		}
-		if cx.Level != XBlockLevel {
-			return 0, nil, invariant(SectionXXBlock, "cLevel", "XXBLOCK child 0x%x has cLevel %d, want 1", bid, cx.Level)
-		}
-		sub, kids, err := n.flattenDataTreeAt(bid, seen, depth+1)
-		if err != nil {
-			return 0, nil, err
-		}
-		leaves = append(leaves, kids...)
-		sum += sub
-	}
-	if sum != uint64(xb.Total) {
-		return 0, nil, invariant(SectionXXBlock, "lcbTotal", "walked %d want lcbTotal %d", sum, xb.Total)
-	}
-	return sum, leaves, nil
+	total, err := n.walkDataTree(root, func(bid uint64, _ uint16) error {
+		leaves = append(leaves, bid)
+		return nil
+	})
+	return total, leaves, err
 }

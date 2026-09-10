@@ -242,8 +242,8 @@ func TestDataTreeHashReopenBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rd.leaves)+len(rd.xbs) > MaxXBlockEntries+1 {
-		t.Fatalf("reader materialized %d+%d BIDs", len(rd.leaves), len(rd.xbs))
+	if rd.it == nil || len(rd.it.xb)+len(rd.it.xx) > MaxXBlockEntries+1 {
+		t.Fatalf("reader materialized %d+%d BIDs", len(rd.it.xb), len(rd.it.xx))
 	}
 	h1 := sha256.New()
 	nread, err := io.Copy(h1, rd)

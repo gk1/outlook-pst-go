@@ -35,6 +35,10 @@
 // owned files are closed, owned temp spools are closed and removed. VALID_AMAP1 is rejected.
 // Close/remove failures after a successful dest sync return a cleanup error
 // without pointing NDB at a closed old source.
+// PST-008 is Heap-on-Node: first/normal/fill-level pages over a data tree,
+// HNPAGEMAP with cAlloc/cFree/offsets/fill levels, HID numbering, and oversized
+// values as HNID subnodes. Data-tree validation, reconstruction, flattening,
+// and lazy readback share one bounded XX->X->data walker.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

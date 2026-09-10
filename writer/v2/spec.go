@@ -95,6 +95,20 @@ const (
 	TCINFOFixedSize              = 22
 	TCOLDESCSize                 = 8
 	HeapSigTC                    = 0x7C
+	HeapSignature                = 0xEC
+	HeapSigBTH                   = 0xB5
+	HeapSigPC                    = 0xBC
+	HeapMaxAlloc                 = 3580
+	HNHDRSize                    = 12
+	HNPAGEHDRSize                = 2
+	HNBITMAPHDRSize              = 66
+	FillLevelEmpty        byte   = 0
+	FillLevel1            byte   = 1
+	FillLevel2            byte   = 2
+	FillLevelFull         byte   = 3
+	HNFillEmpty                  = 3584
+	HNFillLevel1                 = 2560
+	HNFillLevel2                 = 2048
 	PtypInteger32                = 0x0003
 	MaxTCColumns                 = 255 // TCINFO.cCols is a BYTE (MS-PST 2.3.4.1)
 
@@ -219,6 +233,7 @@ const (
 	NIDTypeAssocContentsTable = 0x0F
 	NIDTypeAttachmentTable    = 0x11
 	NIDTypeRecipientTable     = 0x12
+	NIDTypeLTP                = 0x1F
 )
 
 // MakeNID packs a type and index. See MS-PST 2.2.2.1.
