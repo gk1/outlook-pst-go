@@ -147,7 +147,9 @@ func validateHeaderDraft(d HeaderDraft) error {
 		return invalidArg("bCryptMethod", "unknown 0x%02x (MS-PST %s)", d.Crypt, SectionCrypt)
 	}
 	switch d.Root.AMapValid {
-	case AMapValid2, AMapInvalid, AMapValid1:
+	case AMapValid2, AMapInvalid:
+	case AMapValid1:
+		return invalidArg("fAMapValid", "VALID_AMAP1 (0x01) is deprecated (MS-PST %s)", SectionAMapTxn)
 	default:
 		return invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", d.Root.AMapValid, SectionRoot)
 	}
@@ -165,7 +167,9 @@ func writeHeaderCRC(buf []byte) {
 // fAMapValid is preserved, including INVALID_AMAP (0) for transaction staging.
 func EncodeUnicodeRoot(r RootDraft) ([]byte, error) {
 	switch r.AMapValid {
-	case AMapValid2, AMapInvalid, AMapValid1:
+	case AMapValid2, AMapInvalid:
+	case AMapValid1:
+		return nil, invalidArg("fAMapValid", "VALID_AMAP1 (0x01) is deprecated (MS-PST %s)", SectionAMapTxn)
 	default:
 		return nil, invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", r.AMapValid, SectionRoot)
 	}
@@ -201,9 +205,11 @@ func InspectRoot(raw []byte) (*RootView, error) {
 	}
 	amap := b[OffRootAMapValid]
 	switch amap {
-	case AMapValid2, AMapInvalid, AMapValid1:
-		// All MS-PST 2.2.2.5 values. InspectHeader requires VALID_AMAP2
-		// for a committed file; transaction staging uses INVALID_AMAP.
+	case AMapValid2, AMapInvalid:
+		// MS-PST 2.2.2.5. InspectHeader requires VALID_AMAP2 for a committed
+		// file; transaction staging uses INVALID_AMAP. VALID_AMAP1 is rejected.
+	case AMapValid1:
+		return nil, invariant(SectionRoot, "fAMapValid", "VALID_AMAP1 (0x01) is deprecated (MS-PST %s)", SectionAMapTxn)
 	default:
 		return nil, invariant(SectionRoot, "fAMapValid", "unknown 0x%02x", amap)
 	}

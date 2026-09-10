@@ -14,11 +14,15 @@
 // XBLOCK/XXBLOCK rgbid and SLENTRY/SIENTRY. PST-006 streams data trees
 // into a FileSink spool, commits through CommitTo without assembling
 // FileEOF, and reopens via OpenNDBFrom from any io.ReaderAt (not only
-// Sink). Close/remove applies only to owned temp/file handles. Reopen
-// recursively validates XXBLOCK->XBLOCK->data and SIBLOCK->SLBLOCK
-// (lcbTotal, child existence, duplicates/cycles). Failed tree writes
-// restore bidNextB, ids.nextBlock, lastAllocAMap, and surface cleanup
-// errors.
+// Sink). PST-007 is the transaction/crash-safety boundary: one snapshot
+// covers allocator, catalog, refs, live pages, and roots; failed tree
+// writes restore that snapshot. CommitTo uses the MS-PST 2.6.1.3.7
+// two-phase header (INVALID_AMAP then VALID_AMAP2) with a sync at each
+// step. CommitFile writes a sibling temp and renames. The payload source
+// is one owned/borrowed ioHandle: borrowed readers are never closed, owned
+// files are closed, owned temp spools are closed and removed. VALID_AMAP1
+// is rejected. Close/remove failures after a successful dest sync return a
+// cleanup error without pointing NDB at a closed old source.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

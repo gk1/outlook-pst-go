@@ -434,19 +434,16 @@ func TestEncodeUnicodeRootPreservesInvalidAMap(t *testing.T) {
 	}
 
 	r.AMapValid = AMapValid1
-	raw, err = EncodeUnicodeRoot(r)
-	if err != nil {
-		t.Fatal(err)
+	if _, err = EncodeUnicodeRoot(r); !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("VALID_AMAP1 encode: %v", err)
 	}
-	if raw[OffRootAMapValid] != AMapValid1 {
-		t.Fatalf("VALID_AMAP1 encoded 0x%02x", raw[OffRootAMapValid])
+	d := DefaultHeaderDraft()
+	d.Root.AMapValid = AMapValid1
+	if _, err = EncodeUnicodeHeader(d); !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("VALID_AMAP1 header: %v", err)
 	}
-	view, err = InspectRoot(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if view.AMapValid != AMapValid1 {
-		t.Fatalf("VALID_AMAP1 round-trip %d", view.AMapValid)
+	if err := NewStore().SetAMapValid(AMapValid1); !errors.Is(err, ErrInvalidArg) {
+		t.Fatalf("SetAMapValid VALID_AMAP1: %v", err)
 	}
 }
 

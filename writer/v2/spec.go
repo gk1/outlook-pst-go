@@ -19,6 +19,7 @@ const (
 	SectionRefCount     = "2.2.2.7.7.3.1"
 	SectionNBTENTRY     = "2.2.2.7.7.4"
 	SectionGrow         = "2.6.1.1.2"
+	SectionAMapTxn      = "2.6.1.3.7"
 	SectionBlockTrailer = "2.2.2.8.1"
 	SectionBlockAlign   = "2.2.2.8"
 	SectionXBlock       = "2.2.2.8.3.1"

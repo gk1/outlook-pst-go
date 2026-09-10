@@ -43,11 +43,8 @@ func (r repeatByte) Read(p []byte) (int, error) {
 }
 
 func payloadBytes(n *NDB) int {
-	var s int
-	for _, p := range n.payloads {
-		s += len(p)
-	}
-	return s
+	// Encoded blocks live on the Store source; NDB no longer retains logical copies.
+	return 0
 }
 
 func TestXBlockLayoutRoundTrip(t *testing.T) {
@@ -216,8 +213,8 @@ func TestDataTreeHashReopenBounded(t *testing.T) {
 	if n.Store().residentImageBytes() != 0 {
 		t.Fatalf("resident image %d; want FileSink spool only", n.Store().residentImageBytes())
 	}
-	if _, ok := n.Store().spool.(*FileSink); !ok {
-		t.Fatalf("spool %T, want FileSink", n.Store().spool)
+	if _, ok := n.Store().writer().(*FileSink); !ok {
+		t.Fatalf("spool %T, want FileSink", n.Store().writer())
 	}
 	mustNode(t, n, 0x21, root.BID, 0, 0)
 	path := filepath.Join(t.TempDir(), "big.pst")
@@ -582,8 +579,8 @@ func TestPutDataTreeFailureShrinksGeometry(t *testing.T) {
 	}
 	assertAllocatorRestored(t, n, beforeR, beforeEOF, beforeBid, beforeIDs, beforeAMap)
 	var spoolName string
-	if n.Store().spool != nil {
-		spoolName = n.Store().spool.Name()
+	if n.Store().writer() != nil {
+		spoolName = n.Store().writer().Name()
 	}
 	if err := n.Close(); err != nil {
 		t.Fatal(err)
@@ -620,8 +617,8 @@ func reopenReaderAt(t *testing.T, n *NDB, dataBID, subBID uint64, payload []byte
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = n2.Close() })
-	if n2.Store().spool != nil {
-		t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().spool)
+	if n2.Store().writer() != nil {
+		t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().writer())
 	}
 	gotNode, ok := n2.LookupNode(0x41)
 	if !ok || gotNode.DataBID != dataBID || gotNode.SubBID != subBID {
@@ -743,8 +740,8 @@ func TestOpenNDBFromReaderAtOnly(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer n2.Close()
-		if n2.Store().spool != nil {
-			t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().spool)
+		if n2.Store().writer() != nil {
+			t.Fatalf("ReaderAt-only open adopted spool %T", n2.Store().writer())
 		}
 		gotNode, ok := n2.LookupNode(0x41)
 		if !ok || gotNode.DataBID != root.BID || gotNode.SubBID != inner.BID {
@@ -815,9 +812,8 @@ func TestRollbackCleanupFailureIsVisible(t *testing.T) {
 	if err := n.Store().ensureSpool(); err != nil {
 		t.Fatal(err)
 	}
-	spoolName := n.Store().spool.Name()
-	n.Store().spool = failTruncate{Sink: n.Store().spool}
-	n.Store().src = n.Store().spool
+	spoolName := n.Store().writer().Name()
+	n.Store().setWriter(failTruncate{Sink: n.Store().writer()})
 	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
 	if !errors.Is(err, ErrIO) {
 		t.Fatalf("got %v", err)

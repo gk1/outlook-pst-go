@@ -28,7 +28,6 @@ type NDB struct {
 	subnodeRefs  map[uint64]int
 	opaqueRefs   map[uint64]int
 	livePages    []uint64
-	payloads     map[uint64][]byte // BID -> cb payload (no trailer)
 }
 
 // NewNDB returns an empty catalog. Page BIDs and IBs come from store (or a
@@ -45,7 +44,6 @@ func NewNDB(ids *SequentialIDs) *NDB {
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
 		opaqueRefs:   make(map[uint64]int),
-		payloads:     make(map[uint64][]byte),
 	}
 }
 
@@ -129,18 +127,10 @@ func (n *NDB) putPayload(e BBTEntry, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if n.payloads != nil {
-		delete(n.payloads, e.BID)
-	}
 	return n.store.writeExtent(e.IB, raw)
 }
 
 func (n *NDB) blockPayload(e BBTEntry) ([]byte, error) {
-	if n.payloads != nil {
-		if p, ok := n.payloads[e.BID]; ok {
-			return p, nil
-		}
-	}
 	size := BlockDiskSize(uint64(e.CB))
 	if n.store == nil || e.IB == 0 {
 		return nil, invariant(SectionBlockTrailer, "ib", "missing payload for BID 0x%x at 0x%x", e.BID, e.IB)
@@ -359,7 +349,6 @@ func (n *NDB) dropBlock(bid uint64) error {
 	delete(n.dataTreeRefs, bid)
 	delete(n.subnodeRefs, bid)
 	delete(n.opaqueRefs, bid)
-	delete(n.payloads, bid)
 	if err := n.freeBlockIB(e); err != nil {
 		return err
 	}
@@ -623,59 +612,75 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if dst == nil {
 		return invalidArg("sink", "nil commit sink")
 	}
+	snap := n.capture()
 	img, err := n.Encode()
 	if err != nil {
+		_ = n.restore(snap)
 		return err
 	}
-	if err := n.store.WriteTo(dst); err != nil {
+	if err := n.writeCommit(dst, img); err != nil {
+		_ = n.restore(snap)
 		return err
 	}
-	for ib, raw := range img.Pages {
-		if _, err := dst.WriteAt(raw, int64(ib)); err != nil {
-			return ioErr("page", "write at 0x%x: %v", ib, err)
-		}
-	}
-	for _, e := range n.blocks {
-		raw, ok, err := n.encodePayloadBlock(e)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if _, err := dst.WriteAt(raw, int64(e.IB)); err != nil {
-			return ioErr("block", "write at 0x%x: %v", e.IB, err)
-		}
-	}
-	if err := dst.Sync(); err != nil {
-		return ioErr("sink", "sync: %v", err)
-	}
-	if n.store.spool != dst {
-		if err := n.store.closeOwned(); err != nil {
-			return err
-		}
-		n.store.src = dst
-		n.store.spool = dst
-		n.store.srcLife = lifeBorrowed
-	}
-	n.store.backing = nil
-	return nil
+	return n.adopt(dst, lifeBorrowed)
 }
 
-func (n *NDB) encodePayloadBlock(e BBTEntry) ([]byte, bool, error) {
-	if n.payloads == nil {
-		return nil, false, nil
+// CommitFile writes a two-phase PST to a sibling temp file, syncs, then
+// atomically replaces path. A crash before rename leaves the previous file.
+func (n *NDB) CommitFile(path string) error {
+	if path == "" {
+		return invalidArg("path", "empty commit path")
 	}
-	data, ok := n.payloads[e.BID]
-	if !ok {
-		return nil, false, nil
+	tmp := path + ".tmp"
+	dst, err := CreateFileSink(tmp)
+	if err != nil {
+		return ioErr("file", "create %s: %v", tmp, err)
 	}
-	if BIDIsInternal(e.BID) {
-		raw, err := EncodeInternalBlock(data, e.BID, e.IB)
-		return raw, true, err
+	snap := n.capture()
+	img, err := n.Encode()
+	if err != nil {
+		_ = n.restore(snap)
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return err
 	}
-	raw, err := EncodeBlock(data, e.BID, e.IB)
-	return raw, true, err
+	if err := n.writeCommit(dst, img); err != nil {
+		_ = n.restore(snap)
+		_ = dst.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := dst.Close(); err != nil {
+		_ = n.restore(snap)
+		_ = os.Remove(tmp)
+		return ioErr("file", "close %s: %v", tmp, err)
+	}
+	if err := replacePath(tmp, path); err != nil {
+		_ = n.restore(snap)
+		_ = os.Remove(tmp)
+		return ioErr("file", "rename %s -> %s: %v", tmp, path, err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		n.store.io = nil
+		return ioErr("file", "reopen %s: %v", path, err)
+	}
+	sk := &FileSink{f: f}
+	oldWork := n.store.work
+	oldIO := n.store.io
+	n.store.work = nil
+	n.store.io = &ioHandle{r: sk, w: sk, life: lifeClose}
+	var cerr error
+	if oldWork != nil {
+		cerr = oldWork.close()
+	}
+	if oldIO != nil {
+		cerr = errorsJoin(cerr, oldIO.close())
+	}
+	if cerr != nil {
+		return cleanupErr(cerr)
+	}
+	return nil
 }
 
 func encodeTree[T interface{ key() uint64 }](ptype byte, leaves []T, alloc func([]byte, byte) (BREF, error), encodeLeaf func([]T) ([]byte, error), maxLeaf int) (BREF, error) {
@@ -1053,7 +1058,7 @@ func hydrateNDB(n *NDB, img *TreeImage) error {
 }
 
 // OpenNDB reopens a committed Unicode PST for continued mutation.
-// Store maps, ROOT BREFs, live tree pages, payloads, and bidNextP/bidNextB
+// Store maps, ROOT BREFs, live tree pages, and bidNextP/bidNextB
 // are retained. Extra cRef is reconstructed from XBLOCK/SLENTRY when present.
 func OpenNDB(file []byte) (*NDB, error) {
 	return OpenNDBFrom(&MemSink{name: "load", buf: file}, int64(len(file)))
@@ -1095,7 +1100,6 @@ func OpenNDBFrom(r io.ReaderAt, size int64) (*NDB, error) {
 		dataTreeRefs: make(map[uint64]int),
 		subnodeRefs:  make(map[uint64]int),
 		opaqueRefs:   make(map[uint64]int),
-		payloads:     make(map[uint64][]byte),
 	}
 	if err := hydrateNDB(n, img); err != nil {
 		return nil, err

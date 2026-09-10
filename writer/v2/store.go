@@ -15,15 +15,14 @@ type Store struct {
 	regions       []region
 	lastAllocAMap uint32
 	valid         byte
+	unique        uint32
 	bidNextP      uint64
 	bidNextB      uint64
 	dlistBID      uint64
 	nbtRoot       BREF
 	bbtRoot       BREF
-	backing       []byte
-	src           io.ReaderAt
-	spool         Sink
-	srcLife       srcLife
+	io            *ioHandle // last committed source
+	work          *ioHandle // uncommitted writable spool
 }
 
 // srcLife is who may Close/remove the writable handle.
@@ -43,7 +42,7 @@ type region struct {
 // PMap at 0x4600, and a DList at 0x4200. Header/DList live in the unmapped
 // prefix before 0x4400.
 func NewStore() *Store {
-	s := &Store{valid: AMapValid2, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}
+	s := &Store{valid: AMapValid2, unique: 1, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}
 	s.dlistBID = s.takePageBID()
 	s.mustGrow()
 	return s
@@ -121,6 +120,10 @@ func (s *Store) HeaderDraft() HeaderDraft {
 	d.Root.BBTIB = s.bbtRoot.IB
 	d.BidNextP = s.bidNextP
 	d.BidNextB = s.bidNextB
+	d.Unique = s.unique
+	if d.Unique == 0 {
+		d.Unique = 1
+	}
 	return d
 }
 
@@ -150,9 +153,11 @@ func (s *Store) SetTreeRoots(nbt, bbt BREF) {
 // SetAMapValid records fAMapValid for the next header encode.
 func (s *Store) SetAMapValid(v byte) error {
 	switch v {
-	case AMapValid2, AMapInvalid, AMapValid1:
+	case AMapValid2, AMapInvalid:
 		s.valid = v
 		return nil
+	case AMapValid1:
+		return invalidArg("fAMapValid", "VALID_AMAP1 (0x01) is deprecated (MS-PST %s)", SectionAMapTxn)
 	default:
 		return invalidArg("fAMapValid", "unknown 0x%02x (MS-PST %s)", v, SectionRoot)
 	}
@@ -164,6 +169,9 @@ func (s *Store) SetAMapValid(v byte) error {
 func (s *Store) Allocate(size uint64) (uint64, error) {
 	if size > MaxAllocBytes {
 		return 0, limitErr("size", "allocation %d exceeds MS-PST max %d", size, MaxAllocBytes)
+	}
+	if err := s.ensureSpool(); err != nil {
+		return 0, err
 	}
 	slots, err := slotsForSize(size)
 	if err != nil {
@@ -284,6 +292,9 @@ func (s *Store) Free(ib, size uint64) error {
 	if s.coversMetadata(ib, size) {
 		return invalidArg("ib", "cannot free metadata page at 0x%x (MS-PST %s)", ib, SectionAMap)
 	}
+	if err := s.ensureSpool(); err != nil {
+		return err
+	}
 	return s.mark(ib, size, false)
 }
 
@@ -338,19 +349,9 @@ func (s *Store) clearBacking(ib, size uint64) {
 	if size == 0 {
 		return
 	}
-	if len(s.backing) > 0 && ib < uint64(len(s.backing)) {
-		end := ib + size
-		if end > uint64(len(s.backing)) {
-			end = uint64(len(s.backing))
-		}
-		region := s.backing[ib:end]
-		for i := range region {
-			region[i] = 0
-		}
-	}
-	if s.spool != nil {
+	if w := s.writer(); w != nil {
 		z := make([]byte, size)
-		_, _ = s.spool.WriteAt(z, int64(ib))
+		_, _ = w.WriteAt(z, int64(ib))
 	}
 }
 
@@ -632,13 +633,6 @@ func (s *Store) encodeDList() ([]byte, error) {
 	return EncodePage(payload, PageDList, s.dlistBID, DListPageOffset)
 }
 
-// attachBacking keeps a copy of the last encoded/loaded image so a later
-// EncodeFile can preserve allocated data payloads.
-func (s *Store) attachBacking(file []byte) {
-	s.backing = append([]byte(nil), file...)
-}
-
-// writeExtent copies an already-encoded block into the backing image.
 func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if len(raw) == 0 {
 		return nil
@@ -647,20 +641,15 @@ func (s *Store) writeExtent(ib uint64, raw []byte) error {
 	if end > s.FileEOF() {
 		return invariant(SectionAMap, "ib", "write 0x%x+%d exceeds ibFileEof 0x%x", ib, len(raw), s.FileEOF())
 	}
-	// Never grow backing to FileEOF: that is O(PST). In-place update only
-	// when a loaded image already covers the extent.
-	if uint64(len(s.backing)) >= end {
-		copy(s.backing[ib:], raw)
-	}
 	if err := s.ensureSpool(); err != nil {
 		return err
 	}
-	_, err := s.spool.WriteAt(raw, int64(ib))
+	_, err := s.writer().WriteAt(raw, int64(ib))
 	return err
 }
 
 func (s *Store) ensureSpool() error {
-	if s.spool != nil {
+	if s.work != nil && s.work.w != nil {
 		return nil
 	}
 	f, err := os.CreateTemp("", "pst-v2-*.spool")
@@ -668,54 +657,45 @@ func (s *Store) ensureSpool() error {
 		return ioErr("spool", "create: %v", err)
 	}
 	sk := &FileSink{f: f}
-	if s.src != nil {
-		if err := copyReaderAt(sk, s.src, int64(s.FileEOF())); err != nil {
+	var src io.ReaderAt
+	if s.io != nil {
+		src = s.io.r
+	}
+	if src != nil && !sameIO(src, sk) {
+		if err := copyReaderAt(sk, src, int64(s.FileEOF())); err != nil {
 			_ = f.Close()
 			_ = os.Remove(f.Name())
 			return ioErr("spool", "seed: %v", err)
 		}
 	}
-	s.spool = sk
-	s.src = sk
-	s.srcLife = lifeTemp
+	s.work = &ioHandle{r: sk, w: sk, life: lifeTemp}
 	return nil
 }
 
 func (s *Store) closeOwned() error {
-	if s.srcLife == lifeBorrowed || s.spool == nil {
-		return nil
+	var err error
+	if s.work != nil {
+		err = s.work.close()
+		s.work = nil
 	}
-	name := ""
-	if s.srcLife == lifeTemp {
-		name = s.spool.Name()
-	}
-	err := s.spool.Close()
-	if s.src == s.spool {
-		s.src = nil
-	}
-	s.spool = nil
-	life := s.srcLife
-	s.srcLife = lifeBorrowed
-	if life == lifeTemp && name != "" {
-		if rerr := os.Remove(name); rerr != nil && !os.IsNotExist(rerr) {
-			return errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
-		}
+	if s.io != nil {
+		err = errorsJoin(err, s.io.close())
 	}
 	return err
 }
 
 func (s *Store) ownClose() {
-	if s.spool != nil {
-		s.srcLife = lifeClose
+	if s.io != nil && s.io.w != nil {
+		s.io.life = lifeClose
 	}
 }
 
 func (s *Store) attachSource(r io.ReaderAt) {
-	s.src = r
+	h := &ioHandle{r: r, life: lifeBorrowed}
 	if sk, ok := r.(Sink); ok {
-		s.spool = sk
+		h.w = sk
 	}
-	s.srcLife = lifeBorrowed
+	s.io = h
 }
 
 func (s *Store) readExtent(ib uint64, size int) ([]byte, error) {
@@ -730,14 +710,10 @@ func (s *Store) readExtent(ib uint64, size int) ([]byte, error) {
 		nr, err := r.ReadAt(raw, int64(ib))
 		return nr >= size && (err == nil || err == io.EOF)
 	}
-	if try(s.spool) {
+	if s.work != nil && try(s.work.r) {
 		return raw, nil
 	}
-	if s.src != nil && s.src != s.spool && try(s.src) {
-		return raw, nil
-	}
-	if uint64(len(s.backing)) >= ib+uint64(size) {
-		copy(raw, s.backing[ib:ib+uint64(size)])
+	if s.io != nil && try(s.io.r) {
 		return raw, nil
 	}
 	return nil, invariant(SectionBlockTrailer, "ib", "missing payload at 0x%x", ib)
@@ -801,21 +777,6 @@ func copyReaderAt(dst io.WriterAt, src io.ReaderAt, n int64) error {
 	return nil
 }
 
-func sinkSize(s Sink) (int64, error) {
-	cur, err := s.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return 0, err
-	}
-	end, err := s.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := s.Seek(cur, io.SeekStart); err != nil {
-		return 0, err
-	}
-	return end, nil
-}
-
 func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
 	z := make([]byte, BytesPerSlot)
 	for i := range s.regions {
@@ -833,67 +794,29 @@ func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
 	return nil
 }
 
-// WriteTo materializes HEADER, DList, and map pages onto dst without allocating FileEOF.
+// WriteTo materializes a complete VALID_AMAP2 PST onto dst without allocating FileEOF.
 func (s *Store) WriteTo(dst Sink) error {
-	if dst == nil {
-		return invalidArg("sink", "nil commit sink")
-	}
-	eof := int64(s.FileEOF())
-	src := s.src
-	if s.spool != nil {
-		src = s.spool
-	}
-	if src != nil && dst != src && dst != s.spool {
-		if err := copyReaderAt(dst, src, eof); err != nil {
-			return ioErr("spool", "copy: %v", err)
-		}
-	}
-	if err := s.zeroFreeSlotsAt(dst); err != nil {
-		return ioErr("spool", "zero free slots: %v", err)
-	}
-	hdr, err := EncodeUnicodeHeader(s.HeaderDraft())
-	if err != nil {
+	if err := s.writeBody(dst); err != nil {
 		return err
 	}
-	if _, err := dst.WriteAt(hdr, 0); err != nil {
-		return ioErr("header", "write: %v", err)
-	}
-	dlist, err := s.encodeDList()
-	if err != nil {
+	if err := s.writeHeader(dst, AMapValid2); err != nil {
 		return err
 	}
-	if _, err := dst.WriteAt(dlist, int64(DListPageOffset)); err != nil {
-		return ioErr("dlist", "write: %v", err)
-	}
-	for i := range s.regions {
-		pages, err := s.encodeRegionPages(uint64(i))
-		if err != nil {
-			return err
-		}
-		for _, p := range pages {
-			if _, err := dst.WriteAt(p.raw, int64(p.off)); err != nil {
-				return ioErr("amap", "write at 0x%x: %v", p.off, err)
-			}
-		}
-	}
-	if tr, ok := dst.(interface{ Truncate(int64) error }); ok {
-		if err := tr.Truncate(eof); err != nil {
-			return ioErr("sink", "truncate: %v", err)
-		}
-	}
-	if err := dst.Sync(); err != nil {
-		return ioErr("sink", "sync: %v", err)
+	if err := syncSink(dst); err != nil {
+		return err
 	}
 	return nil
 }
 
-// residentImageBytes is in-process image memory (backing + MemSink), not FileSink.
+// residentImageBytes is in-process image memory (MemSink), not FileSink.
 func (s *Store) residentImageBytes() int {
-	n := len(s.backing)
-	if m, ok := s.spool.(*MemSink); ok && len(m.buf) > n {
-		n = len(m.buf)
+	if m, ok := s.writer().(*MemSink); ok {
+		return len(m.buf)
 	}
-	return n
+	if m, ok := s.reader().(*MemSink); ok {
+		return len(m.buf)
+	}
+	return 0
 }
 
 func (s *Store) ShrinkTrailingEmpty(minRegions int) error {
@@ -910,13 +833,10 @@ func (s *Store) ShrinkTrailingEmpty(minRegions int) error {
 	if uint32(len(s.regions)) > 0 && s.lastAllocAMap >= uint32(len(s.regions)) {
 		s.lastAllocAMap = uint32(len(s.regions) - 1)
 	}
-	if tr, ok := s.spool.(interface{ Truncate(int64) error }); ok {
+	if tr, ok := s.writer().(interface{ Truncate(int64) error }); ok {
 		if err := tr.Truncate(int64(s.FileEOF())); err != nil {
 			return ioErr("spool", "truncate: %v", err)
 		}
-	}
-	if uint64(len(s.backing)) > s.FileEOF() {
-		s.backing = s.backing[:s.FileEOF()]
 	}
 	return nil
 }
@@ -1044,6 +964,7 @@ func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
 		bidNextP:      h.BidNextP,
 		bidNextB:      h.BidNextB,
 		dlistBID:      dl.Page.BID,
+		unique:        h.Unique,
 		nbtRoot:       BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
 		bbtRoot:       BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
 	}

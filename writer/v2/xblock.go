@@ -112,26 +112,11 @@ func (n *NDB) PutDataTree(r io.Reader, expected int64) (BBTEntry, error) {
 	if expected > int64(^uint32(0)) {
 		return BBTEntry{}, limitErr("lcbTotal", "logical size %d exceeds uint32 lcbTotal (MS-PST %s)", expected, SectionXBlock)
 	}
-	startRegions := n.store.RegionCount()
-	startBidB := n.store.bidNextB
-	startIDs := n.ids.nextBlock
-	startAMap := n.store.lastAllocAMap
+	snap := n.capture()
 	var staged []uint64
 	var fail error
 	rollback := func() error {
-		var rb error
-		for i := len(staged) - 1; i >= 0; i-- {
-			if err := n.dropBlock(staged[i]); err != nil {
-				rb = rollbackErr(rb, err)
-			}
-		}
-		if err := n.store.ShrinkTrailingEmpty(startRegions); err != nil {
-			rb = rollbackErr(rb, err)
-		}
-		n.store.bidNextB = startBidB
-		n.ids.nextBlock = startIDs
-		n.store.lastAllocAMap = startAMap
-		return rb
+		return n.restore(snap)
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
 

@@ -15,6 +15,7 @@ var (
 	ErrClosed         = errors.New("writer closed")
 	ErrInvalidArg     = errors.New("invalid argument")
 	ErrIO             = errors.New("sink i/o")
+	ErrCleanup        = errors.New("commit cleanup")
 )
 
 // Code classifies a writer or inspector failure.
@@ -28,6 +29,7 @@ const (
 	CodeClosed         Code = "closed"
 	CodeInvalidArg     Code = "invalid-argument"
 	CodeIO             Code = "io"
+	CodeCleanup        Code = "cleanup"
 )
 
 // Error is the structured error taxonomy for writer v2.
@@ -96,6 +98,8 @@ func (e *Error) sentinel() error {
 		return ErrInvalidArg
 	case CodeIO:
 		return ErrIO
+	case CodeCleanup:
+		return ErrCleanup
 	default:
 		return ErrInvalidArg
 	}

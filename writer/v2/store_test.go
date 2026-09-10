@@ -11,14 +11,15 @@ import (
 
 func spoolByte(s *Store, ib uint64) byte {
 	var b [1]byte
-	if s.spool != nil {
-		n, _ := s.spool.ReadAt(b[:], int64(ib))
+	r := s.reader()
+	if r == nil {
+		r = s.writer()
+	}
+	if r != nil {
+		n, _ := r.ReadAt(b[:], int64(ib))
 		if n == 1 {
 			return b[0]
 		}
-	}
-	if uint64(len(s.backing)) > ib {
-		return s.backing[ib]
 	}
 	return 0
 }

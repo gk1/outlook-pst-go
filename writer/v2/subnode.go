@@ -302,25 +302,10 @@ func (n *NDB) PutSubnodeTree(entries []SLEntry) (BBTEntry, error) {
 	}
 	sorted := append([]SLEntry(nil), entries...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].NID < sorted[j].NID })
-	startRegions := n.store.RegionCount()
-	startBidB := n.store.bidNextB
-	startIDs := n.ids.nextBlock
-	startAMap := n.store.lastAllocAMap
+	snap := n.capture()
 	var staged []uint64
 	rollback := func() error {
-		var rb error
-		for i := len(staged) - 1; i >= 0; i-- {
-			if err := n.dropBlock(staged[i]); err != nil {
-				rb = rollbackErr(rb, err)
-			}
-		}
-		if err := n.store.ShrinkTrailingEmpty(startRegions); err != nil {
-			rb = rollbackErr(rb, err)
-		}
-		n.store.bidNextB = startBidB
-		n.ids.nextBlock = startIDs
-		n.store.lastAllocAMap = startAMap
-		return rb
+		return n.restore(snap)
 	}
 	note := func(e BBTEntry) { staged = append(staged, e.BID) }
 	root, err := n.buildSubnodeTree(sorted, note)
