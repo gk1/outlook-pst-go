@@ -613,6 +613,11 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err := n.rejectInPlace(dst); err != nil {
 		return err
 	}
+	stage, err := newStageSink()
+	if err != nil {
+		return ioErr("sink", "stage: %v", err)
+	}
+	defer func() { _ = closeSink(stage) }()
 	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
@@ -620,7 +625,10 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err != nil {
 		return n.abortTxn(snap, err)
 	}
-	if err := n.writeCommit(dst, img); err != nil {
+	if err := n.writeCommit(stage, img); err != nil {
+		return n.abortTxn(snap, err)
+	}
+	if err := n.store.publishSink(dst, stage); err != nil {
 		return n.abortTxn(snap, err)
 	}
 	return n.adopt(dst, lifeBorrowed)

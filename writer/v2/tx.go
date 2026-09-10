@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"reflect"
 )
 
 // replacePath is the commit-file rename. Tests inject failures here.
@@ -47,6 +46,9 @@ var closeWork = func(s Sink) error {
 
 // createCommitTemp creates the CommitFile sibling. Tests inject failures.
 var createCommitTemp = func(path string) (Sink, error) { return CreateFileSink(path) }
+
+// newStageSink is the owned CommitTo staging sink. Tests inject failures.
+var newStageSink = func() (Sink, error) { return NewMemSink("stage"), nil }
 
 // truncWork truncates the work spool to the restored EOF. Tests inject failures.
 var truncWork = truncSink
@@ -145,105 +147,67 @@ func (s *Store) setWriter(w Sink) {
 	}
 }
 
-// UnwrapSink is an optional identity hint for Sink wrappers. Correctness
-// does not require it; sameIO also walks pointer fields.
+// UnwrapSink is an optional wrapper hint. CommitTo does not use it for
+// identity: dest is never the in-progress write target.
 type UnwrapSink interface {
 	UnwrapSink() Sink
 }
 
-// UnwrapReaderAt is an optional identity hint for ReaderAt wrappers.
+// UnwrapReaderAt is an optional ReaderAt wrapper hint.
 type UnwrapReaderAt interface {
 	UnwrapReaderAt() io.ReaderAt
 }
 
-// sameIO reports whether a and b share a payload object. Interface values
-// are never compared with ==. Identity is the set of non-nil pointer keys
-// found by optional unwrap plus a bounded walk of pointer/struct fields.
+// sameIO reports whether a and b are the same *MemSink, *FileSink, or
+// *os.File pointer. Interface values are never compared with ==. Unknown
+// and wrapper types do not match; CommitTo does not discover backing alias.
 func sameIO(a, b any) bool {
-	if a == nil || b == nil {
-		return false
-	}
-	ka, kb := ioKeys(a), ioKeys(b)
-	if len(ka) == 0 || len(kb) == 0 {
-		return false
-	}
-	for p := range ka {
-		if kb[p] {
-			return true
-		}
+	switch x := a.(type) {
+	case *MemSink:
+		y, ok := b.(*MemSink)
+		return ok && x != nil && y != nil && x == y
+	case *FileSink:
+		y, ok := b.(*FileSink)
+		return ok && x != nil && y != nil && x == y
+	case *os.File:
+		y, ok := b.(*os.File)
+		return ok && x != nil && y != nil && x == y
 	}
 	return false
 }
 
-func ioKeys(v any) map[uintptr]bool {
-	out := map[uintptr]bool{}
-	seen := map[uintptr]bool{}
-	collectIOKeys(v, 0, out, seen)
-	return out
-}
-
-func collectIOKeys(v any, depth int, out, seen map[uintptr]bool) {
-	if v == nil || depth > 8 {
-		return
+func (s *Store) publishSink(dst, stage Sink) error {
+	if dst == nil || stage == nil {
+		return invalidArg("sink", "nil publish sink")
 	}
-	switch x := v.(type) {
-	case UnwrapSink:
-		if next := x.UnwrapSink(); next != nil {
-			collectIOKeys(next, depth+1, out, seen)
-		}
-	case UnwrapReaderAt:
-		if next := x.UnwrapReaderAt(); next != nil {
-			collectIOKeys(next, depth+1, out, seen)
+	if sameIO(dst, stage) {
+		return nil
+	}
+	eof := int64(s.FileEOF())
+	if err := s.writeHeader(dst, AMapInvalid); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
+	if err := copyReaderAtFrom(dst, stage, int64(UnicodeHeaderSize), eof); err != nil {
+		return ioErr("spool", "publish: %v", err)
+	}
+	if tr, ok := dst.(interface{ Truncate(int64) error }); ok {
+		if err := tr.Truncate(eof); err != nil {
+			return ioErr("sink", "truncate: %v", err)
 		}
 	}
-	rv := reflect.ValueOf(v)
-	if !rv.IsValid() {
-		return
+	if err := syncSink(dst); err != nil {
+		return err
 	}
-	switch rv.Kind() {
-	case reflect.Pointer:
-		if rv.IsNil() {
-			return
-		}
-		p := rv.Pointer()
-		if seen[p] {
-			return
-		}
-		seen[p] = true
-		out[p] = true
-		el := rv.Elem()
-		if el.IsValid() && el.CanInterface() {
-			collectIOKeys(el.Interface(), depth+1, out, seen)
-		}
-	case reflect.Struct:
-		for i := 0; i < rv.NumField(); i++ {
-			f := rv.Field(i)
-			switch f.Kind() {
-			case reflect.Pointer:
-				if f.IsNil() {
-					continue
-				}
-				p := f.Pointer()
-				if !seen[p] {
-					seen[p] = true
-					out[p] = true
-					el := f.Elem()
-					if el.IsValid() && el.CanInterface() {
-						collectIOKeys(el.Interface(), depth+1, out, seen)
-					}
-				}
-			case reflect.Interface, reflect.Struct:
-				if f.CanInterface() {
-					collectIOKeys(f.Interface(), depth+1, out, seen)
-				}
-			}
-		}
-	case reflect.Interface:
-		if rv.IsNil() {
-			return
-		}
-		collectIOKeys(rv.Elem().Interface(), depth+1, out, seen)
+	if err := s.writeHeader(dst, AMapValid2); err != nil {
+		return err
 	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
+	return nil
 }
 
 // snapshot is the one transaction boundary. Field names for Store/NDB value
@@ -425,10 +389,7 @@ func (n *NDB) rejectInPlace(dst Sink) error {
 	if n == nil || n.store == nil {
 		return nil
 	}
-	if n.store.io != nil && (sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r)) {
-		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the last committed source; use CommitFile")
-	}
-	if n.store.work != nil && (sameIO(dst, n.store.work.w) || sameIO(dst, n.store.work.r)) {
+	if n.store.work != nil && sameIO(dst, n.store.work.w) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the work spool; use CommitFile")
 	}
 	return nil
@@ -532,8 +493,16 @@ func (n *NDB) adopt(dst Sink, life srcLife) error {
 	if dst == nil {
 		return invalidArg("sink", "nil commit sink")
 	}
-	if n.store.io != nil && sameIO(dst, n.store.io.w) {
-		return unsupported(FeatureInPlaceMutation, "in-place commit of the last committed source; use CommitFile")
+	if n.store.io != nil && (sameIO(dst, n.store.io.w) || sameIO(dst, n.store.io.r)) {
+		oldWork := n.store.work
+		n.store.work = nil
+		n.pendingPath = ""
+		if oldWork != nil {
+			if err := oldWork.close(); err != nil {
+				return cleanupErr(err)
+			}
+		}
+		return nil
 	}
 	oldWork := n.store.work
 	oldIO := n.store.io

@@ -18,15 +18,15 @@
 // covers allocator, catalog, refs, live pages, roots, and whether a work
 // spool exists; failed tree writes restore that snapshot and rewind in-place
 // work mutations from an extent undo journal (or drop work if the txn created
-// it). CommitTo rejects the last committed source before any dest write. It
-// writes INVALID_AMAP + sync, body/pages + sync, then VALID_AMAP2 + sync
-// (MS-PST 2.6.1.3.7). CommitFile writes a sibling
+// it). CommitTo renders a complete image to a fresh owned staging sink
+// (INVALID + sync, body/pages + sync, VALID + sync) and only then publishes
+// that image onto dest with the same INVALID-first protocol. Dest is never
+// the in-progress write target, so crash safety does not depend on discovering
+// arbitrary Sink identity. sameIO compares only *MemSink/*FileSink/*os.File
+// pointers and never uses interface ==. CommitFile writes a sibling
 // temp, renames, and fsyncs the parent directory. A post-rename dirsync or
 // reopen failure returns ErrAdopt, keeps the work spool as the usable
-// source, and records PendingPath. sameIO never compares interface values with ==. Identity is the set of
-// pointer keys from optional unwrap plus a bounded pointer/struct walk, so a
-// distinct unknown Sink is a valid destination and an opaque wrapper of the
-// current source is still rejected. The payload
+// source, and records PendingPath. The payload
 // source is one owned/borrowed ioHandle: borrowed readers are never closed,
 // owned files are closed, owned temp spools are closed and removed. VALID_AMAP1 is rejected.
 // Close/remove failures after a successful dest sync return a cleanup error

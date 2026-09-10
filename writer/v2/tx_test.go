@@ -69,6 +69,57 @@ type opaqueNC struct {
 	_ [0]func()
 }
 
+type sliceAliasSink struct {
+	inner []Sink
+	Sink
+	_ [0]func()
+}
+
+type mapAliasSink struct {
+	inner map[string]Sink
+	Sink
+	_ [0]func()
+}
+
+type closAliasSink struct {
+	at func([]byte, int64) (int, error)
+	Sink
+	_ [0]func()
+}
+
+func (c closAliasSink) WriteAt(p []byte, off int64) (int, error) {
+	return c.at(p, off)
+}
+
+type deepBox struct {
+	next Sink
+	_    [0]func()
+}
+
+func (d deepBox) Write(p []byte) (int, error)              { return d.next.Write(p) }
+func (d deepBox) WriteAt(p []byte, off int64) (int, error) { return d.next.WriteAt(p, off) }
+func (d deepBox) ReadAt(p []byte, off int64) (int, error)  { return d.next.ReadAt(p, off) }
+func (d deepBox) Seek(offset int64, whence int) (int64, error) {
+	return d.next.Seek(offset, whence)
+}
+func (d deepBox) Sync() error  { return d.next.Sync() }
+func (d deepBox) Close() error { return d.next.Close() }
+func (d deepBox) Name() string { return d.next.Name() }
+
+func nestDeep(s Sink, n int) Sink {
+	cur := s
+	for i := 0; i < n; i++ {
+		cur = deepBox{next: cur}
+	}
+	return cur
+}
+
+type sharedPtrSink struct {
+	*MemSink
+	shared *int
+	_      [0]func()
+}
+
 type opaqueReader struct {
 	r io.ReaderAt
 	_ [0]func()
@@ -326,7 +377,7 @@ func TestRestoreRevertsRetainedExtentMutation(t *testing.T) {
 	}
 }
 
-func TestCommitToRejectsInPlaceBeforeWrite(t *testing.T) {
+func TestCommitToDoesNotTouchDestUntilStageComplete(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("first"), false)
 	ms := NewMemSink("same")
 	fs := &faultSink{Sink: ms}
@@ -340,11 +391,51 @@ func TestCommitToRejectsInPlaceBeforeWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	mustNode(t, n, 0x61, extra.BID, 0, 0)
-	if err := n.CommitTo(fs); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("in-place CommitTo: %v", err)
+	old := newStageSink
+	newStageSink = func() (Sink, error) {
+		return &faultSink{Sink: NewMemSink("stage"), failWrite: 1}, nil
+	}
+	defer func() { newStageSink = old }()
+	if err := n.CommitTo(fs); err == nil {
+		t.Fatal("expected staging failure")
 	}
 	if fs.writes != writes || fs.off0 != off0 {
-		t.Fatalf("in-place CommitTo mutated dest writes=%d->%d off0=%d->%d", writes, fs.writes, off0, fs.off0)
+		t.Fatalf("dest mutated before stage completed writes=%d->%d off0=%d->%d", writes, fs.writes, off0, fs.off0)
+	}
+}
+
+func TestCommitToSameMemSinkPublishesCompleteImage(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("first"), false)
+	ms := NewMemSink("same")
+	if err := n.CommitTo(ms); err != nil {
+		t.Fatal(err)
+	}
+	extra, err := n.PutDataTree(bytes.NewReader([]byte("more")), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n, 0x61, extra.BID, 0, 0)
+	if err := n.CommitTo(ms); err != nil {
+		t.Fatal(err)
+	}
+	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(ms.Bytes())}, int64(len(ms.Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	rd, err := n2.OpenDataTree(n2.nodes[0x21].DataBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first" {
+		t.Fatalf("payload %q", got)
+	}
+	if _, ok := n2.LookupNode(0x61); !ok {
+		t.Fatal("missing extra node")
 	}
 }
 
@@ -552,7 +643,7 @@ func TestNonComparableSinkCommit(t *testing.T) {
 	if err := n.CommitTo(dst); err != nil {
 		t.Fatal(err)
 	}
-	if err := n.CommitTo(dst); !errors.Is(err, ErrUnsupported) {
+	if err := n.CommitTo(dst); err != nil {
 		t.Fatalf("second ncSink CommitTo: %v", err)
 	}
 	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(dst.Bytes())}, int64(len(dst.Bytes())))
@@ -670,7 +761,7 @@ func TestFaultWriteDoesNotAdoptDestination(t *testing.T) {
 	if n.store.bidNextB != before.bidNextB || len(n.nodes) != len(before.nodes) {
 		t.Fatal("in-memory state not restored after write fault")
 	}
-	if sameIO(n.store.writer(), fs) || (n.store.io != nil && sameIO(n.store.io.w, fs)) {
+	if n.store.io != nil {
 		t.Fatal("adopted a failed destination")
 	}
 }
@@ -765,7 +856,7 @@ func TestCommitToInjectedBoundaries(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected injected failure")
 			}
-			if n.store.io != nil && sameIO(n.store.io.w, fs) {
+			if n.store.io != nil {
 				t.Fatal("adopted failed dest")
 			}
 			herr := destHeader(t, ms)
@@ -970,7 +1061,7 @@ func TestCommitToInjectsEveryWriteAndSync(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected injected failure")
 		}
-		if n.store.io != nil && sameIO(n.store.io.w, fs) {
+		if n.store.io != nil {
 			t.Fatal("adopted failed dest")
 		}
 		herr := destHeader(t, ms)
@@ -1060,13 +1151,24 @@ func TestOpaqueNonComparableSinkCommitTo(t *testing.T) {
 	if err := n.CommitTo(dst); err != nil {
 		t.Fatal(err)
 	}
-	writes := len(dst.Bytes())
-	err := n.CommitTo(dst)
-	if !errors.Is(err, ErrUnsupported) {
+	if err := n.CommitTo(dst); err != nil {
 		t.Fatalf("second opaque CommitTo: %v", err)
 	}
-	if len(dst.Bytes()) != writes {
-		t.Fatal("second CommitTo mutated dest in place")
+	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(dst.Bytes())}, int64(len(dst.Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	rd, err := n2.OpenDataTree(n2.nodes[0x21].DataBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "opaque" {
+		t.Fatalf("payload %q", got)
 	}
 }
 
@@ -1311,11 +1413,8 @@ func TestOpaqueNonComparableSinkSameIONoPanic(t *testing.T) {
 			t.Fatalf("sameIO panicked: %v", r)
 		}
 	}()
-	if !sameIO(a, a) {
-		t.Fatal("same opaque sink wrapping the same MemSink must match")
-	}
-	if sameIO(a, b) {
-		t.Fatal("distinct opaque sinks must not match")
+	if sameIO(a, a) || sameIO(a, b) {
+		t.Fatal("unknown types must not match by pointer-graph inference")
 	}
 }
 
@@ -1381,27 +1480,91 @@ func TestUnknownSourceSecondDistinctUnknownSink(t *testing.T) {
 	}
 }
 
-func TestOpaqueWrapperOfKnownSourceRejected(t *testing.T) {
-	n, _, _ := seedNDB(t, []byte("wrap-src"), false)
-	ms := NewMemSink("known")
-	if err := n.CommitTo(ms); err != nil {
-		t.Fatal(err)
+func TestHiddenAliasNotMutatedWhenStageFails(t *testing.T) {
+	cases := []struct {
+		name string
+		wrap func(Sink) Sink
+	}{
+		{"slice", func(s Sink) Sink { return sliceAliasSink{inner: []Sink{s}, Sink: s} }},
+		{"map", func(s Sink) Sink { return mapAliasSink{inner: map[string]Sink{"d": s}, Sink: s} }},
+		{"closure", func(s Sink) Sink {
+			return closAliasSink{at: s.WriteAt, Sink: s}
+		}},
+		{"deep", func(s Sink) Sink { return nestDeep(s, 12) }},
 	}
-	before := append([]byte(nil), ms.Bytes()...)
-	wrap := opaqueNC{MemSink: ms}
-	if reflect.TypeOf(wrap).Comparable() {
-		t.Fatal("opaqueNC must not be comparable")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n, _, _ := seedNDB(t, []byte("alias"), false)
+			ms := NewMemSink("known")
+			if err := n.CommitTo(ms); err != nil {
+				t.Fatal(err)
+			}
+			before := append([]byte(nil), ms.Bytes()...)
+			wrap := tc.wrap(ms)
+			if reflect.TypeOf(wrap).Comparable() {
+				t.Fatal("alias wrapper must not be comparable")
+			}
+			old := newStageSink
+			newStageSink = func() (Sink, error) {
+				return &faultSink{Sink: NewMemSink("stage"), failWrite: 1}, nil
+			}
+			defer func() { newStageSink = old }()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("CommitTo panicked: %v", r)
+				}
+			}()
+			if err := n.CommitTo(wrap); err == nil {
+				t.Fatal("expected staging failure")
+			}
+			if !bytes.Equal(ms.Bytes(), before) {
+				t.Fatal("hidden alias mutated in place")
+			}
+		})
+	}
+}
+
+func TestDistinctSinksSharingUnrelatedPointer(t *testing.T) {
+	shared := new(int)
+	n, _, _ := seedNDB(t, []byte("share"), false)
+	a := sharedPtrSink{MemSink: NewMemSink("a"), shared: shared}
+	b := sharedPtrSink{MemSink: NewMemSink("b"), shared: shared}
+	if reflect.TypeOf(a).Comparable() {
+		t.Fatal("sharedPtrSink must not be comparable")
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			t.Fatalf("CommitTo panicked: %v", r)
 		}
 	}()
-	if err := n.CommitTo(wrap); !errors.Is(err, ErrUnsupported) {
-		t.Fatalf("wrapper of current source: %v", err)
+	if err := n.CommitTo(a); err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(ms.Bytes(), before) {
-		t.Fatal("opaque wrapper mutated known source")
+	first := append([]byte(nil), a.Bytes()...)
+	if err := n.CommitTo(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Bytes()) == 0 {
+		t.Fatal("second dest empty")
+	}
+	if !bytes.Equal(a.Bytes(), first) {
+		t.Fatal("distinct sink sharing an unrelated pointer was rejected or mutated")
+	}
+	n2, err := OpenNDBFrom(onlyReaderAt{bytes.NewReader(b.Bytes())}, int64(len(b.Bytes())))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	rd, err := n2.OpenDataTree(n2.nodes[0x21].DataBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "share" {
+		t.Fatalf("payload %q", got)
 	}
 }
 
