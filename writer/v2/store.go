@@ -22,6 +22,7 @@ type Store struct {
 	bbtRoot       BREF
 	io            *ioHandle // last committed source
 	work          *ioHandle // uncommitted writable spool
+	hold          *ioHandle // previous owned source dest may alias; closed on Close
 	undo          *undoLog  // extent journal for the active transaction
 }
 
@@ -780,6 +781,10 @@ func (s *Store) closeOwned() error {
 	if s.io != nil {
 		err = errorsJoin(err, s.io.close())
 	}
+	if s.hold != nil {
+		err = errorsJoin(err, s.hold.close())
+		s.hold = nil
+	}
 	return err
 }
 
@@ -974,26 +979,7 @@ func (s *Store) zeroFreeSlotsAt(w io.WriterAt) error {
 
 // WriteTo materializes a complete VALID_AMAP2 PST onto dst without allocating FileEOF.
 func (s *Store) WriteTo(dst Sink) error {
-	if err := s.writeHeader(dst, AMapInvalid); err != nil {
-		return err
-	}
-	if err := syncSink(dst); err != nil {
-		return err
-	}
-	if err := s.writeBody(dst); err != nil {
-		return err
-	}
-	if err := syncSink(dst); err != nil {
-		return err
-	}
-	if err := s.writeHeader(dst, AMapValid2); err != nil {
-		return err
-	}
-	if err := syncSink(dst); err != nil {
-		return err
-	}
-	s.valid = AMapValid2
-	return nil
+	return s.writeTwoPhase(dst, func() error { return s.writeBody(dst) })
 }
 
 // residentImageBytes is in-process image memory (MemSink), not FileSink.

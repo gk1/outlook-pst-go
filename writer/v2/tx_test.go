@@ -69,6 +69,11 @@ type opaqueNC struct {
 	_ [0]func()
 }
 
+type opaqueFileWrap struct {
+	Sink
+	_ [0]func()
+}
+
 type sliceAliasSink struct {
 	inner []Sink
 	Sink
@@ -238,6 +243,32 @@ func seedNDB(t *testing.T, payload []byte, withSub bool) (*NDB, BBTEntry, BBTEnt
 	return n, root, sub
 }
 
+func assertNDBReadable(t *testing.T, n *NDB, nid uint64, want string) {
+	t.Helper()
+	got, ok := n.LookupNode(nid)
+	if !ok {
+		t.Fatalf("missing node 0x%x", nid)
+	}
+	rd, err := n.OpenDataTree(got.DataBID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != want {
+		t.Fatalf("payload %q want %q", b, want)
+	}
+}
+
+func destIsIO(n *NDB, dst Sink) bool {
+	if n == nil || n.store == nil || n.store.io == nil {
+		return false
+	}
+	return sameIO(n.store.io.w, dst) || sameIO(n.store.io.r, dst)
+}
+
 func destHeader(t *testing.T, ms *MemSink) error {
 	t.Helper()
 	b := ms.Bytes()
@@ -287,7 +318,7 @@ func TestSnapshotCoversMutableFields(t *testing.T) {
 	for i := 0; i < snap.NumField(); i++ {
 		names[snap.Field(i).Name] = true
 	}
-	skipStore := map[string]bool{"io": true, "work": true, "undo": true}
+	skipStore := map[string]bool{"io": true, "work": true, "hold": true, "undo": true}
 	st := reflect.TypeOf(Store{})
 	for i := 0; i < st.NumField(); i++ {
 		f := st.Field(i)
@@ -752,18 +783,18 @@ func TestReaderAtOnlyMutateCommitReopen(t *testing.T) {
 
 func TestFaultWriteDoesNotAdoptDestination(t *testing.T) {
 	n, _, _ := seedNDB(t, []byte("src"), false)
-	before := n.capture()
 	ms := NewMemSink("dst")
 	fs := &faultSink{Sink: ms, failWrite: 1}
 	if err := n.CommitTo(fs); err == nil {
 		t.Fatal("expected write fault")
 	}
-	if n.store.bidNextB != before.bidNextB || len(n.nodes) != len(before.nodes) {
-		t.Fatal("in-memory state not restored after write fault")
-	}
-	if n.store.io != nil {
+	if destIsIO(n, fs) {
 		t.Fatal("adopted a failed destination")
 	}
+	if n.store.io == nil {
+		t.Fatal("lost complete stage after dest publish failure")
+	}
+	assertNDBReadable(t, n, 0x21, "src")
 }
 
 func TestFailedTransactionDoesNotLeakIntoNextCommit(t *testing.T) {
@@ -856,9 +887,13 @@ func TestCommitToInjectedBoundaries(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected injected failure")
 			}
-			if n.store.io != nil {
+			if destIsIO(n, fs) {
 				t.Fatal("adopted failed dest")
 			}
+			if n.store.io == nil {
+				t.Fatal("lost complete stage after dest publish failure")
+			}
+			assertNDBReadable(t, n, 0x21, "inj")
 			herr := destHeader(t, ms)
 			if tc.accept {
 				if herr != nil {
@@ -1061,9 +1096,13 @@ func TestCommitToInjectsEveryWriteAndSync(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected injected failure")
 		}
-		if n.store.io != nil {
+		if destIsIO(n, fs) {
 			t.Fatal("adopted failed dest")
 		}
+		if n.store.io == nil {
+			t.Fatal("lost complete stage after dest publish failure")
+		}
+		assertNDBReadable(t, n, 0x21, "inj")
 		herr := destHeader(t, ms)
 		if herr == nil {
 			if err := CheckAllocation(ms.Bytes()); err != nil {
@@ -1123,11 +1162,9 @@ func TestCommitRestoreErrorIsJoined(t *testing.T) {
 	old := truncWork
 	truncWork = func(Sink, int64) error { return io.ErrClosedPipe }
 	defer func() { truncWork = old }()
-	ms := NewMemSink("dst")
-	fs := &faultSink{Sink: ms, failWrite: 1}
-	err := n.CommitTo(fs)
+	_, err := n.PutDataTree(&boomReader{left: 2 << 20}, 0)
 	if err == nil {
-		t.Fatal("expected fault")
+		t.Fatal("expected boom")
 	}
 	if !errors.Is(err, ErrIO) && !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("missing op error: %v", err)
@@ -1694,4 +1731,253 @@ func TestRunTxnShortWriteRestoresState(t *testing.T) {
 	if !n.store.BitmapEqual(&Store{regions: before.regions}) {
 		t.Fatal("allocation map not restored")
 	}
+}
+
+func TestHiddenAliasPublishFailureKeepsSource(t *testing.T) {
+	cases := []struct {
+		name string
+		wrap func(Sink) Sink
+	}{
+		{"slice", func(s Sink) Sink { return sliceAliasSink{inner: []Sink{s}, Sink: s} }},
+		{"map", func(s Sink) Sink { return mapAliasSink{inner: map[string]Sink{"d": s}, Sink: s} }},
+		{"closure", func(s Sink) Sink { return closAliasSink{at: s.WriteAt, Sink: s} }},
+		{"deep", func(s Sink) Sink { return nestDeep(s, 12) }},
+	}
+	count := &faultSink{Sink: NewMemSink("count")}
+	n0, _, _ := seedNDB(t, []byte("alias-src"), false)
+	if err := n0.CommitTo(count); err != nil {
+		t.Fatal(err)
+	}
+	writes, syncs, truncs := count.writes, count.syncs, count.truncs
+	if writes < 1 {
+		t.Fatal("no dest writes")
+	}
+	for _, tc := range cases {
+		for i := 1; i <= writes; i++ {
+			i := i
+			t.Run(tc.name+"/write", func(t *testing.T) {
+				n, _, _ := seedNDB(t, []byte("alias-src"), false)
+				ms := NewMemSink("known")
+				if err := n.CommitTo(ms); err != nil {
+					t.Fatal(err)
+				}
+				extra, err := n.PutDataTree(bytes.NewReader([]byte("more")), 4)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustNode(t, n, 0x61, extra.BID, 0, 0)
+				fs := &faultSink{Sink: ms, failWrite: i}
+				wrap := tc.wrap(fs)
+				err = n.CommitTo(wrap)
+				if err == nil {
+					assertNDBReadable(t, n, 0x21, "alias-src")
+					return
+				}
+				if destIsIO(n, fs) || destIsIO(n, wrap) {
+					t.Fatal("adopted failed dest")
+				}
+				if n.store.io == nil {
+					t.Fatal("lost complete stage")
+				}
+				assertNDBReadable(t, n, 0x21, "alias-src")
+				assertNDBReadable(t, n, 0x61, "more")
+			})
+		}
+		for i := 1; i <= syncs; i++ {
+			i := i
+			t.Run(tc.name+"/sync", func(t *testing.T) {
+				n, _, _ := seedNDB(t, []byte("alias-src"), false)
+				ms := NewMemSink("known")
+				if err := n.CommitTo(ms); err != nil {
+					t.Fatal(err)
+				}
+				fs := &faultSink{Sink: ms, failSync: i}
+				wrap := tc.wrap(fs)
+				if err := n.CommitTo(wrap); err == nil {
+					assertNDBReadable(t, n, 0x21, "alias-src")
+					return
+				}
+				if n.store.io == nil {
+					t.Fatal("lost complete stage")
+				}
+				assertNDBReadable(t, n, 0x21, "alias-src")
+			})
+		}
+		for i := 1; i <= truncs; i++ {
+			i := i
+			t.Run(tc.name+"/trunc", func(t *testing.T) {
+				n, _, _ := seedNDB(t, []byte("alias-src"), false)
+				ms := NewMemSink("known")
+				if err := n.CommitTo(ms); err != nil {
+					t.Fatal(err)
+				}
+				fs := &faultSink{Sink: ms, failTrunc: i}
+				wrap := tc.wrap(fs)
+				if err := n.CommitTo(wrap); err == nil {
+					assertNDBReadable(t, n, 0x21, "alias-src")
+					return
+				}
+				if n.store.io == nil {
+					t.Fatal("lost complete stage")
+				}
+				assertNDBReadable(t, n, 0x21, "alias-src")
+			})
+		}
+	}
+}
+
+func TestOwnedFileOpaqueAliasCommitTo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owned-alias.pst")
+	n, _, _ := seedNDB(t, []byte("owned-src"), false)
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	fs, ok := n2.store.io.w.(*FileSink)
+	if !ok {
+		t.Fatalf("owned source %T", n2.store.io.w)
+	}
+	extra, err := n2.PutDataTree(bytes.NewReader([]byte("more")), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustNode(t, n2, 0x61, extra.BID, 0, 0)
+	wrap := opaqueFileWrap{Sink: fs}
+	if reflect.TypeOf(wrap).Comparable() {
+		t.Fatal("opaqueFileWrap must not be comparable")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CommitTo panicked: %v", r)
+		}
+	}()
+	if err := n2.CommitTo(wrap); err != nil && !errors.Is(err, ErrCleanup) {
+		t.Fatal(err)
+	}
+	assertNDBReadable(t, n2, 0x21, "owned-src")
+	assertNDBReadable(t, n2, 0x61, "more")
+}
+
+func TestStageFileBackedNotMemSink(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("stage-file"), false)
+	calls := 0
+	old := createTemp
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		calls++
+		return old(dir, pattern)
+	}
+	defer func() { createTemp = old }()
+	dst := NewMemSink("out")
+	if err := n.CommitTo(dst); err != nil {
+		t.Fatal(err)
+	}
+	if calls == 0 {
+		t.Fatal("CommitTo used RAM stage instead of file-backed temp")
+	}
+	assertNDBReadable(t, n, 0x21, "stage-file")
+}
+
+func TestStageInjectedBoundaries(t *testing.T) {
+	probe := &faultSink{Sink: NewMemSink("probe")}
+	old := newStageSink
+	newStageSink = func() (Sink, error) { return probe, nil }
+	n0, _, _ := seedNDB(t, []byte("stg"), false)
+	if err := n0.CommitTo(NewMemSink("discard")); err != nil {
+		t.Fatal(err)
+	}
+	writes, syncs, truncs := probe.writes, probe.syncs, probe.truncs
+	newStageSink = old
+	if writes < 3 || syncs < 3 {
+		t.Fatalf("too few stage ops writes=%d syncs=%d", writes, syncs)
+	}
+	check := func(t *testing.T, failWrite, failSync, failTrunc int) {
+		t.Helper()
+		n, _, _ := seedNDB(t, []byte("stg"), false)
+		ms := NewMemSink("dst")
+		fs := &faultSink{Sink: NewMemSink("stage"), failWrite: failWrite, failSync: failSync, failTrunc: failTrunc}
+		newStageSink = func() (Sink, error) { return fs, nil }
+		defer func() { newStageSink = old }()
+		writes0 := 0
+		err := n.CommitTo(ms)
+		if err == nil {
+			t.Fatal("expected stage failure")
+		}
+		if destIsIO(n, ms) {
+			t.Fatal("adopted dest after stage failure")
+		}
+		if len(ms.Bytes()) != writes0 {
+			t.Fatal("dest mutated after stage failure")
+		}
+	}
+	for i := 1; i <= writes; i++ {
+		i := i
+		t.Run("write", func(t *testing.T) { check(t, i, 0, 0) })
+	}
+	for i := 1; i <= syncs; i++ {
+		i := i
+		t.Run("sync", func(t *testing.T) { check(t, 0, i, 0) })
+	}
+	for i := 1; i <= truncs; i++ {
+		i := i
+		t.Run("trunc", func(t *testing.T) { check(t, 0, 0, i) })
+	}
+}
+
+func TestStageCreateFailure(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("create"), false)
+	ms := NewMemSink("dst")
+	errCreate := errors.New("stage-create")
+	old := newStageSink
+	newStageSink = func() (Sink, error) { return nil, errCreate }
+	defer func() { newStageSink = old }()
+	err := n.CommitTo(ms)
+	if err == nil {
+		t.Fatal("expected stage create failure")
+	}
+	if !errors.Is(err, ErrIO) || !errors.Is(err, errCreate) {
+		t.Fatalf("missing create error: %v", err)
+	}
+	if destIsIO(n, ms) {
+		t.Fatal("adopted dest")
+	}
+}
+
+func TestStageCloseRemoveAfterDestSync(t *testing.T) {
+	n, _, _ := seedNDB(t, []byte("cleanup-stage"), false)
+	errClose := errors.New("stage-close")
+	errRemove := errors.New("stage-remove")
+	oldC := closeWork
+	closeWork = func(s Sink) error {
+		_ = s.Close()
+		return errClose
+	}
+	oldR := removeFile
+	removeFile = func(string) error { return errRemove }
+	defer func() {
+		closeWork = oldC
+		removeFile = oldR
+	}()
+	dst := NewMemSink("out")
+	err := n.CommitTo(dst)
+	if err == nil {
+		t.Fatal("expected stage cleanup error")
+	}
+	if !errors.Is(err, ErrCleanup) {
+		t.Fatalf("want cleanup: %v", err)
+	}
+	if !errors.Is(err, errClose) {
+		t.Fatalf("missing close: %v", err)
+	}
+	if !errors.Is(err, errRemove) {
+		t.Fatalf("missing remove: %v", err)
+	}
+	if !destIsIO(n, dst) {
+		t.Fatal("dest not adopted after dest sync")
+	}
+	assertNDBReadable(t, n, 0x21, "cleanup-stage")
 }

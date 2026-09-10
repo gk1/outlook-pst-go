@@ -18,11 +18,13 @@
 // covers allocator, catalog, refs, live pages, roots, and whether a work
 // spool exists; failed tree writes restore that snapshot and rewind in-place
 // work mutations from an extent undo journal (or drop work if the txn created
-// it). CommitTo renders a complete image to a fresh owned staging sink
-// (INVALID + sync, body/pages + sync, VALID + sync) and only then publishes
-// that image onto dest with the same INVALID-first protocol. Dest is never
-// the in-progress write target, so crash safety does not depend on discovering
-// arbitrary Sink identity. sameIO compares only *MemSink/*FileSink/*os.File
+// it). CommitTo renders a complete image to a fresh owned file-backed
+// staging sink (INVALID + sync, body/pages + sync, VALID + sync), installs
+// that stage as the authoritative source, then publishes onto dest with the
+// same INVALID-first protocol. A dest publish failure keeps the complete
+// stage readable and cannot destroy the only valid source through a hidden
+// alias. An opaque wrapper around an owned OpenNDBFile source does not
+// close that file on success. sameIO compares only *MemSink/*FileSink/*os.File
 // pointers and never uses interface ==. CommitFile writes a sibling
 // temp, renames, and fsyncs the parent directory. A post-rename dirsync or
 // reopen failure returns ErrAdopt, keeps the work spool as the usable

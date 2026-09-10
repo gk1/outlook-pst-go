@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -47,8 +48,9 @@ var closeWork = func(s Sink) error {
 // createCommitTemp creates the CommitFile sibling. Tests inject failures.
 var createCommitTemp = func(path string) (Sink, error) { return CreateFileSink(path) }
 
-// newStageSink is the owned CommitTo staging sink. Tests inject failures.
-var newStageSink = func() (Sink, error) { return NewMemSink("stage"), nil }
+// newStageSink is the owned CommitTo staging sink. Default is a temp file,
+// not a RAM copy of FileEOF. Tests inject failures.
+var newStageSink = createStageSink
 
 // truncWork truncates the work spool to the restored EOF. Tests inject failures.
 var truncWork = truncSink
@@ -59,6 +61,58 @@ func openCommittedFile(path string) (Sink, error) {
 		return nil, err
 	}
 	return &FileSink{f: f}, nil
+}
+
+func createStageSink() (Sink, error) {
+	f, err := createTemp("", "pst-v2-*.stage")
+	if err != nil {
+		return nil, err
+	}
+	return &FileSink{f: f}, nil
+}
+
+func stageLife(s Sink) srcLife {
+	if _, ok := s.(*FileSink); ok {
+		return lifeTemp
+	}
+	return lifeClose
+}
+
+func discardStage(stage Sink) error {
+	if stage == nil {
+		return nil
+	}
+	err := closeSink(stage)
+	if _, ok := stage.(*FileSink); ok {
+		if name := stage.Name(); name != "" {
+			if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
+				err = errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
+			}
+		}
+	}
+	return err
+}
+
+func knownCore(v any) bool {
+	switch x := v.(type) {
+	case *MemSink:
+		return x != nil
+	case *FileSink:
+		return x != nil
+	case *os.File:
+		return x != nil
+	}
+	return false
+}
+
+func mayAlias(dst, src any) bool {
+	if dst == nil || src == nil {
+		return false
+	}
+	if sameIO(dst, src) {
+		return true
+	}
+	return !knownCore(dst)
 }
 
 func truncSink(w Sink, eof int64) error {
@@ -145,17 +199,6 @@ func (s *Store) setWriter(w Sink) {
 	if w != nil {
 		s.work.r = w
 	}
-}
-
-// UnwrapSink is an optional wrapper hint. CommitTo does not use it for
-// identity: dest is never the in-progress write target.
-type UnwrapSink interface {
-	UnwrapSink() Sink
-}
-
-// UnwrapReaderAt is an optional ReaderAt wrapper hint.
-type UnwrapReaderAt interface {
-	UnwrapReaderAt() io.ReaderAt
 }
 
 // sameIO reports whether a and b are the same *MemSink, *FileSink, or
@@ -355,7 +398,7 @@ func cleanupErr(err error) *Error {
 		Code:   CodeCleanup,
 		Field:  "cleanup",
 		Detail: err.Error(),
-		Err:    ErrCleanup,
+		Err:    fmt.Errorf("%w: %w", ErrCleanup, err),
 	}
 }
 
@@ -392,6 +435,29 @@ func (n *NDB) rejectInPlace(dst Sink) error {
 	if n.store.work != nil && sameIO(dst, n.store.work.w) {
 		return unsupported(FeatureInPlaceMutation, "CommitTo destination is the work spool; use CommitFile")
 	}
+	return nil
+}
+
+func (s *Store) writeTwoPhase(dst Sink, body func() error) error {
+	if err := s.writeHeader(dst, AMapInvalid); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
+	if err := body(); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
+	if err := s.writeHeader(dst, AMapValid2); err != nil {
+		return err
+	}
+	if err := syncSink(dst); err != nil {
+		return err
+	}
+	s.valid = AMapValid2
 	return nil
 }
 
@@ -455,32 +521,43 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 		n.store.unique = 1
 	}
 	// MS-PST 2.6.1.3.7: INVALID + sync, body/pages + sync, VALID + sync.
-	// A crash cannot expose mixed bytes under a VALID header.
-	if err := n.store.writeHeader(dst, AMapInvalid); err != nil {
-		return err
+	return n.store.writeTwoPhase(dst, func() error {
+		if err := n.store.writeBody(dst); err != nil {
+			return err
+		}
+		for ib, raw := range img.Pages {
+			if err := writeAtFull(dst, raw, int64(ib)); err != nil {
+				return ioErr("page", "write at 0x%x: %v", ib, err)
+			}
+		}
+		return nil
+	})
+}
+
+func (n *NDB) adoptPublished(dst Sink, oldWork, oldIO *ioHandle) error {
+	stage := n.store.io
+	n.store.io = &ioHandle{r: dst, w: dst, life: lifeBorrowed}
+	n.pendingPath = ""
+	var err error
+	if stage != nil {
+		err = stage.close()
 	}
-	if err := syncSink(dst); err != nil {
-		return err
+	if oldWork != nil {
+		err = errorsJoin(err, oldWork.close())
 	}
-	if err := n.store.writeBody(dst); err != nil {
-		return err
-	}
-	for ib, raw := range img.Pages {
-		if err := writeAtFull(dst, raw, int64(ib)); err != nil {
-			return ioErr("page", "write at 0x%x: %v", ib, err)
+	if oldIO != nil {
+		if mayAlias(dst, oldIO.w) || mayAlias(dst, oldIO.r) {
+			if n.store.hold != nil && n.store.hold != oldIO {
+				err = errorsJoin(err, n.store.hold.close())
+			}
+			n.store.hold = oldIO
+		} else {
+			err = errorsJoin(err, oldIO.close())
 		}
 	}
-	// Body/pages must be durable before VALID reaches storage (MS-PST 2.6.1.3.7).
-	if err := syncSink(dst); err != nil {
-		return err
+	if err != nil {
+		return cleanupErr(err)
 	}
-	if err := n.store.writeHeader(dst, AMapValid2); err != nil {
-		return err
-	}
-	if err := syncSink(dst); err != nil {
-		return err
-	}
-	n.store.valid = AMapValid2
 	return nil
 }
 

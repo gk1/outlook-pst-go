@@ -617,21 +617,41 @@ func (n *NDB) CommitTo(dst Sink) error {
 	if err != nil {
 		return ioErr("sink", "stage: %v", err)
 	}
-	defer func() { _ = closeSink(stage) }()
 	snap := n.capture()
 	n.beginTxn(snap)
 	defer n.store.endUndo()
 	img, err := n.Encode()
 	if err != nil {
+		_ = discardStage(stage)
 		return n.abortTxn(snap, err)
 	}
 	if err := n.writeCommit(stage, img); err != nil {
+		_ = discardStage(stage)
 		return n.abortTxn(snap, err)
 	}
+	// Stage is a complete VALID image. Install it as the authoritative
+	// source before any dest write so a hidden alias of the previous source
+	// cannot destroy the only readable copy.
+	oldWork := n.store.work
+	oldIO := n.store.io
+	n.store.work = nil
+	n.store.io = &ioHandle{r: stage, w: stage, life: stageLife(stage)}
+	n.pendingPath = ""
 	if err := n.store.publishSink(dst, stage); err != nil {
-		return n.abortTxn(snap, err)
+		var cl error
+		if oldWork != nil {
+			cl = oldWork.close()
+		}
+		if oldIO != nil {
+			if mayAlias(dst, oldIO.w) || mayAlias(dst, oldIO.r) {
+				n.store.hold = oldIO
+			} else {
+				cl = errorsJoin(cl, oldIO.close())
+			}
+		}
+		return rollbackErr(err, cl)
 	}
-	return n.adopt(dst, lifeBorrowed)
+	return n.adoptPublished(dst, oldWork, oldIO)
 }
 
 // PendingPath is a CommitFile path that is durable on disk but not yet
