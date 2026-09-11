@@ -63,7 +63,7 @@ func openCommittedFile(path string) (Sink, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FileSink{f: f}, nil
+	return newOwnedFile(f, ownedFileOwn(path)), nil
 }
 
 func createStageSink() (Sink, error) {
@@ -71,26 +71,18 @@ func createStageSink() (Sink, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FileSink{f: f}, nil
-}
-
-func stageLife(s Sink) srcLife {
-	if _, ok := s.(*FileSink); ok {
-		return lifeTemp
-	}
-	return lifeClose
+	return newOwnedFile(f, tempFileOwn(f.Name())), nil
 }
 
 func discardStage(stage Sink) error {
 	if stage == nil {
 		return nil
 	}
-	name := stage.Name()
+	own := ownershipOf(stage)
 	err := closeSink(stage)
-	// File-backed stages use an absolute path. MemSink labels are not paths.
-	if filepath.IsAbs(name) {
-		if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
-			err = errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
+	if own.Remove && own.Path != "" {
+		if rerr := removeFile(own.Path); rerr != nil && !os.IsNotExist(rerr) {
+			err = errorsJoin(err, ioErr("spool", "remove %s: %v", own.Path, rerr))
 		}
 	}
 	return err
@@ -180,27 +172,28 @@ func writeAtFull(w io.WriterAt, p []byte, off int64) error {
 // Borrowed handles are never closed. Owned files are closed. Owned temp
 // spools are closed and removed.
 type ioHandle struct {
-	r    io.ReaderAt
-	w    Sink
-	life srcLife
+	r      io.ReaderAt
+	w      Sink
+	life   srcLife
+	remove bool
+	path   string
 }
 
 func (h *ioHandle) close() error {
 	if h == nil || h.life == lifeBorrowed || h.w == nil {
 		return nil
 	}
-	name := ""
-	if h.life == lifeTemp {
-		name = h.w.Name()
-	}
+	path := h.path
+	remove := h.remove
 	err := closeWork(h.w)
-	life := h.life
 	h.r = nil
 	h.w = nil
 	h.life = lifeBorrowed
-	if life == lifeTemp && name != "" {
-		if rerr := removeFile(name); rerr != nil && !os.IsNotExist(rerr) {
-			return errorsJoin(err, ioErr("spool", "remove %s: %v", name, rerr))
+	h.remove = false
+	h.path = ""
+	if remove && path != "" {
+		if rerr := removeFile(path); rerr != nil && !os.IsNotExist(rerr) {
+			return errorsJoin(err, ioErr("spool", "remove %s: %v", path, rerr))
 		}
 	}
 	return err
@@ -228,7 +221,7 @@ func (s *Store) writer() Sink {
 
 func (s *Store) setWriter(w Sink) {
 	if s.work == nil {
-		s.work = &ioHandle{life: lifeTemp}
+		s.work = &ioHandle{life: lifeTemp, remove: true}
 	}
 	s.work.w = w
 	if w != nil {
@@ -288,28 +281,14 @@ func (s *Store) publishSink(dst, stage Sink) error {
 	return nil
 }
 
-// snapshot is the one transaction boundary. Field names for Store/NDB value
-// state match the live structs so TestSnapshotCoversMutableFields can catch
-// omissions. io/work handles are represented by hadWork. In-place work
-// mutations are reverted from Store.undo (extent journal), not a FileEOF copy.
+// snapshot is the one transaction boundary. Store/NDB mutable value-state is
+// cloneable storeState/catalogState. io/work/hold/undo stay outside; hadWork
+// records whether a work spool existed. In-place work mutations are reverted
+// from Store.undo (extent journal), not a FileEOF copy.
 type snapshot struct {
-	regions       []region
-	lastAllocAMap uint32
-	valid         byte
-	unique        uint32
-	bidNextP      uint64
-	bidNextB      uint64
-	dlistBID      uint64
-	nbtRoot       BREF
-	bbtRoot       BREF
-	ids           SequentialIDs
-	nodes         map[uint64]NBTEntry
-	blocks        map[uint64]BBTEntry
-	dataTreeRefs  map[uint64]int
-	subnodeRefs   map[uint64]int
-	opaqueRefs    map[uint64]int
-	livePages     []uint64
-	hadWork       bool
+	store   storeState
+	catalog catalogState
+	hadWork bool
 }
 
 func cloneRegions(in []region) []region {
@@ -343,56 +322,19 @@ func (n *NDB) capture() *snapshot {
 		return &snapshot{}
 	}
 	s := n.store
-	snap := &snapshot{
-		regions:       cloneRegions(s.regions),
-		lastAllocAMap: s.lastAllocAMap,
-		valid:         s.valid,
-		unique:        s.unique,
-		bidNextP:      s.bidNextP,
-		bidNextB:      s.bidNextB,
-		dlistBID:      s.dlistBID,
-		nbtRoot:       s.nbtRoot,
-		bbtRoot:       s.bbtRoot,
-		nodes:         cloneMap(n.nodes),
-		blocks:        cloneMap(n.blocks),
-		dataTreeRefs:  cloneMap(n.dataTreeRefs),
-		subnodeRefs:   cloneMap(n.subnodeRefs),
-		opaqueRefs:    cloneMap(n.opaqueRefs),
-		livePages:     cloneU64(n.livePages),
+	return &snapshot{
+		store:   s.storeState.clone(),
+		catalog: n.catalogSnapshot(),
+		hadWork: s.work != nil && s.work.w != nil,
 	}
-	if n.ids != nil {
-		snap.ids = *n.ids
-	}
-	snap.hadWork = s.work != nil && s.work.w != nil
-	return snap
 }
 
 func (n *NDB) restore(snap *snapshot) error {
 	if n == nil || n.store == nil || snap == nil {
 		return nil
 	}
-	s := n.store
-	s.regions = cloneRegions(snap.regions)
-	s.lastAllocAMap = snap.lastAllocAMap
-	s.valid = snap.valid
-	s.unique = snap.unique
-	s.bidNextP = snap.bidNextP
-	s.bidNextB = snap.bidNextB
-	s.dlistBID = snap.dlistBID
-	s.nbtRoot = snap.nbtRoot
-	s.bbtRoot = snap.bbtRoot
-	if n.ids != nil {
-		*n.ids = snap.ids
-	} else {
-		ids := snap.ids
-		n.ids = &ids
-	}
-	n.nodes = cloneMap(snap.nodes)
-	n.blocks = cloneMap(snap.blocks)
-	n.dataTreeRefs = cloneMap(snap.dataTreeRefs)
-	n.subnodeRefs = cloneMap(snap.subnodeRefs)
-	n.opaqueRefs = cloneMap(snap.opaqueRefs)
-	n.livePages = cloneU64(snap.livePages)
+	n.store.storeState = snap.store.clone()
+	n.applyCatalog(snap.catalog)
 	return n.restoreSource(snap)
 }
 
@@ -571,7 +513,7 @@ func (n *NDB) writeCommit(dst Sink, img *TreeImage) error {
 
 func (n *NDB) adoptPublished(dst Sink, oldWork, oldIO *ioHandle) error {
 	stage := n.store.io
-	n.store.io = &ioHandle{r: dst, w: dst, life: lifeBorrowed}
+	n.store.io = borrowedHandle(dst)
 	n.pendingPath = ""
 	var err error
 	if stage != nil {
@@ -611,7 +553,7 @@ func (n *NDB) adopt(dst Sink, life srcLife) error {
 	oldWork := n.store.work
 	oldIO := n.store.io
 	n.store.work = nil
-	n.store.io = &ioHandle{r: dst, w: dst, life: life}
+	n.store.io = ownedHandle(dst, life)
 	n.pendingPath = ""
 	var err error
 	if oldWork != nil {

@@ -313,32 +313,47 @@ func TestSnapshotRestoresCompleteCatalog(t *testing.T) {
 }
 
 func TestSnapshotCoversMutableFields(t *testing.T) {
-	snap := reflect.TypeOf(snapshot{})
-	names := make(map[string]bool, snap.NumField())
-	for i := 0; i < snap.NumField(); i++ {
-		names[snap.Field(i).Name] = true
-	}
 	skipStore := map[string]bool{"io": true, "work": true, "hold": true, "undo": true}
 	st := reflect.TypeOf(Store{})
+	ss := reflect.TypeOf(storeState{})
+	ssNames := map[string]bool{}
+	for i := 0; i < ss.NumField(); i++ {
+		ssNames[ss.Field(i).Name] = true
+	}
 	for i := 0; i < st.NumField(); i++ {
 		f := st.Field(i)
+		if f.Anonymous && f.Type == ss {
+			continue
+		}
 		if skipStore[f.Name] {
 			continue
 		}
-		if !names[f.Name] {
-			t.Errorf("Store.%s missing from snapshot", f.Name)
+		t.Errorf("Store.%s is not in storeState and is not an ownership handle", f.Name)
+	}
+	for name := range ssNames {
+		if _, ok := st.FieldByName(name); !ok {
+			t.Errorf("storeState.%s not promoted on Store", name)
 		}
 	}
 	skipNDB := map[string]bool{"store": true, "pendingPath": true}
+	cs := reflect.TypeOf(catalogState{})
+	csNames := map[string]bool{}
+	for i := 0; i < cs.NumField(); i++ {
+		csNames[cs.Field(i).Name] = true
+	}
 	nd := reflect.TypeOf(NDB{})
 	for i := 0; i < nd.NumField(); i++ {
 		f := nd.Field(i)
 		if skipNDB[f.Name] {
 			continue
 		}
-		if !names[f.Name] {
-			t.Errorf("NDB.%s missing from snapshot", f.Name)
+		if !csNames[f.Name] {
+			t.Errorf("NDB.%s missing from catalogState", f.Name)
 		}
+	}
+	snap := reflect.TypeOf(snapshot{})
+	if snap.NumField() != 3 {
+		t.Fatalf("snapshot fields %d want store/catalog/hadWork", snap.NumField())
 	}
 }
 
@@ -1709,14 +1724,14 @@ func TestRunTxnShortWriteRestoresState(t *testing.T) {
 	if n.store.FileEOF() != eof {
 		t.Fatalf("EOF %d want %d", n.store.FileEOF(), eof)
 	}
-	if n.store.lastAllocAMap != before.lastAllocAMap {
-		t.Fatalf("lastAllocAMap %d want %d", n.store.lastAllocAMap, before.lastAllocAMap)
+	if n.store.lastAllocAMap != before.store.lastAllocAMap {
+		t.Fatalf("lastAllocAMap %d want %d", n.store.lastAllocAMap, before.store.lastAllocAMap)
 	}
-	if n.store.unique != before.unique {
-		t.Fatalf("unique %d want %d", n.store.unique, before.unique)
+	if n.store.unique != before.store.unique {
+		t.Fatalf("unique %d want %d", n.store.unique, before.store.unique)
 	}
-	if n.store.bidNextP != before.bidNextP || n.store.bidNextB != before.bidNextB {
-		t.Fatalf("counters p=%d/%d b=%d/%d", n.store.bidNextP, before.bidNextP, n.store.bidNextB, before.bidNextB)
+	if n.store.bidNextP != before.store.bidNextP || n.store.bidNextB != before.store.bidNextB {
+		t.Fatalf("counters p=%d/%d b=%d/%d", n.store.bidNextP, before.store.bidNextP, n.store.bidNextB, before.store.bidNextB)
 	}
 	got, ok := n.LookupNode(0x61)
 	if !ok || got.DataBID != keep.BID {
@@ -1725,10 +1740,10 @@ func TestRunTxnShortWriteRestoresState(t *testing.T) {
 	if !bytes.Equal(payload(root.BID), origRoot) || !bytes.Equal(payload(keep.BID), origKeep) {
 		t.Fatal("payloads not restored")
 	}
-	if !reflect.DeepEqual(n.dataTreeRefs, before.dataTreeRefs) || !reflect.DeepEqual(n.subnodeRefs, before.subnodeRefs) || !reflect.DeepEqual(n.opaqueRefs, before.opaqueRefs) {
+	if !reflect.DeepEqual(n.dataTreeRefs, before.catalog.dataTreeRefs) || !reflect.DeepEqual(n.subnodeRefs, before.catalog.subnodeRefs) || !reflect.DeepEqual(n.opaqueRefs, before.catalog.opaqueRefs) {
 		t.Fatal("refs not restored")
 	}
-	if !n.store.BitmapEqual(&Store{regions: before.regions}) {
+	if !n.store.BitmapEqual(&Store{storeState: storeState{regions: before.store.regions}}) {
 		t.Fatal("allocation map not restored")
 	}
 }

@@ -97,6 +97,13 @@ func (h *Heap) SetRoot(hid uint32) { h.root = hid }
 
 func (h *Heap) Root() uint32 { return h.root }
 
+func (h *Heap) newSub(data []byte) uint32 {
+	nid := MakeNID(NIDTypeLTP, h.nextSub)
+	h.nextSub++
+	h.subs = append(h.subs, heapSub{nid: nid, data: append([]byte(nil), data...)})
+	return nid
+}
+
 func (h *Heap) fits(i int, size int) bool {
 	nAlloc := len(h.pages[i].allocs)
 	if nAlloc >= HNMaxAllocsPerPage {
@@ -117,10 +124,7 @@ func (h *Heap) Allocate(data []byte) (uint32, error) {
 		return 0, invalidArg("heap", "nil heap")
 	}
 	if len(data) > HeapMaxAlloc {
-		nid := MakeNID(NIDTypeLTP, h.nextSub)
-		h.nextSub++
-		h.subs = append(h.subs, heapSub{nid: nid, data: append([]byte(nil), data...)})
-		return nid, nil
+		return h.newSub(data), nil
 	}
 	if len(h.pages) == 0 {
 		h.pages = append(h.pages, hnPage{})

@@ -281,14 +281,17 @@ func (m *MemSink) Sync() error  { return nil }
 func (m *MemSink) Close() error { return nil }
 
 // FileSink wraps an os.File.
-type FileSink struct{ f *os.File }
+type FileSink struct {
+	f   *os.File
+	own sinkOwn
+}
 
 func CreateFileSink(path string) (*FileSink, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
 	}
-	return &FileSink{f: f}, nil
+	return newOwnedFile(f, ownedFileOwn(path)), nil
 }
 
 func (s *FileSink) Write(p []byte) (int, error)                  { return s.f.Write(p) }

@@ -28,6 +28,8 @@ const (
 	SectionSLBlock      = "2.2.2.8.3.3.1"
 	SectionSIBlock      = "2.2.2.8.3.3.2"
 	SectionHN           = "2.3.1"
+	SectionBTH          = "2.3.2"
+	SectionPC           = "2.3.3"
 	SectionTCINFO       = "2.3.4.1"
 	SectionTCOLDESC     = "2.3.4.2"
 	SectionRowMatrix    = "2.3.4.4"
@@ -111,7 +113,27 @@ const (
 	HNFillEmpty                  = 3584
 	HNFillLevel1                 = 2560
 	HNFillLevel2                 = 2048
+	PtypInteger16                = 0x0002
 	PtypInteger32                = 0x0003
+	PtypFloating32               = 0x0004
+	PtypFloating64               = 0x0005
+	PtypCurrency                 = 0x0006
+	PtypError                    = 0x000A
+	PtypBoolean                  = 0x000B
+	PtypObject                   = 0x000D
+	PtypInteger64                = 0x0014
+	PtypString8                  = 0x001E
+	PtypString                   = 0x001F
+	PtypTime                     = 0x0040
+	PtypGUID                     = 0x0048
+	PtypBinary                   = 0x0102
+	PtypMVInteger16              = 0x1002
+	PtypMVInteger32              = 0x1003
+	PtypMVInteger64              = 0x1014
+	PtypMVString                 = 0x101F
+	PtypMVBinary                 = 0x1102
+	BTHHeaderSize                = 8
+	PCLeafValueSize              = 6   // wPropType + dwValueHnid (MS-PST 2.3.3.3)
 	MaxTCColumns                 = 255 // TCINFO.cCols is a BYTE (MS-PST 2.3.4.1)
 
 	UnicodeBTEntriesBytes = 488 // rgentries before cEnt (MS-PST 2.2.2.7.7.1)

@@ -40,6 +40,12 @@
 // 1..2047 per page; a new page is started before hidIndex or hidBlockIndex
 // overflow), and oversized values as HNID subnodes. Data-tree validation, reconstruction, flattening,
 // and lazy readback share one bounded XX->X->data walker.
+// PST-009 is BTH-on-HN plus Property Context: unique sorted keys, multi-level
+// index nodes, PC scalars/string/binary/MV/object, HID vs HNID-subnode
+// placement, unknown properties preserved on Load+Set. Transaction snapshots
+// clone storeState/catalogState. Stage/work/hold/adopt share one ioHandle
+// ownership boundary; cleanup uses explicit sinkOwn metadata, never Name()
+// path shape.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //

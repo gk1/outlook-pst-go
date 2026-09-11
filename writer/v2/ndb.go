@@ -633,7 +633,7 @@ func (n *NDB) CommitTo(dst Sink) error {
 	oldWork := n.store.work
 	oldIO := n.store.io
 	n.store.work = nil
-	n.store.io = &ioHandle{r: stage, w: stage, life: stageLife(stage)}
+	n.store.io = newHandle(stage)
 	n.pendingPath = ""
 	if err := n.store.publishSink(dst, stage); err != nil {
 		var cl error
@@ -1087,7 +1087,7 @@ func OpenNDBFile(path string) (*NDB, error) {
 		_ = f.Close()
 		return nil, ioErr("file", "stat %s: %v", path, err)
 	}
-	n, err := OpenNDBFrom(&FileSink{f: f}, st.Size())
+	n, err := OpenNDBFrom(newOwnedFile(f, ownedFileOwn(path)), st.Size())
 	if err != nil {
 		_ = f.Close()
 		return nil, err

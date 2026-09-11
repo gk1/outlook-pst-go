@@ -11,19 +11,11 @@ import (
 // Growth is in whole AMap regions with periodic PMap/FMap/FPMap pages.
 // See MS-PST 2.2.2.7.2 and 2.6.1.1.2.
 type Store struct {
-	regions       []region
-	lastAllocAMap uint32
-	valid         byte
-	unique        uint32
-	bidNextP      uint64
-	bidNextB      uint64
-	dlistBID      uint64
-	nbtRoot       BREF
-	bbtRoot       BREF
-	io            *ioHandle // last committed source
-	work          *ioHandle // uncommitted writable spool
-	hold          *ioHandle // at most one owned OpenNDBFile dest may alias; closed on Close
-	undo          *undoLog  // extent journal for the active transaction
+	storeState
+	io   *ioHandle // last committed source
+	work *ioHandle // uncommitted writable spool
+	hold *ioHandle // at most one owned OpenNDBFile dest may alias; closed on Close
+	undo *undoLog  // extent journal for the active transaction
 }
 
 // srcLife is who may Close/remove the writable handle.
@@ -43,7 +35,7 @@ type region struct {
 // PMap at 0x4600, and a DList at 0x4200. Header/DList live in the unmapped
 // prefix before 0x4400.
 func NewStore() *Store {
-	s := &Store{valid: AMapValid2, unique: 1, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}
+	s := &Store{storeState: storeState{valid: AMapValid2, unique: 1, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}}
 	s.dlistBID = s.takePageBID()
 	s.mustGrow()
 	return s
@@ -756,7 +748,7 @@ func (s *Store) ensureSpool() error {
 	if err != nil {
 		return ioErr("spool", "create: %v", err)
 	}
-	sk := &FileSink{f: f}
+	sk := newOwnedFile(f, tempFileOwn(f.Name()))
 	var src io.ReaderAt
 	if s.io != nil {
 		src = s.io.r
@@ -768,7 +760,7 @@ func (s *Store) ensureSpool() error {
 			return ioErr("spool", "seed: %v", err)
 		}
 	}
-	s.work = &ioHandle{r: sk, w: sk, life: lifeTemp}
+	s.work = newHandle(sk)
 	return nil
 }
 
@@ -791,15 +783,12 @@ func (s *Store) closeOwned() error {
 func (s *Store) ownClose() {
 	if s.io != nil && s.io.w != nil {
 		s.io.life = lifeClose
+		s.io.remove = false
 	}
 }
 
 func (s *Store) attachSource(r io.ReaderAt) {
-	h := &ioHandle{r: r, life: lifeBorrowed}
-	if sk, ok := r.(Sink); ok {
-		h.w = sk
-	}
-	s.io = h
+	s.io = newHandleReader(r, lifeBorrowed)
 }
 
 func (s *Store) undoRangeFree(ib, size uint64) bool {
@@ -1132,7 +1121,7 @@ func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
 	if h.BidNextB < FirstAllocBID || h.BidNextB&3 != 0 {
 		return nil, invariant(SectionBID, "bidNextB", "got %d, want >= %d and 4-aligned (MS-PST %s)", h.BidNextB, FirstAllocBID, SectionBID)
 	}
-	s := &Store{
+	s := &Store{storeState: storeState{
 		valid:         h.Root.AMapValid,
 		lastAllocAMap: dl.Current,
 		bidNextP:      h.BidNextP,
@@ -1141,7 +1130,7 @@ func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
 		unique:        h.Unique,
 		nbtRoot:       BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
 		bbtRoot:       BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
-	}
+	}}
 	s.regions = make([]region, last+1)
 	for i := uint64(0); i <= last; i++ {
 		off := AMapOffset(i)
