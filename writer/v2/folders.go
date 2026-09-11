@@ -241,6 +241,18 @@ func (t *FolderTree) rowState(nid uint32) (minFolder, error) {
 	if err != nil {
 		return minFolder{}, err
 	}
+	eid, err := v.GetBinary(PidTagEntryId)
+	if err != nil {
+		return minFolder{}, err
+	}
+	created, err := v.GetTime(PidTagCreationTime)
+	if err != nil {
+		return minFolder{}, err
+	}
+	modified, err := v.GetTime(PidTagLastModificationTime)
+	if err != nil {
+		return minFolder{}, err
+	}
 	return minFolder{
 		nid:        nid,
 		parent:     t.parentOf(nid),
@@ -248,6 +260,9 @@ func (t *FolderTree) rowState(nid uint32) (minFolder, error) {
 		content:    content,
 		unread:     unread,
 		subfolders: hv.RowCount() > 0,
+		eid:        eid,
+		created:    created,
+		modified:   modified,
 	}, nil
 }
 
@@ -259,6 +274,19 @@ func (t *FolderTree) upsertChildRow(parent, child uint32) error {
 	return t.patchTC(RelatedNID(parent, NIDTypeHierarchyTable), func(tc *TC) error {
 		return writeHierarchyRow(tc, st)
 	})
+}
+
+// mutatePC updates a folder PC then rewrites its parent hierarchy row from
+// that PC so EntryID, timestamps, name, and counts stay in lockstep.
+func (t *FolderTree) mutatePC(nid uint32, fn func(*PC) error) error {
+	if err := t.patchPC(nid, fn); err != nil {
+		return err
+	}
+	parent := t.parentOf(nid)
+	if parent == 0 {
+		return nil
+	}
+	return t.upsertChildRow(parent, nid)
 }
 
 func (t *FolderTree) removeChildRow(parent, child uint32) error {
@@ -368,15 +396,12 @@ func (t *FolderTree) renameLocked(nid uint32, name string) error {
 	if err := t.collision(parent, name, nid); err != nil {
 		return err
 	}
-	if err := t.patchPC(nid, func(p *PC) error {
+	return t.mutatePC(nid, func(p *PC) error {
 		if err := p.SetString(PidTagDisplayName, name); err != nil {
 			return err
 		}
 		return p.SetTime(PidTagLastModificationTime, filetimeOf(t.now))
-	}); err != nil {
-		return err
-	}
-	return t.upsertChildRow(parent, nid)
+	})
 }
 
 // Move reparents a folder, updating both hierarchy tables and subfolder flags.
@@ -420,7 +445,9 @@ func (t *FolderTree) moveLocked(nid, newParent uint32) error {
 	if err := t.n.SetParent(nid, newParent); err != nil {
 		return err
 	}
-	if err := t.upsertChildRow(newParent, nid); err != nil {
+	if err := t.mutatePC(nid, func(p *PC) error {
+		return p.SetTime(PidTagLastModificationTime, filetimeOf(t.now))
+	}); err != nil {
 		return err
 	}
 	if err := t.syncFlags(oldParent); err != nil {

@@ -1,10 +1,15 @@
 package writer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -535,5 +540,249 @@ func TestExporterDeleteAndMovePlan(t *testing.T) {
 	}
 	if err := exp.DeleteFolder(IPMSubtreeRef); !errors.Is(err, ErrInvalidArg) {
 		t.Fatalf("delete IPM: %v", err)
+	}
+}
+
+func assertHierarchyMirrorsPC(t *testing.T, n *NDB, parent, child uint32) {
+	t.Helper()
+	pc, err := OpenPC(n, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eid, err := pc.GetBinary(PidTagEntryId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := pc.GetTime(PidTagCreationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod, err := pc.GetTime(PidTagLastModificationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, err := pc.GetString(PidTagDisplayName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hv, err := OpenTC(n, RelatedNID(parent, NIDTypeHierarchyTable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rowEID, err := hv.GetBinary(child, PidTagEntryId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(eid, rowEID) {
+		t.Fatalf("hierarchy EntryID %x want %x", rowEID, eid)
+	}
+	rowCreated, err := hv.GetTime(child, PidTagCreationTime)
+	if err != nil || rowCreated != created {
+		t.Fatalf("hierarchy creation %d want %d %v", rowCreated, created, err)
+	}
+	rowMod, err := hv.GetTime(child, PidTagLastModificationTime)
+	if err != nil || rowMod != mod {
+		t.Fatalf("hierarchy modified %d want %d %v", rowMod, mod, err)
+	}
+	rowName, err := hv.GetString(child, PidTagDisplayName)
+	if err != nil || rowName != name {
+		t.Fatalf("hierarchy name %q want %q %v", rowName, name, err)
+	}
+}
+
+func collectWriterPaths(t *testing.T, n *NDB) []string {
+	t.Helper()
+	var out []string
+	var walk func(uint32, string)
+	walk = func(nid uint32, prefix string) {
+		hv, err := OpenTC(n, RelatedNID(nid, NIDTypeHierarchyTable))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids, err := hv.RowIDs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids {
+			name, err := hv.GetString(id, PidTagDisplayName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := name
+			if prefix != "" {
+				path = prefix + "/" + name
+			}
+			out = append(out, path)
+			walk(id, path)
+		}
+	}
+	walk(NIDRootFolder, "")
+	sort.Strings(out)
+	return out
+}
+
+func collectReaderPaths(t *testing.T, path string) []string {
+	t.Helper()
+	p, err := outlookpst.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	root, err := p.RootFolder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	var walk func(f *outlookpst.Folder, prefix string)
+	walk = func(f *outlookpst.Folder, prefix string) {
+		for child, err := range f.Subfolders() {
+			if err != nil {
+				t.Fatal(err)
+			}
+			name, err := child.Name()
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := name
+			if prefix != "" {
+				path = prefix + "/" + name
+			}
+			out = append(out, path)
+			walk(child, path)
+		}
+	}
+	walk(root, "")
+	sort.Strings(out)
+	return out
+}
+
+func TestHierarchyRowMirrorsPCEntryIDAndTimestamps(t *testing.T) {
+	n, tree, _ := blankTree(t)
+	assertHierarchyMirrorsPC(t, n, NIDRootFolder, tree.IPM())
+	assertHierarchyMirrorsPC(t, n, NIDRootFolder, tree.Waste())
+	assertHierarchyMirrorsPC(t, n, NIDRootFolder, tree.Finder())
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertHierarchyMirrorsPC(t, n, tree.IPM(), inbox)
+	if err := tree.Rename(inbox, "Primary"); err != nil {
+		t.Fatal(err)
+	}
+	assertHierarchyMirrorsPC(t, n, tree.IPM(), inbox)
+}
+
+func TestMoveUpdatesFolderPCModtimeAndHierarchyRow(t *testing.T) {
+	specNow := time.Unix(1_700_000_000, 0).UTC()
+	later := specNow.Add(time.Hour)
+	n, tree, _ := blankTree(t)
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, err := tree.Create(tree.IPM(), "Archive")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pcBefore, err := OpenPC(n, inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := pcBefore.GetTime(PidTagCreationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modBefore, err := pcBefore.GetTime(PidTagLastModificationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eidBefore, err := pcBefore.GetBinary(PidTagEntryId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mover, err := OpenFolderTree(n, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mover.Move(inbox, archive); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := OpenPC(n, inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod, err := pc.GetTime(PidTagLastModificationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filetimeOf(later)
+	if mod != want {
+		t.Fatalf("moved PC modified %d want %d (before %d)", mod, want, modBefore)
+	}
+	stillCreated, err := pc.GetTime(PidTagCreationTime)
+	if err != nil || stillCreated != created {
+		t.Fatalf("creation time mutated")
+	}
+	eid, err := pc.GetBinary(PidTagEntryId)
+	if err != nil || !bytes.Equal(eid, eidBefore) {
+		t.Fatal("EntryID changed on move")
+	}
+	assertHierarchyMirrorsPC(t, n, archive, inbox)
+	old, err := OpenTC(n, RelatedNID(tree.IPM(), NIDTypeHierarchyTable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.GetString(inbox, PidTagDisplayName); err == nil {
+		t.Fatal("old parent still has moved folder row")
+	}
+}
+
+func TestWriterAndReaderEnumerateSameTree(t *testing.T) {
+	n, tree, path := blankTree(t)
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projects, err := tree.Create(inbox, "Projects")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tree.Create(projects, "Alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tree.Create(projects, "Beta"); err != nil {
+		t.Fatal(err)
+	}
+	commitTree(t, n, path)
+	writer := collectWriterPaths(t, n)
+	reader := collectReaderPaths(t, path)
+	if !reflect.DeepEqual(writer, reader) {
+		t.Fatalf("writer %v\nreader %v", writer, reader)
+	}
+	want := []string{
+		"Deleted Items",
+		"Min Store",
+		"Min Store/Inbox",
+		"Min Store/Inbox/Projects",
+		"Min Store/Inbox/Projects/Alpha",
+		"Min Store/Inbox/Projects/Beta",
+		"Search Root",
+	}
+	if !reflect.DeepEqual(writer, want) {
+		t.Fatalf("tree %v want %v", writer, want)
+	}
+	if bin, err := exec.LookPath("pffinfo"); err == nil {
+		out, err := exec.Command(bin, path).CombinedOutput()
+		if err != nil {
+			t.Fatalf("pffinfo: %v %s", err, out)
+		}
+		text := string(out)
+		for _, name := range []string{"Inbox", "Projects", "Alpha", "Beta", "Deleted Items", "Search Root"} {
+			if !strings.Contains(text, name) {
+				t.Fatalf("pffinfo missing %q:\n%s", name, text)
+			}
+		}
+	} else {
+		t.Log("pffinfo not on PATH; writer vs self-reader comparison is the always-on gate")
 	}
 }

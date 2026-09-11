@@ -223,6 +223,12 @@ func (t *TC) SetBinary(rowID uint32, id uint16, b []byte) error {
 	return t.Set(rowID, id, b)
 }
 
+func (t *TC) SetTime(rowID uint32, id uint16, filetime uint64) error {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, filetime)
+	return t.Set(rowID, id, buf)
+}
+
 func (t *TC) place(typ uint16, data []byte) (uint32, error) {
 	if typ == PtypObject {
 		return t.heap.newSub(data), nil
@@ -562,6 +568,28 @@ func (v *TCView) GetBool(rowID uint32, id uint16) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func (v *TCView) GetBinary(rowID uint32, id uint16) ([]byte, error) {
+	typ, data, err := v.Get(rowID, id)
+	if err != nil {
+		return nil, err
+	}
+	if typ != PtypBinary {
+		return nil, invalidArg("wPropType", "0x%04x is not PtypBinary", typ)
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (v *TCView) GetTime(rowID uint32, id uint16) (uint64, error) {
+	typ, data, err := v.Get(rowID, id)
+	if err != nil {
+		return 0, err
+	}
+	if typ != PtypTime || len(data) < 8 {
+		return 0, invalidArg("wPropType", "0x%04x is not PtypTime", typ)
+	}
+	return binary.LittleEndian.Uint64(data), nil
 }
 
 func (v *TCView) Load() (*TC, error) {

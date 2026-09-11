@@ -43,6 +43,9 @@ func hierarchyColumns() []ColumnView {
 		{PropType: PtypInteger32, PropID: PidTagContentCount},
 		{PropType: PtypInteger32, PropID: PidTagContentUnreadCount},
 		{PropType: PtypBoolean, PropID: PidTagSubfolders},
+		{PropType: PtypBinary, PropID: PidTagEntryId},
+		{PropType: PtypTime, PropID: PidTagCreationTime},
+		{PropType: PtypTime, PropID: PidTagLastModificationTime},
 	}
 }
 
@@ -78,6 +81,9 @@ type minFolder struct {
 	content    int32
 	unread     int32
 	folderType int32
+	eid        []byte
+	created    uint64
+	modified   uint64
 }
 
 // WriteMinimum creates the MS-PST 2.4.1 / 2.7.1 nodes for a blank Unicode PST
@@ -167,17 +173,13 @@ func WriteMinimum(n *NDB, spec MinimumSpec) error {
 	}
 
 	folders := []minFolder{
-		{nid: NIDRootFolder, parent: 0, name: "", class: "IPF.Note", subfolders: true},
-		{nid: ipm, parent: NIDRootFolder, name: spec.DisplayName, class: "IPF.Note"},
-		{nid: waste, parent: NIDRootFolder, name: "Deleted Items", class: "IPF.Note"},
-		{nid: finder, parent: NIDRootFolder, name: "Search Root", class: "IPF.Note", folderType: FolderTypeSearch},
+		{nid: NIDRootFolder, parent: 0, name: "", class: "IPF.Note", subfolders: true, eid: rootEID, created: ft, modified: ft},
+		{nid: ipm, parent: NIDRootFolder, name: spec.DisplayName, class: "IPF.Note", eid: ipmEID, created: ft, modified: ft},
+		{nid: waste, parent: NIDRootFolder, name: "Deleted Items", class: "IPF.Note", eid: wasteEID, created: ft, modified: ft},
+		{nid: finder, parent: NIDRootFolder, name: "Search Root", class: "IPF.Note", folderType: FolderTypeSearch, eid: finderEID, created: ft, modified: ft},
 	}
 	for _, f := range folders {
-		eid := encodeEntryID(spec.RecordKey, f.nid)
-		if f.nid == NIDRootFolder {
-			eid = rootEID
-		}
-		if err := writeFolderPC(n, f, eid, ft); err != nil {
+		if err := writeFolderPC(n, f, f.eid, ft); err != nil {
 			return err
 		}
 		hier, err := NewTC(n, hierarchyColumns())
@@ -333,5 +335,14 @@ func writeHierarchyRow(tc *TC, child minFolder) error {
 	if err := tc.SetInt32(child.nid, PidTagContentUnreadCount, child.unread); err != nil {
 		return err
 	}
-	return tc.SetBool(child.nid, PidTagSubfolders, child.subfolders)
+	if err := tc.SetBool(child.nid, PidTagSubfolders, child.subfolders); err != nil {
+		return err
+	}
+	if err := tc.SetBinary(child.nid, PidTagEntryId, child.eid); err != nil {
+		return err
+	}
+	if err := tc.SetTime(child.nid, PidTagCreationTime, child.created); err != nil {
+		return err
+	}
+	return tc.SetTime(child.nid, PidTagLastModificationTime, child.modified)
 }
