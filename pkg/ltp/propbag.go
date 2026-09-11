@@ -121,16 +121,15 @@ func (pb *PropertyBag) readPropertyValue(entry *PropertyEntry) ([]byte, error) {
 	propType := entry.PropType
 	hnid := entry.Value
 
-	// Check if it's a fixed-size property
+	// MS-PST 2.3.3.4: values of 4 bytes or less are stored inline in
+	// dwValueHnid. FILETIME/GUID/i8 are HNIDs like variable properties.
 	fixedSize := propType.FixedSize()
-	if fixedSize > 0 {
-		// Value is stored inline in the HNID field
+	if fixedSize > 0 && fixedSize <= 4 {
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, uint32(hnid))
 		return buf[:fixedSize], nil
 	}
 
-	// Variable-size property
 	if hnid.IsHeapID() {
 		// Read from heap
 		return pb.heap.Read(hnid.ToHeapID())

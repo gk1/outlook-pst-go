@@ -61,6 +61,11 @@
 // parent hierarchy rows, counts, subfolder flags, EntryIDs, timestamps). Root,
 // IPM, Deleted Items, and Search Root are protected. Unknown PC properties
 // survive Load+Set. Finalize writes planned user folders onto the skeleton.
+// PST-013 writes IPM.Note messages: required PC properties, body variants,
+// flags, importance, timestamps, search/record keys, and a Recipient Table
+// subnode that exists even with zero rows. Contents-table rows and folder
+// content/unread counts stay coherent with the message node. Attachments
+// remain PST-014.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only

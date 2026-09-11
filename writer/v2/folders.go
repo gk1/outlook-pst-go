@@ -518,7 +518,7 @@ func (t *FolderTree) deleteLocked(nid uint32) error {
 
 // CreateFromPlan materializes user folders from a v2 export plan onto a
 // WriteMinimum skeleton. Root and IPM already exist.
-func (t *FolderTree) CreateFromPlan(folders []PlannedFolder) error {
+func (t *FolderTree) CreateFromPlan(folders []PlannedFolder) (map[FolderRef]uint32, error) {
 	nids := map[FolderRef]uint32{
 		RootFolderRef: NIDRootFolder,
 		IPMSubtreeRef: t.ipm,
@@ -541,15 +541,15 @@ func (t *FolderTree) CreateFromPlan(folders []PlannedFolder) error {
 			}
 			nid, err := t.Create(parent, f.Name)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			nids[f.Ref] = nid
 			progress++
 		}
 		if progress == 0 {
-			return invalidArg("parent", "folder plan has a missing parent or cycle")
+			return nil, invalidArg("parent", "folder plan has a missing parent or cycle")
 		}
 		pending = next
 	}
-	return nil
+	return nids, nil
 }

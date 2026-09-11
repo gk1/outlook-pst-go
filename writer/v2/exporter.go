@@ -536,7 +536,11 @@ func (s *session) Finalize(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := tree.CreateFromPlan(s.plan.Folders); err != nil {
+	nids, err := tree.CreateFromPlan(s.plan.Folders)
+	if err != nil {
+		return err
+	}
+	if err := tree.CreateMessagesFromPlan(nids, s.plan.Messages, s.content); err != nil {
 		return err
 	}
 	return n.CommitTo(s.opts.Sink)

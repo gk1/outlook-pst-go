@@ -317,10 +317,13 @@ func (db *Database) searchBBT(page *disk.BTPage, bid uint64) (*BlockInfo, error)
 
 	// Non-leaf: find the appropriate child.
 	// The key in each intermediate entry represents the MINIMUM BID in that subtree.
-	// We need to find the LAST entry where entry.Key <= bid.
+	// LookupBlock strips bidInternal before search, and leaves compare the same
+	// way, so intermediate keys must ignore that bit too. Otherwise an SLBLOCK
+	// whose first-key is 0xCA (internal) is missed when looking up 0xC8.
 	childIdx := -1
+	internal := uint64(util.BlockIDInternalBit)
 	for i, entry := range page.NonleafEntries {
-		if entry.Key <= bid {
+		if entry.Key&^internal <= bid {
 			childIdx = i
 		} else {
 			break // Keys are sorted, no need to continue

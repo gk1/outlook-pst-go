@@ -3,6 +3,7 @@ package writer
 import (
 	"bytes"
 	"encoding/binary"
+	"sort"
 )
 
 // HID / HNID packing. See MS-PST 2.3.1.1.
@@ -74,9 +75,11 @@ type hnPage struct {
 }
 
 type heapSub struct {
-	nid    uint32
-	data   []byte
-	leafCB int // 0 = MaxDataBlockCB; otherwise each data-tree leaf is at most leafCB
+	nid     uint32
+	data    []byte
+	leafCB  int // 0 = MaxDataBlockCB; otherwise each data-tree leaf is at most leafCB
+	dataBID uint64
+	subBID  uint64
 }
 
 // Heap is a Unicode Heap-on-Node builder. See MS-PST 2.3.1.
@@ -258,49 +261,78 @@ func (h *Heap) Commit(nid uint32) error {
 }
 
 func (h *Heap) commitLocked(nid uint32) error {
-	raws, _, err := h.encodePages()
+	data, sub, err := h.materialize()
 	if err != nil {
 		return err
+	}
+	return h.n.PutNode(NBTEntry{NID: uint64(nid), DataBID: data.BID, SubBID: sub.BID})
+}
+
+// AttachHeap adds child's data tree as a subnode of this heap (MS-PST 2.4.5.3
+// recipient tables hang off the message PC this way).
+func (h *Heap) AttachHeap(nid uint32, child *Heap) error {
+	if h == nil || h.n == nil || child == nil {
+		return invalidArg("heap", "nil heap")
+	}
+	if nid == 0 {
+		return invalidArg("nid", "subnode NID is 0")
+	}
+	data, sub, err := child.materialize()
+	if err != nil {
+		return err
+	}
+	h.subs = append(h.subs, heapSub{nid: nid, dataBID: data.BID, subBID: sub.BID})
+	return nil
+}
+
+func (h *Heap) materialize() (BBTEntry, BBTEntry, error) {
+	raws, _, err := h.encodePages()
+	if err != nil {
+		return BBTEntry{}, BBTEntry{}, err
 	}
 	leaves := make([]BBTEntry, 0, len(raws))
 	var total uint32
 	for _, raw := range raws {
 		e, err := h.n.AllocBlock(uint16(len(raw)))
 		if err != nil {
-			return err
+			return BBTEntry{}, BBTEntry{}, err
 		}
 		if err := h.n.putPayload(e, raw); err != nil {
-			return err
+			return BBTEntry{}, BBTEntry{}, err
 		}
 		leaves = append(leaves, e)
 		total += uint32(len(raw))
 	}
 	data, err := h.n.buildDataTree(leaves, total)
 	if err != nil {
-		return err
+		return BBTEntry{}, BBTEntry{}, err
 	}
-	var sub BBTEntry
-	if len(h.subs) > 0 {
-		ents := make([]SLEntry, len(h.subs))
-		for i, s := range h.subs {
-			var blk BBTEntry
-			var err error
-			if s.leafCB > 0 {
-				blk, err = putDataLeaves(h.n, s.data, s.leafCB)
-			} else {
-				blk, err = h.n.streamDataTree(bytes.NewReader(s.data), int64(len(s.data)))
-			}
-			if err != nil {
-				return err
-			}
-			ents[i] = SLEntry{NID: uint64(s.nid), DataBID: blk.BID}
+	if len(h.subs) == 0 {
+		return data, BBTEntry{}, nil
+	}
+	ents := make([]SLEntry, 0, len(h.subs))
+	for _, s := range h.subs {
+		if s.dataBID != 0 {
+			ents = append(ents, SLEntry{NID: uint64(s.nid), DataBID: s.dataBID, SubBID: s.subBID})
+			continue
 		}
-		sub, err = h.n.buildSubnodeTree(ents)
+		var blk BBTEntry
+		if s.leafCB > 0 {
+			blk, err = putDataLeaves(h.n, s.data, s.leafCB)
+		} else {
+			blk, err = h.n.streamDataTree(bytes.NewReader(s.data), int64(len(s.data)))
+		}
 		if err != nil {
-			return err
+			return BBTEntry{}, BBTEntry{}, err
 		}
+		ents = append(ents, SLEntry{NID: uint64(s.nid), DataBID: blk.BID})
 	}
-	return h.n.PutNode(NBTEntry{NID: uint64(nid), DataBID: data.BID, SubBID: sub.BID})
+	sort.Slice(ents, func(i, j int) bool { return ents[i].NID < ents[j].NID })
+	sub, err := h.n.buildSubnodeTree(ents)
+	if err != nil {
+		return BBTEntry{}, BBTEntry{}, err
+	}
+	return data, sub, nil
 }
 
 // putDataLeaves writes data as a data tree whose leaves are at most leafCB

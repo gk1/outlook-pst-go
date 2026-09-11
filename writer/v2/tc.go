@@ -294,6 +294,27 @@ func (t *TC) Commit(nid uint32) error {
 	if nid == 0 || NIDTypeOf(nid) == NIDTypeHID {
 		return invalidArg("nid", "TC node 0x%x must not be a HID", nid)
 	}
+	if err := t.build(); err != nil {
+		return err
+	}
+	return t.heap.Commit(nid)
+}
+
+// AttachTo writes this table as a subnode of parent (recipient tables).
+func (t *TC) AttachTo(parent *Heap, nid uint32) error {
+	if t == nil || t.n == nil {
+		return invalidArg("tc", "nil TC")
+	}
+	if parent == nil {
+		return invalidArg("heap", "nil parent heap")
+	}
+	if err := t.build(); err != nil {
+		return err
+	}
+	return parent.AttachHeap(nid, t.heap)
+}
+
+func (t *TC) build() error {
 	rowSize := tableRowSize(t.rgib)
 	raws := make([][]byte, len(t.rows))
 	for i, r := range t.rows {
@@ -351,7 +372,7 @@ func (t *TC) Commit(nid uint32) error {
 		return err
 	}
 	t.heap.SetRoot(hid)
-	return t.heap.Commit(nid)
+	return nil
 }
 
 // TCView is a committed Table Context.
