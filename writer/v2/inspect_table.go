@@ -209,18 +209,28 @@ func EncodeTCINFO(d TableDraft) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return writeTCINFO(cols, rgib, d.RowIndex, d.Rows)
+}
+
+// writeTCINFO serializes an already-laid-out column list. Offset/iBit/rgib
+// are preserved so Load+Commit cannot reshuffle ibData by tag order.
+func writeTCINFO(cols []ColumnView, rgib [4]uint16, rowIndex, rows uint32) ([]byte, error) {
+	cols = append([]ColumnView(nil), cols...)
 	if err := sortColumnsByTag(cols); err != nil {
 		return nil, err
 	}
 	n := len(cols)
+	if n > MaxTCColumns {
+		return nil, invalidArg("cCols", "%d columns exceeds byte cCols %d (MS-PST %s)", n, MaxTCColumns, SectionTCINFO)
+	}
 	buf := make([]byte, TCINFOFixedSize+TCOLDESCSize*n)
 	buf[0] = HeapSigTC
 	buf[1] = byte(n)
 	for i := 0; i < 4; i++ {
 		binary.LittleEndian.PutUint16(buf[2+i*2:], rgib[i])
 	}
-	binary.LittleEndian.PutUint32(buf[10:], d.RowIndex)
-	binary.LittleEndian.PutUint32(buf[14:], d.Rows)
+	binary.LittleEndian.PutUint32(buf[10:], rowIndex)
+	binary.LittleEndian.PutUint32(buf[14:], rows)
 	colOff := TCINFOFixedSize
 	for _, c := range cols {
 		binary.LittleEndian.PutUint16(buf[colOff:], c.PropType)
@@ -281,13 +291,17 @@ func InspectTable(raw []byte) (*TableView, error) {
 	if err := validateColumnLayout(cols, rgib); err != nil {
 		return nil, err
 	}
+	hidIndex := binary.LittleEndian.Uint32(raw[18:22])
+	if hidIndex != 0 {
+		return nil, invariant(SectionTCINFO, "hidIndex", "deprecated hidIndex must be 0 (MS-PST %s)", SectionTCINFO)
+	}
 	return &TableView{
 		Signature: raw[0],
 		NumCols:   raw[1],
 		RgIB:      rgib,
 		RowIndex:  binary.LittleEndian.Uint32(raw[10:14]),
 		RowMatrix: binary.LittleEndian.Uint32(raw[14:18]),
-		HidIndex:  binary.LittleEndian.Uint32(raw[18:22]),
+		HidIndex:  hidIndex,
 		Columns:   cols,
 		Raw:       append([]byte(nil), raw[:need]...),
 	}, nil
@@ -423,6 +437,110 @@ func validateIbDataGroups(cols []ColumnView, rgib [4]uint16) error {
 	wantBM := want1b + ceb
 	if rgib[0] != want4b || rgib[1] != want2b || rgib[2] != want1b || rgib[3] != wantBM {
 		return invariant(SectionTCINFO, "rgib", "rgib=%v want TCI_4b=%d TCI_2b=%d TCI_1b=%d TCI_bm=%d (MS-PST %s)", rgib, want4b, want2b, want1b, wantBM, SectionRowMatrix)
+	}
+	return nil
+}
+
+// CEB bits are packed LSB-first in each byte: iBit 0 is 1<<0 of rgbCEB[0].
+// See MS-PST 2.3.4.4.
+func cebHas(ceb []byte, iBit byte) bool {
+	i := int(iBit)
+	if i/8 >= len(ceb) {
+		return false
+	}
+	return ceb[i/8]&(1<<uint(i%8)) != 0
+}
+
+func cebSet(ceb []byte, iBit byte) {
+	i := int(iBit)
+	if i/8 >= len(ceb) {
+		return
+	}
+	ceb[i/8] |= 1 << uint(i%8)
+}
+
+func tableRowSize(rgib [4]uint16) int { return int(rgib[3]) }
+
+func tableRowsPerBlock(rowSize int) int {
+	if rowSize <= 0 {
+		return 0
+	}
+	return MaxDataBlockCB / rowSize
+}
+
+func tableRowOffset(idx, rowSize int, blocked bool) int {
+	if !blocked {
+		return idx * rowSize
+	}
+	rpb := tableRowsPerBlock(rowSize)
+	if rpb < 1 {
+		return idx * rowSize
+	}
+	return (idx/rpb)*MaxDataBlockCB + (idx%rpb)*rowSize
+}
+
+// InspectTableRows validates Row Matrix boundaries against the Row Index BTH.
+// HID matrices are tightly packed. Subnode matrices pad to MaxDataBlockCB so
+// a row never spans a data-tree leaf (MS-PST 2.3.4.4).
+func InspectTableRows(tv *TableView, ents []bthKV, matrix []byte, blocked bool) error {
+	if tv == nil {
+		return invalidArg("tc", "nil TableView")
+	}
+	rowSize := tableRowSize(tv.RgIB)
+	if rowSize <= 0 {
+		return invariant(SectionRowMatrix, "TCI_bm", "row size %d", rowSize)
+	}
+	if tableRowsPerBlock(rowSize) < 1 {
+		return invariant(SectionRowMatrix, "cbRow", "row size %d exceeds data block %d (MS-PST %s)", rowSize, MaxDataBlockCB, SectionRowMatrix)
+	}
+	if tv.RowMatrix == 0 {
+		if len(ents) != 0 || len(matrix) != 0 {
+			return invariant(SectionTCINFO, "hnidRows", "hnidRows is 0 but matrix/index is not empty")
+		}
+		return nil
+	}
+	if blocked && IsHID(tv.RowMatrix) {
+		return invariant(SectionTCINFO, "hnidRows", "blocked Row Matrix HID 0x%x, want NID_TYPE_LTP", tv.RowMatrix)
+	}
+	if !blocked && !IsHID(tv.RowMatrix) {
+		return invariant(SectionTCINFO, "hnidRows", "tight Row Matrix HNID 0x%x, want HID", tv.RowMatrix)
+	}
+	seenIdx := make(map[uint32]uint32, len(ents))
+	for _, e := range ents {
+		if len(e.key) != 4 || len(e.val) != 4 {
+			return invariant(SectionTCRowID, "TCROWID", "BTH entry key %d val %d, want 4/4", len(e.key), len(e.val))
+		}
+		id := binary.LittleEndian.Uint32(e.key)
+		idx := binary.LittleEndian.Uint32(e.val)
+		if _, dup := seenIdx[idx]; dup {
+			return invariant(SectionTCRowID, "dwRowIndex", "duplicate RowIndex %d", idx)
+		}
+		seenIdx[idx] = id
+		off := tableRowOffset(int(idx), rowSize, blocked)
+		if off < 0 || off+rowSize > len(matrix) {
+			return invariant(SectionRowMatrix, "row", "row %d (id 0x%x) offset %d+%d exceeds matrix %d", idx, id, off, rowSize, len(matrix))
+		}
+		row := matrix[off : off+rowSize]
+		gotID := binary.LittleEndian.Uint32(row[0:4])
+		if gotID != id {
+			return invariant(SectionTCRowID, "PidTagLtpRowId", "row %d cell 0x%x BTH key 0x%x", idx, gotID, id)
+		}
+		ceb := row[tv.RgIB[2]:tv.RgIB[3]]
+		if !cebHas(ceb, 0) || !cebHas(ceb, 1) {
+			return invariant(SectionTCRowID, "rgbCEB", "row 0x%x missing required PidTagLtpRowId/PidTagLtpRowVer bits", id)
+		}
+		for _, c := range tv.Columns {
+			end := int(c.Offset) + int(c.Size)
+			if int(c.Offset) < 0 || end > rowSize {
+				return invariant(SectionTCOLDESC, "ibData", "column 0x%04x ibData %d+%d exceeds row %d", c.PropID, c.Offset, c.Size, rowSize)
+			}
+		}
+	}
+	if !blocked {
+		want := len(ents) * rowSize
+		if len(matrix) != want {
+			return invariant(SectionRowMatrix, "cb", "HID matrix %d bytes, want %d for %d rows", len(matrix), want, len(ents))
+		}
 	}
 	return nil
 }

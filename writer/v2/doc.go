@@ -47,6 +47,11 @@
 // clone storeState/catalogState. Stage/work/hold/adopt share one ioHandle
 // ownership boundary; cleanup uses explicit sinkOwn metadata, never Name()
 // path shape.
+// PST-010 is Table Context: inline TCINFO/rgTCOLDESC, LSB-first CEB at
+// TCI_bm, Row Index BTH (dwRowID→dwRowIndex), HID vs block-padded subnode
+// Row Matrix, add/update/delete, and PtypObject as NID_TYPE_LTP in the
+// 4-byte cell. InspectTable / InspectTableRows check descriptors and row
+// boundaries independently of the builder.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.
 //
