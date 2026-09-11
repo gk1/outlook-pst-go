@@ -56,6 +56,11 @@
 // root/IPM/search/deleted folders with related hierarchy/contents/FAI tables,
 // template and search-management nodes, HEADER rgnid by type, and EntryIDs,
 // through one CommitTo. Finalize materializes that blank file.
+// PST-012 is folder object-model mutation: create/rename/move/delete keep the
+// folder PC and related hierarchy/contents/FAI tables coherent (shared nidIndex,
+// parent hierarchy rows, counts, subfolder flags, EntryIDs, timestamps). Root,
+// IPM, Deleted Items, and Search Root are protected. Unknown PC properties
+// survive Load+Set. Finalize writes planned user folders onto the skeleton.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only

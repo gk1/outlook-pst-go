@@ -357,6 +357,57 @@ func (v *PCView) GetString(id uint16) (string, error) {
 	return decodeUnicodePC(data), nil
 }
 
+func (v *PCView) GetBinary(id uint16) ([]byte, error) {
+	typ, data, err := v.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if typ != PtypBinary {
+		return nil, invalidArg("wPropType", "0x%04x is not PtypBinary", typ)
+	}
+	return append([]byte(nil), data...), nil
+}
+
+func (v *PCView) GetInt32(id uint16) (int32, error) {
+	typ, data, err := v.Get(id)
+	if err != nil {
+		return 0, err
+	}
+	if typ != PtypInteger32 || len(data) < 4 {
+		return 0, invalidArg("wPropType", "0x%04x is not PtypInteger32", typ)
+	}
+	return int32(binary.LittleEndian.Uint32(data)), nil
+}
+
+func (v *PCView) GetBool(id uint16) (bool, error) {
+	typ, data, err := v.Get(id)
+	if err != nil {
+		return false, err
+	}
+	if typ != PtypBoolean {
+		return false, invalidArg("wPropType", "0x%04x is not PtypBoolean", typ)
+	}
+	switch len(data) {
+	case 0:
+		return false, nil
+	case 1:
+		return data[0] != 0, nil
+	default:
+		return binary.LittleEndian.Uint16(data) != 0, nil
+	}
+}
+
+func (v *PCView) GetTime(id uint16) (uint64, error) {
+	typ, data, err := v.Get(id)
+	if err != nil {
+		return 0, err
+	}
+	if typ != PtypTime || len(data) < 8 {
+		return 0, invalidArg("wPropType", "0x%04x is not PtypTime", typ)
+	}
+	return binary.LittleEndian.Uint64(data), nil
+}
+
 func (v *PCView) GetMVString(id uint16) ([]string, error) {
 	typ, data, err := v.Get(id)
 	if err != nil {

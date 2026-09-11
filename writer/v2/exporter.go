@@ -89,9 +89,11 @@ func (s *session) CreateFolder(spec FolderSpec) (FolderRef, error) {
 	if err := s.check(); err != nil {
 		return 0, err
 	}
-	if spec.Name == "" {
-		return 0, invalidArg("name", "folder name is required")
+	name, err := validateFolderName(spec.Name)
+	if err != nil {
+		return 0, err
 	}
+	spec.Name = name
 	parent := spec.Parent
 	if parent == 0 {
 		parent = IPMSubtreeRef
@@ -99,6 +101,9 @@ func (s *session) CreateFolder(spec FolderSpec) (FolderRef, error) {
 	p, ok := s.folders[parent]
 	if !ok {
 		return 0, invalidArg("parent", "unknown folder ref %d", parent)
+	}
+	if err := s.planCollision(parent, spec.Name, 0); err != nil {
+		return 0, err
 	}
 	depth := p.Depth + 1
 	if depth > s.opts.Limits.MaxFolderDepth {
@@ -119,6 +124,150 @@ func (s *session) CreateFolder(spec FolderSpec) (FolderRef, error) {
 	s.folders[ref] = f
 	s.plan.Folders = append(s.plan.Folders, f)
 	return ref, nil
+}
+
+func (s *session) planCollision(parent FolderRef, name string, except FolderRef) error {
+	for _, f := range s.folders {
+		if f.Parent == parent && f.Ref != except && strings.EqualFold(f.Name, name) {
+			return invalidArg("name", "folder %q already exists under parent %d", name, parent)
+		}
+	}
+	return nil
+}
+
+func (s *session) updatePlanFolder(f PlannedFolder) {
+	s.folders[f.Ref] = f
+	for i := range s.plan.Folders {
+		if s.plan.Folders[i].Ref == f.Ref {
+			s.plan.Folders[i] = f
+			return
+		}
+	}
+}
+
+func (s *session) systemFolder(ref FolderRef) bool {
+	return ref == RootFolderRef || ref == IPMSubtreeRef
+}
+
+func (s *session) RenameFolder(ref FolderRef, name string) error {
+	if err := s.check(); err != nil {
+		return err
+	}
+	name, err := validateFolderName(name)
+	if err != nil {
+		return err
+	}
+	if s.systemFolder(ref) {
+		return invalidArg("ref", "cannot rename system folder %d", ref)
+	}
+	f, ok := s.folders[ref]
+	if !ok {
+		return invalidArg("ref", "unknown folder ref %d", ref)
+	}
+	if err := s.planCollision(f.Parent, name, ref); err != nil {
+		return err
+	}
+	f.Name = name
+	s.updatePlanFolder(f)
+	return nil
+}
+
+func (s *session) MoveFolder(ref, parent FolderRef) error {
+	if err := s.check(); err != nil {
+		return err
+	}
+	if s.systemFolder(ref) {
+		return invalidArg("ref", "cannot move system folder %d", ref)
+	}
+	if parent == 0 {
+		parent = IPMSubtreeRef
+	}
+	f, ok := s.folders[ref]
+	if !ok {
+		return invalidArg("ref", "unknown folder ref %d", ref)
+	}
+	p, ok := s.folders[parent]
+	if !ok {
+		return invalidArg("parent", "unknown folder ref %d", parent)
+	}
+	for cur := parent; cur != 0; {
+		if cur == ref {
+			return invalidArg("parent", "cannot move folder %d under itself or a descendant", ref)
+		}
+		pf, ok := s.folders[cur]
+		if !ok {
+			break
+		}
+		if pf.Parent == cur {
+			break
+		}
+		cur = pf.Parent
+	}
+	if err := s.planCollision(parent, f.Name, ref); err != nil {
+		return err
+	}
+	depth := p.Depth + 1
+	if depth > s.opts.Limits.MaxFolderDepth {
+		return limitErr("MaxFolderDepth", "depth %d exceeds %d", depth, s.opts.Limits.MaxFolderDepth)
+	}
+	f.Parent = parent
+	s.updatePlanFolder(f)
+	s.recomputeDepth(ref)
+	return nil
+}
+
+func (s *session) recomputeDepth(ref FolderRef) {
+	f := s.folders[ref]
+	p, ok := s.folders[f.Parent]
+	if !ok {
+		return
+	}
+	f.Depth = p.Depth + 1
+	s.updatePlanFolder(f)
+	for _, c := range s.folders {
+		if c.Parent == ref {
+			s.recomputeDepth(c.Ref)
+		}
+	}
+}
+
+func (s *session) DeleteFolder(ref FolderRef) error {
+	if err := s.check(); err != nil {
+		return err
+	}
+	if s.systemFolder(ref) {
+		return invalidArg("ref", "cannot delete system folder %d", ref)
+	}
+	if _, ok := s.folders[ref]; !ok {
+		return invalidArg("ref", "unknown folder ref %d", ref)
+	}
+	drop := map[FolderRef]struct{}{}
+	var walk func(FolderRef)
+	walk = func(r FolderRef) {
+		drop[r] = struct{}{}
+		for _, c := range s.folders {
+			if c.Parent == r {
+				walk(c.Ref)
+			}
+		}
+	}
+	walk(ref)
+	for _, m := range s.plan.Messages {
+		if _, ok := drop[m.Folder]; ok {
+			return invalidArg("folder", "folder %d still contains messages", m.Folder)
+		}
+	}
+	for r := range drop {
+		delete(s.folders, r)
+	}
+	out := s.plan.Folders[:0]
+	for _, f := range s.plan.Folders {
+		if _, ok := drop[f.Ref]; !ok {
+			out = append(out, f)
+		}
+	}
+	s.plan.Folders = out
+	return nil
 }
 
 func (s *session) CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, error) {
@@ -381,6 +530,13 @@ func (s *session) Finalize(ctx context.Context) error {
 	n := NewNDB(nil)
 	spec := MinimumSpec{DisplayName: s.plan.DisplayName, Now: time.Unix(0, s.plan.CreatedNano).UTC()}
 	if err := WriteMinimum(n, spec); err != nil {
+		return err
+	}
+	tree, err := OpenFolderTree(n, spec.Now)
+	if err != nil {
+		return err
+	}
+	if err := tree.CreateFromPlan(s.plan.Folders); err != nil {
 		return err
 	}
 	return n.CommitTo(s.opts.Sink)

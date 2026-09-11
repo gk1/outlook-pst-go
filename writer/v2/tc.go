@@ -537,6 +537,33 @@ func (v *TCView) GetString(rowID uint32, id uint16) (string, error) {
 	return decodeUnicodePC(data), nil
 }
 
+func (v *TCView) GetInt32(rowID uint32, id uint16) (int32, error) {
+	typ, data, err := v.Get(rowID, id)
+	if err != nil {
+		return 0, err
+	}
+	if typ != PtypInteger32 || len(data) < 4 {
+		return 0, invalidArg("wPropType", "0x%04x is not PtypInteger32", typ)
+	}
+	return int32(binary.LittleEndian.Uint32(data)), nil
+}
+
+func (v *TCView) GetBool(rowID uint32, id uint16) (bool, error) {
+	typ, data, err := v.Get(rowID, id)
+	if err != nil {
+		return false, err
+	}
+	if typ != PtypBoolean {
+		return false, invalidArg("wPropType", "0x%04x is not PtypBoolean", typ)
+	}
+	for _, b := range data {
+		if b != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (v *TCView) Load() (*TC, error) {
 	t := &TC{
 		n:      v.heap.n,

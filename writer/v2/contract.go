@@ -131,6 +131,9 @@ type MessageContent struct {
 type Exporter interface {
 	CreateMailbox(Mailbox) error
 	CreateFolder(FolderSpec) (FolderRef, error)
+	RenameFolder(ref FolderRef, name string) error
+	MoveFolder(ref, parent FolderRef) error
+	DeleteFolder(ref FolderRef) error
 	CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, error)
 	Plan() Plan
 	EncodePlan() ([]byte, error)

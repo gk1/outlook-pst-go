@@ -315,6 +315,15 @@ func addHierarchyRow(tc *TC, child minFolder) error {
 	if err := tc.AddID(child.nid); err != nil {
 		return err
 	}
+	return writeHierarchyRow(tc, child)
+}
+
+func writeHierarchyRow(tc *TC, child minFolder) error {
+	if _, err := tc.row(child.nid); err != nil {
+		if err := tc.AddID(child.nid); err != nil {
+			return err
+		}
+	}
 	if err := tc.SetString(child.nid, PidTagDisplayName, child.name); err != nil {
 		return err
 	}

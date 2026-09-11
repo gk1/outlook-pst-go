@@ -34,6 +34,9 @@ const (
 	SectionTCOLDESC     = "2.3.4.2"
 	SectionRowMatrix    = "2.3.4.4"
 	SectionTCRowID      = "2.3.4.4.1"
+	SectionFolder       = "2.4.4"
+	SectionFolderPC     = "2.4.4.1"
+	SectionHierarchyTbl = "2.4.4.4"
 	SectionMinPST       = "2.7.1"
 	SectionCRC          = "5.3"
 	SectionSignature    = "5.5"
@@ -292,6 +295,7 @@ const (
 	PidTagRecordKey             uint16 = 0x0FF9
 	PidTagEntryId               uint16 = 0x0FFF
 	PidTagDisplayName           uint16 = 0x3001
+	PidTagComment               uint16 = 0x3004
 	PidTagCreationTime          uint16 = 0x3007
 	PidTagLastModificationTime  uint16 = 0x3008
 	PidTagStoreSupportMask      uint16 = 0x340D
