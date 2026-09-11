@@ -378,11 +378,12 @@ func (s *session) Finalize(ctx context.Context) error {
 	if ctx != nil && ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return &Error{
-		Code:   CodeNotImplemented,
-		Detail: "Unicode PST codecs are implemented by PST-002 and later; message content is retained on the exporter for that materialization",
-		Err:    ErrNotImplemented,
+	n := NewNDB(nil)
+	spec := MinimumSpec{DisplayName: s.plan.DisplayName, Now: time.Unix(0, s.plan.CreatedNano).UTC()}
+	if err := WriteMinimum(n, spec); err != nil {
+		return err
 	}
+	return n.CommitTo(s.opts.Sink)
 }
 
 func (s *session) Close() error {

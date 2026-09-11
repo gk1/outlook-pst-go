@@ -534,6 +534,7 @@ func metadataPageIB(ib uint64) bool {
 // offset. Superseded tree pages are freed after the new tree is committed.
 // Unowned (cRef==1) BBT records are reclaimed and not serialized.
 func (n *NDB) Encode() (*TreeImage, error) {
+	n.syncRgNID()
 	if err := n.reclaimOrphans(); err != nil {
 		return nil, err
 	}
@@ -1034,10 +1035,35 @@ func (img *TreeImage) collectPageIBs() ([]uint64, error) {
 	return ibs, nil
 }
 
+func (n *NDB) syncRgNID() {
+	if n == nil || n.store == nil {
+		return
+	}
+	if n.ids != nil {
+		n.store.nids = n.ids.nid
+	}
+}
+
+// SetParent updates NBTENTRY.nidParent. Related table nodes name the folder.
+func (n *NDB) SetParent(nid, parent uint32) error {
+	if n == nil {
+		return invalidArg("ndb", "nil NDB")
+	}
+	e, ok := n.LookupNode(uint64(nid))
+	if !ok {
+		return invalidArg("nid", "missing NID 0x%x", nid)
+	}
+	e.ParentNID = parent
+	return n.PutNode(e)
+}
+
 func idsFromStore(s *Store) *SequentialIDs {
 	ids := NewSequentialIDs()
 	ids.nextBlock = s.bidNextB
 	ids.nextPage = s.bidNextP
+	if s != nil {
+		ids.nid = s.nids
+	}
 	return ids
 }
 

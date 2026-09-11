@@ -238,9 +238,17 @@ const DFLBackfillComplete byte = 0x01
 
 // Special NIDs. See MS-PST 2.4.1 / 2.7.1.
 const (
-	NIDMessageStore uint32 = 0x21
-	NIDNameToIDMap  uint32 = 0x61
-	NIDRootFolder   uint32 = 0x122
+	NIDMessageStore              uint32 = 0x21
+	NIDNameToIDMap               uint32 = 0x61
+	NIDNormalFolderTemplate      uint32 = 0xA1
+	NIDSearchFolderTemplate      uint32 = 0xC1
+	NIDRootFolder                uint32 = 0x122
+	NIDSearchManagementQueue     uint32 = 0x1E1
+	NIDSearchActivityList        uint32 = 0x201
+	NIDSearchDomainObject        uint32 = 0x261
+	NIDSearchGathererQueue       uint32 = 0x281
+	NIDSearchGathererDescriptor  uint32 = 0x2A1
+	NIDSearchGathererFolderQueue uint32 = 0x321
 )
 
 // NID types. See MS-PST 2.2.2.1.
@@ -252,12 +260,55 @@ const (
 	NIDTypeNormalMessage      = 0x04
 	NIDTypeAttachment         = 0x05
 	NIDTypeAssocMessage       = 0x08
+	NIDTypeReceiveFolderTable = 0x0B
+	NIDTypeOutgoingQueueTable = 0x0C
 	NIDTypeHierarchyTable     = 0x0D
 	NIDTypeContentsTable      = 0x0E
 	NIDTypeAssocContentsTable = 0x0F
 	NIDTypeAttachmentTable    = 0x11
 	NIDTypeRecipientTable     = 0x12
 	NIDTypeLTP                = 0x1F
+)
+
+// RelatedNID is the hierarchy/contents/FAI node that shares a folder's nidIndex.
+// See MS-PST 2.4.1 / 2.4.4.
+func RelatedNID(folder uint32, nidType byte) uint32 {
+	return MakeNID(nidType, NIDIndexOf(folder))
+}
+
+// MAPI property IDs used by the minimum PST and folder tables. See MS-OXPROPS.
+const (
+	PidTagImportance            uint16 = 0x0017
+	PidTagMessageClass          uint16 = 0x001A
+	PidTagSubject               uint16 = 0x0037
+	PidTagClientSubmitTime      uint16 = 0x0039
+	PidTagSentRepresentingName  uint16 = 0x0042
+	PidTagDisplayTo             uint16 = 0x0E04
+	PidTagMessageDeliveryTime   uint16 = 0x0E06
+	PidTagMessageFlags          uint16 = 0x0E07
+	PidTagMessageSize           uint16 = 0x0E08
+	PidTagMessageStatus         uint16 = 0x0E17
+	PidTagHasAttachments        uint16 = 0x0E1B
+	PidTagRecordKey             uint16 = 0x0FF9
+	PidTagEntryId               uint16 = 0x0FFF
+	PidTagDisplayName           uint16 = 0x3001
+	PidTagCreationTime          uint16 = 0x3007
+	PidTagLastModificationTime  uint16 = 0x3008
+	PidTagStoreSupportMask      uint16 = 0x340D
+	PidTagIpmSubTreeEntryId     uint16 = 0x35E0
+	PidTagIpmWastebasketEntryId uint16 = 0x35E3
+	PidTagFinderEntryId         uint16 = 0x35E7
+	PidTagFolderType            uint16 = 0x3601
+	PidTagContentCount          uint16 = 0x3602
+	PidTagContentUnreadCount    uint16 = 0x3603
+	PidTagSubfolders            uint16 = 0x360A
+	PidTagContainerClass        uint16 = 0x3613
+	PidTagNameidStreamGuid      uint16 = 0x0002
+	PidTagNameidStreamEntry     uint16 = 0x0003
+	PidTagNameidStreamString    uint16 = 0x0004
+	FolderTypeGeneric           int32  = 1
+	StoreSupportMaskUnicode     int32  = 0x00040E79
+	EntryIDSize                        = 24
 )
 
 // MakeNID packs a type and index. See MS-PST 2.2.2.1.

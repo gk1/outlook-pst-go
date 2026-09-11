@@ -9,18 +9,6 @@ import (
 	"time"
 )
 
-func TestFinalizeNotImplemented(t *testing.T) {
-	exp, err := New(Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer exp.Close()
-	err = exp.Finalize(context.Background())
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("got %v", err)
-	}
-}
-
 func TestUnsupportedCalendar(t *testing.T) {
 	exp, _ := New(Options{})
 	defer exp.Close()
@@ -191,7 +179,7 @@ func TestMessageContentRetainedForFinalize(t *testing.T) {
 	if p.Messages[0].BodyTextSHA256 == "" || p.Messages[0].HeadersSHA256 == "" {
 		t.Fatal("plan missing content hashes")
 	}
-	if err := exp.Finalize(context.Background()); !errors.Is(err, ErrNotImplemented) {
+	if err := exp.Finalize(context.Background()); err != nil {
 		t.Fatalf("finalize: %v", err)
 	}
 	still, err := exp.MessageContent(ref)

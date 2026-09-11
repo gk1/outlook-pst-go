@@ -65,13 +65,11 @@ type SequentialIDs struct {
 // NewSequentialIDs returns counters matching a blank Unicode PST.
 func NewSequentialIDs() *SequentialIDs {
 	s := &SequentialIDs{
-		StartIndex: 0x400,
+		StartIndex: NIDIndexDefault,
 		nextBlock:  4, // BIDs 0-3 are reserved
 		nextPage:   4,
 		unique:     1,
-	}
-	for i := range s.nid {
-		s.nid[i] = s.StartIndex
+		nid:        DefaultRgNID(),
 	}
 	return s
 }
@@ -81,6 +79,25 @@ func (s *SequentialIDs) NextNID(nidType byte) uint32 {
 	idx := s.nid[t]
 	s.nid[t] = idx + 1
 	return MakeNID(t, idx)
+}
+
+// RgNID is the HEADER.rgnid table: next unused nidIndex per nidType.
+func (s *SequentialIDs) RgNID() [32]uint32 {
+	if s == nil {
+		return DefaultRgNID()
+	}
+	return s.nid
+}
+
+// EnsureIndex raises the next unused nidIndex for nidType to at least next.
+func (s *SequentialIDs) EnsureIndex(nidType byte, next uint32) {
+	if s == nil {
+		return
+	}
+	t := nidType & 0x1F
+	if s.nid[t] < next {
+		s.nid[t] = next
+	}
 }
 
 func (s *SequentialIDs) NextBlockBID() uint64 {
@@ -298,10 +315,11 @@ func (s *FileSink) Write(p []byte) (int, error)                  { return s.f.Wr
 func (s *FileSink) WriteAt(p []byte, off int64) (int, error)     { return s.f.WriteAt(p, off) }
 func (s *FileSink) ReadAt(p []byte, off int64) (int, error)      { return s.f.ReadAt(p, off) }
 func (s *FileSink) Seek(offset int64, whence int) (int64, error) { return s.f.Seek(offset, whence) }
-func (s *FileSink) Sync() error                                  { return s.f.Sync() }
-func (s *FileSink) Close() error                                 { return s.f.Close() }
-func (s *FileSink) Name() string                                 { return s.f.Name() }
-func (s *FileSink) Truncate(n int64) error                       { return s.f.Truncate(n) }
+
+func (s *FileSink) Sync() error            { return s.f.Sync() }
+func (s *FileSink) Close() error           { return s.f.Close() }
+func (s *FileSink) Name() string           { return s.f.Name() }
+func (s *FileSink) Truncate(n int64) error { return s.f.Truncate(n) }
 
 // Options configure a v2 exporter.
 type Options struct {

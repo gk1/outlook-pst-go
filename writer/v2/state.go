@@ -13,6 +13,7 @@ type storeState struct {
 	dlistBID      uint64
 	nbtRoot       BREF
 	bbtRoot       BREF
+	nids          [32]uint32
 }
 
 func (s storeState) clone() storeState {

@@ -104,10 +104,30 @@ func (t *TC) Add() (uint32, error) {
 		return 0, invalidArg("tc", "nil TC")
 	}
 	id := t.nextID
-	t.nextID++
+	if err := t.AddID(id); err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// AddID inserts a row whose dwRowID is id. Hierarchy tables use the
+// child folder NID as dwRowID (MS-PST 2.3.4.3 / 2.4.4.4).
+func (t *TC) AddID(id uint32) error {
+	if t == nil {
+		return invalidArg("tc", "nil TC")
+	}
+	if id == 0 {
+		return invalidArg("dwRowID", "row id 0")
+	}
+	if _, ok := t.byRow[id]; ok {
+		return invalidArg("dwRowID", "duplicate row 0x%x", id)
+	}
 	t.byRow[id] = len(t.rows)
 	t.rows = append(t.rows, tcRow{id: id, ver: 1, cells: make(map[uint16][]byte)})
-	return id, nil
+	if id >= t.nextID {
+		t.nextID = id + 1
+	}
+	return nil
 }
 
 func (t *TC) row(rowID uint32) (*tcRow, error) {

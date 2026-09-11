@@ -145,14 +145,10 @@ func (b *BTH) searchLeaf(data []byte, key []byte) ([]byte, error) {
 		offset := i * entrySize
 		entryKey := data[offset : offset+keySize]
 
-		cmp := compareKeys(key, entryKey)
-		if cmp == 0 {
-			// Found it - return value portion
+		// Full scan: leaves are ordered as unsigned LE integers (MS-PST 2.3.2),
+		// which is not memcmp order for 2-byte PropIDs (e.g. 0x0FF9 vs 0x3001).
+		if compareKeys(key, entryKey) == 0 {
 			return data[offset+keySize : offset+keySize+valueSize], nil
-		}
-		if cmp < 0 {
-			// Key would be before this entry, not found
-			break
 		}
 	}
 

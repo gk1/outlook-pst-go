@@ -2,7 +2,7 @@
   "case": "one-message",
   "folders": 3,
   "messages": 1,
-  "plan_sha256": "ed68eb3bfee3afdf2d60640992b4af9779efa41eafaf6b6ab8975f67bbf466a8",
+  "plan_sha256": "99571d26024be3a7f3ef3ad1977232072054824d7437cf62c2395392be173bce",
   "subjects": [
     "Hello"
   ],

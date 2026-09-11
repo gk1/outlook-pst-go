@@ -35,7 +35,7 @@ type region struct {
 // PMap at 0x4600, and a DList at 0x4200. Header/DList live in the unmapped
 // prefix before 0x4400.
 func NewStore() *Store {
-	s := &Store{storeState: storeState{valid: AMapValid2, unique: 1, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID}}
+	s := &Store{storeState: storeState{valid: AMapValid2, unique: 1, bidNextP: FirstAllocBID, bidNextB: FirstAllocBID, nids: DefaultRgNID()}}
 	s.dlistBID = s.takePageBID()
 	s.mustGrow()
 	return s
@@ -114,6 +114,7 @@ func (s *Store) HeaderDraft() HeaderDraft {
 	d.BidNextP = s.bidNextP
 	d.BidNextB = s.bidNextB
 	d.Unique = s.unique
+	d.NIDs = s.nids
 	if d.Unique == 0 {
 		d.Unique = 1
 	}
@@ -1130,6 +1131,7 @@ func LoadStoreFrom(r io.ReaderAt, size int64) (*Store, error) {
 		unique:        h.Unique,
 		nbtRoot:       BREF{BID: h.Root.NBTBID, IB: h.Root.NBTIB},
 		bbtRoot:       BREF{BID: h.Root.BBTBID, IB: h.Root.BBTIB},
+		nids:          h.NIDs,
 	}}
 	s.regions = make([]region, last+1)
 	for i := uint64(0); i <= last; i++ {

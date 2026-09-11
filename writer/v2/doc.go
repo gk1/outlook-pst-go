@@ -52,8 +52,10 @@
 // whose data-tree leaves are whole-row multiples, add/update/delete, and PtypObject as NID_TYPE_LTP in the
 // 4-byte cell. InspectTable / InspectTableRows check descriptors and row
 // boundaries independently of the builder.
-// Finalize currently returns ErrNotImplemented until later
-// NDB cards land.
+// PST-011 writes the minimum Unicode PST: message store, Name-to-ID map,
+// root/IPM/search/deleted folders with related hierarchy/contents/FAI tables,
+// template and search-management nodes, HEADER rgnid by type, and EntryIDs,
+// through one CommitTo. Finalize materializes that blank file.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only
