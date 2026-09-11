@@ -9,6 +9,7 @@ import (
 // MessageWrite is the on-disk IPM.Note input. Missing timestamps use the
 // FolderTree clock. Empty SearchKey/RecordKey are allocated from SequentialIDs.
 type MessageWrite struct {
+	NID         uint32 // if set, used as the on-disk NID (export-plan materialization)
 	Subject     string
 	Class       string
 	BodyText    string
@@ -402,7 +403,18 @@ func (t *FolderTree) createMessageLocked(folder uint32, w MessageWrite) (uint32,
 	if ids == nil {
 		return 0, invalidArg("ids", "NDB has no SequentialIDs")
 	}
-	nid := ids.NextNID(NIDTypeNormalMessage)
+	nid := w.NID
+	if nid == 0 {
+		nid = ids.NextNID(NIDTypeNormalMessage)
+	} else {
+		if NIDTypeOf(nid) != NIDTypeNormalMessage {
+			return 0, invalidArg("nid", "planned NID 0x%x is not a normal message", nid)
+		}
+		if _, ok := t.n.LookupNode(uint64(nid)); ok {
+			return 0, invalidArg("nid", "message NID 0x%x already exists", nid)
+		}
+		ids.EnsureIndex(NIDTypeNormalMessage, NIDIndexOf(nid)+1)
+	}
 	sentT := orTime(w.Sent, t.now)
 	recvT := orTime(w.Received, t.now)
 	createdT := orTime(w.Created, t.now)
@@ -511,6 +523,7 @@ func plannedToWrite(pm PlannedMessage, c MessageContent) MessageWrite {
 		bcc[i] = Recipient{Name: r.Name, Email: r.Email, Type: RecipBcc}
 	}
 	return MessageWrite{
+		NID:         pm.NID,
 		Subject:     pm.Subject,
 		Class:       pm.Class,
 		BodyText:    c.BodyText,

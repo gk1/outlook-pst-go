@@ -3,6 +3,7 @@ package writer
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -509,12 +510,45 @@ func TestMessageExporterFinalizeRoundTrip(t *testing.T) {
 	if _, err := hex.DecodeString(pm.SearchKey); err != nil {
 		t.Fatal(err)
 	}
+	if pm.NID == 0 || NIDTypeOf(pm.NID) != NIDTypeNormalMessage {
+		t.Fatalf("plan NID 0x%x", pm.NID)
+	}
 	if err := exp.Finalize(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "export.pst")
 	if err := os.WriteFile(path, sink.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
+	}
+	ndb, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ndb.Close()
+	if _, ok := ndb.LookupNode(uint64(pm.NID)); !ok {
+		t.Fatalf("Finalize reallocated message; planned NID 0x%x missing", pm.NID)
+	}
+	store, err := OpenPC(ndb, NIDMessageStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := store.GetBinary(PidTagRecordKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rk [16]byte
+	copy(rk[:], key)
+	pc, err := OpenPC(ndb, pm.NID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eid, err := pc.GetBinary(PidTagEntryId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantID := encodeEntryID(rk, pm.NID)
+	if !bytes.Equal(eid, wantID) {
+		t.Fatalf("EntryID %x want %x", eid, wantID)
 	}
 	p, err := outlookpst.Open(path)
 	if err != nil {
@@ -543,6 +577,114 @@ func TestMessageExporterFinalizeRoundTrip(t *testing.T) {
 	recips := collectRecips(t, m)
 	if len(recips) != 2 {
 		t.Fatalf("recips %d", len(recips))
+	}
+}
+
+func TestCreateMessagesFromPlanPreservesPlannedNIDAndEntryID(t *testing.T) {
+	n, tree, path := blankTree(t)
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned := MakeNID(NIDTypeNormalMessage, 0x12345)
+	firstDefault := NewSequentialIDs().NextNID(NIDTypeNormalMessage)
+	if planned == firstDefault {
+		t.Fatal("test NID collides with default allocator")
+	}
+	sent := time.Unix(1_700_000_111, 0).UTC()
+	recv := time.Unix(1_700_000_222, 0).UTC()
+	pm := PlannedMessage{
+		Ref:       1,
+		NID:       planned,
+		Folder:    1,
+		Subject:   "planned-nid",
+		Class:     "IPM.Note",
+		SentNano:  sent.UnixNano(),
+		RecvNano:  recv.UnixNano(),
+		Read:      true,
+		SearchKey: hex.EncodeToString(bytes.Repeat([]byte{0xAB}, 16)),
+		RecordKey: hex.EncodeToString(bytes.Repeat([]byte{0xCD}, 16)),
+		To:        []PlannedRecipient{{Name: "Bob", Email: "bob@example.com", Type: RecipTo}},
+	}
+	nids := map[FolderRef]uint32{1: inbox}
+	if err := tree.CreateMessagesFromPlan(nids, []PlannedMessage{pm}, map[MessageRef]MessageContent{1: {BodyText: "body"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := n.LookupNode(uint64(firstDefault)); ok {
+		t.Fatalf("materializer allocated default NID 0x%x instead of planned 0x%x", firstDefault, planned)
+	}
+	e, ok := n.LookupNode(uint64(planned))
+	if !ok {
+		t.Fatalf("missing planned NID 0x%x", planned)
+	}
+	if e.ParentNID != inbox {
+		t.Fatalf("parent 0x%x want inbox 0x%x", e.ParentNID, inbox)
+	}
+	pc, err := OpenPC(n, planned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eid, err := pc.GetBinary(PidTagEntryId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(eid[20:]); got != planned {
+		t.Fatalf("EntryID nid 0x%x want 0x%x", got, planned)
+	}
+	ct, err := OpenTC(n, RelatedNID(inbox, NIDTypeContentsTable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ct.GetString(planned, PidTagSubject); err != nil {
+		t.Fatalf("contents row: %v", err)
+	}
+	submit, err := ct.GetTime(planned, PidTagClientSubmitTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliver, err := ct.GetTime(planned, PidTagMessageDeliveryTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submit != filetimeOf(sent) || deliver != filetimeOf(recv) {
+		t.Fatalf("contents times submit=%d deliver=%d", submit, deliver)
+	}
+	var recip bool
+	if err := n.WalkSubnodes(e.SubBID, func(ent SLEntry) error {
+		if uint32(ent.NID) == RelatedNID(planned, NIDTypeRecipientTable) {
+			recip = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !recip {
+		t.Fatal("recipient table not attached to planned NID")
+	}
+	next, err := tree.CreateMessage(inbox, MessageWrite{Subject: "next", Read: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == planned || next == firstDefault {
+		t.Fatalf("next NID 0x%x collided", next)
+	}
+	if NIDIndexOf(next) <= NIDIndexOf(planned) {
+		t.Fatalf("EnsureIndex did not advance past planned index: next=0x%x planned=0x%x", next, planned)
+	}
+	commitTree(t, n, path)
+	pst, err := outlookpst.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pst.Close()
+	root, err := pst.RootFolder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := findFolder(t, root, "Min Store", "Inbox")
+	msgs := collectMessages(t, in)
+	if len(msgs) != 2 {
+		t.Fatalf("reader msgs %d", len(msgs))
 	}
 }
 
