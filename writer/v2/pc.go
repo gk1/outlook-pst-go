@@ -1,7 +1,9 @@
 package writer
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
 	"unicode/utf16"
 )
 
@@ -109,7 +111,27 @@ func (p *PC) SetString(id uint16, s string) error {
 }
 
 func (p *PC) SetBinary(id uint16, b []byte) error {
+	if len(b) > HeapMaxAlloc {
+		return p.SetBinaryStream(id, bytes.NewReader(b), int64(len(b)))
+	}
 	return p.Set(id, PtypBinary, b)
+}
+
+// SetBinaryStream stores a PtypBinary by streaming r through an HNID data
+// tree (MS-PST 2.3.1 / 2.4.6.2.2). The payload is not retained on the PC.
+func (p *PC) SetBinaryStream(id uint16, r io.Reader, size int64) error {
+	if p == nil {
+		return invalidArg("pc", "nil PC")
+	}
+	hnid, err := p.heap.AllocateStream(r, size)
+	if err != nil {
+		return err
+	}
+	if _, ok := p.props[id]; !ok {
+		p.order = append(p.order, id)
+	}
+	p.props[id] = pcProp{typ: PtypBinary, hnid: hnid}
+	return nil
 }
 
 func (p *PC) SetInt32(id uint16, v int32) error {

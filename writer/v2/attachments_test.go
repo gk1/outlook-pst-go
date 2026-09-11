@@ -390,3 +390,228 @@ func TestAttachmentPlanGoldenUnchanged(t *testing.T) {
 		t.Fatalf("attachment golden sha %x want %s", sum, bytes.TrimSpace(want))
 	}
 }
+
+func hasProp(cols []ColumnView, id uint16) bool {
+	for _, c := range cols {
+		if c.PropID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAttachmentTableTemplate(t *testing.T) {
+	_, n := writeBlank(t, MinimumSpec{DisplayName: "Min Store"})
+	if _, ok := n.LookupNode(uint64(NIDAttachmentTable)); !ok {
+		t.Fatal("missing NID_ATTACHMENT_TABLE 0x671")
+	}
+	tc, err := OpenTC(n, NIDAttachmentTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc.RowCount() != 0 {
+		t.Fatalf("template rows %d, want 0", tc.RowCount())
+	}
+	cols := tc.Info().Columns
+	for _, id := range []uint16{PidTagAttachSize, PidTagAttachFilename, PidTagAttachMethod, PidTagRenderingPosition, PidTagLtpRowId, PidTagLtpRowVer} {
+		if !hasProp(cols, id) {
+			t.Fatalf("template missing column 0x%04x", id)
+		}
+	}
+}
+
+func TestPerMessageAttachmentTableRenderingPosition(t *testing.T) {
+	n, tree, path := blankTree(t)
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nid, err := tree.CreateMessage(inbox, MessageWrite{
+		Subject: "pos",
+		Read:    true,
+		Attachments: []AttachmentWrite{
+			{Filename: "file.bin", Data: []byte("x")},
+			{Filename: "in.png", Inline: true, Data: png1x1},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := openSubTC(n, nid, RelatedNID(nid, NIDTypeAttachmentTable))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasProp(tbl.Info().Columns, PidTagRenderingPosition) {
+		t.Fatal("per-message table missing PidTagRenderingPosition")
+	}
+	ids, err := tbl.RowIDs()
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("rows %v %v", ids, err)
+	}
+	pos0, err := tbl.GetInt32(ids[0], PidTagRenderingPosition)
+	if err != nil || pos0 != RenderingPositionNone {
+		t.Fatalf("file pos %d %v", pos0, err)
+	}
+	pos1, err := tbl.GetInt32(ids[1], PidTagRenderingPosition)
+	if err != nil || pos1 != 0 {
+		t.Fatalf("inline pos %d %v", pos1, err)
+	}
+	commitTree(t, n, path)
+}
+
+func TestNoAttachmentTableWithoutAttachments(t *testing.T) {
+	n, tree, _ := blankTree(t)
+	inbox, err := tree.Create(tree.IPM(), "Inbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nid, err := tree.CreateMessage(inbox, MessageWrite{Subject: "plain", BodyText: "hi"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := n.LookupNode(uint64(nid))
+	if !ok {
+		t.Fatal("missing message")
+	}
+	want := RelatedNID(nid, NIDTypeAttachmentTable)
+	err = n.WalkSubnodes(e.SubBID, func(s SLEntry) error {
+		if uint32(s.NID) == want {
+			t.Fatalf("empty message has attachment table subnode 0x%x", s.NID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAttachmentStreamingDoesNotRetainBytes(t *testing.T) {
+	sink := NewMemSink("mail")
+	exp, err := New(Options{
+		Sink:        sink,
+		DisplayName: "Min Store",
+		Clock:       FixedClock{T: time.Unix(1_700_000_000, 0).UTC()},
+		IDs:         NewSequentialIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	if err := exp.CreateMailbox(Mailbox{DisplayName: "Min Store"}); err != nil {
+		t.Fatal(err)
+	}
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte{'Q'}, MaxDataBlockCB+64)
+	want := sha256.Sum256(payload)
+	ref, err := exp.CreateMessage(inbox, MessageSpec{
+		Subject: "stream",
+		Attachments: []AttachmentSpec{{
+			Filename: "large.bin",
+			MIMEType: "application/octet-stream",
+			Size:     int64(len(payload)),
+			Body:     bytes.NewReader(payload),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exp.MessageContent(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attachments) != 1 {
+		t.Fatal(got.Attachments)
+	}
+	if len(got.Attachments[0].Bytes) != 0 {
+		t.Fatalf("retained %d bytes in AttachmentContent.Bytes", len(got.Attachments[0].Bytes))
+	}
+	if got.Attachments[0].SHA256 != hex.EncodeToString(want[:]) {
+		t.Fatalf("sha %s", got.Attachments[0].SHA256)
+	}
+	if err := exp.Finalize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "stream.pst")
+	if err := os.WriteFile(path, sink.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pst, err := outlookpst.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pst.Close()
+	root, err := pst.RootFolder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := findFolder(t, root, "Min Store", "Inbox")
+	atts := collectAttach(t, collectMessages(t, in)[0])
+	data, err := atts[0].Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	if sum != want {
+		t.Fatalf("reopen hash %x want %x", sum, want)
+	}
+}
+
+func TestAllocateStreamDoesNotRetainPayload(t *testing.T) {
+	n := NewNDB(nil)
+	h := NewHeap(n, HeapSigPC)
+	large := bytes.Repeat([]byte{'Z'}, HeapMaxAlloc+100)
+	if _, err := h.AllocateStream(bytes.NewReader(large), int64(len(large))); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.subs) != 1 {
+		t.Fatalf("subs %d", len(h.subs))
+	}
+	if len(h.subs[0].data) != 0 {
+		t.Fatalf("heap retained %d payload bytes", len(h.subs[0].data))
+	}
+	if h.subs[0].dataBID == 0 {
+		t.Fatal("missing streamed data BID")
+	}
+}
+
+func TestNonSeekableAttachmentSpoolsNotBytes(t *testing.T) {
+	exp, err := New(Options{
+		DisplayName: "Min Store",
+		Clock:       FixedClock{T: time.Unix(1_700_000_000, 0).UTC()},
+		IDs:         NewSequentialIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exp.Close()
+	inbox, err := exp.CreateFolder(FolderSpec{Name: "Inbox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("spooled-bytes")
+	r := &countingReader{max: int64(len(payload))}
+	ref, err := exp.CreateMessage(inbox, MessageSpec{
+		Subject: "spool",
+		Attachments: []AttachmentSpec{{
+			Filename: "s.bin",
+			Size:     int64(len(payload)),
+			Body:     r,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exp.MessageContent(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Attachments[0].Bytes) != 0 {
+		t.Fatalf("retained bytes %d", len(got.Attachments[0].Bytes))
+	}
+	if got.Attachments[0].Body == nil {
+		t.Fatal("missing spool Body")
+	}
+}

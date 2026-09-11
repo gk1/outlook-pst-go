@@ -1,26 +1,28 @@
 package writer
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 )
 
 // session is the concrete Exporter.
 type session struct {
-	opts     Options
-	closed   bool
-	mailbox  bool
-	nextFold FolderRef
-	nextMsg  MessageRef
-	folders  map[FolderRef]PlannedFolder
-	content  map[MessageRef]MessageContent
-	plan     Plan
+	opts       Options
+	closed     bool
+	mailbox    bool
+	nextFold   FolderRef
+	nextMsg    MessageRef
+	folders    map[FolderRef]PlannedFolder
+	content    map[MessageRef]MessageContent
+	plan       Plan
+	spools     []string
+	spoolFiles []*os.File
 }
 
 // New constructs a v2 exporter. CryptWIP and ANSI are rejected here.
@@ -307,7 +309,7 @@ func (s *session) CreateMessage(folder FolderRef, msg MessageSpec) (MessageRef, 
 	if bodyBytes > s.opts.Limits.MaxMessageBytes {
 		return 0, limitErr("MaxMessageBytes", "message body %d exceeds %d", bodyBytes, s.opts.Limits.MaxMessageBytes)
 	}
-	atts, stored, attBytes, err := snapshotAttachments(msg.Attachments, s.opts.Limits, s.opts.Limits.MaxMessageBytes-bodyBytes)
+	atts, stored, attBytes, err := s.snapshotAttachments(msg.Attachments, s.opts.Limits, s.opts.Limits.MaxMessageBytes-bodyBytes)
 	if err != nil {
 		return 0, err
 	}
@@ -395,11 +397,11 @@ func validateSensitivity(v Sensitivity) error {
 	}
 }
 
-func snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]PlannedAttachment, []AttachmentContent, int64, error) {
-	return snapshotAttachmentsAt(in, lim, remain, 0, map[*MessageSpec]struct{}{})
+func (s *session) snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]PlannedAttachment, []AttachmentContent, int64, error) {
+	return s.snapshotAttachmentsAt(in, lim, remain, 0, map[*MessageSpec]struct{}{})
 }
 
-func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) ([]PlannedAttachment, []AttachmentContent, int64, error) {
+func (s *session) snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) ([]PlannedAttachment, []AttachmentContent, int64, error) {
 	if len(in) == 0 {
 		return []PlannedAttachment{}, []AttachmentContent{}, 0, nil
 	}
@@ -414,7 +416,7 @@ func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth 
 			return nil, nil, 0, unsupported(FeatureOLE, fmt.Sprintf("attachment %d", i))
 		}
 		if a.Embedded != nil {
-			pm, storedEmb, n, err := snapshotEmbedded(a, lim, remain-total, depth, stack)
+			pm, storedEmb, n, err := s.snapshotEmbedded(a, lim, remain-total, depth, stack)
 			if err != nil {
 				return nil, nil, 0, err
 			}
@@ -458,7 +460,7 @@ func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth 
 			}
 			budget = a.Size
 		}
-		data, err := readBounded(a.Body, budget)
+		hex, n, body, err := s.hashAttachmentBody(a.Body, budget)
 		if err != nil {
 			if errors.Is(err, ErrLimit) {
 				if a.Size > 0 {
@@ -471,12 +473,9 @@ func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth 
 			}
 			return nil, nil, 0, err
 		}
-		n := int64(len(data))
 		if a.Size > 0 && n != a.Size {
 			return nil, nil, 0, invalidArg("size", "attachment %d size %d != read %d", i, a.Size, n)
 		}
-		sum := sha256.Sum256(data)
-		hex := fmt.Sprintf("%x", sum[:])
 		total += n
 		out = append(out, PlannedAttachment{
 			Filename:  a.Filename,
@@ -492,13 +491,14 @@ func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth 
 			ContentID: a.ContentID,
 			Inline:    a.Inline,
 			SHA256:    hex,
-			Bytes:     data,
+			Size:      n,
+			Body:      body,
 		})
 	}
 	return out, stored, total, nil
 }
 
-func snapshotEmbedded(a AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) (*PlannedMessage, *MessageContent, int64, error) {
+func (s *session) snapshotEmbedded(a AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) (*PlannedMessage, *MessageContent, int64, error) {
 	msg := a.Embedded
 	if msg == nil {
 		return nil, nil, 0, invalidArg("embedded", "nil MessageSpec")
@@ -531,7 +531,7 @@ func snapshotEmbedded(a AttachmentSpec, lim Limits, remain int64, depth int, sta
 	if bodyBytes > remain {
 		return nil, nil, 0, limitErr("MaxMessageBytes", "embedded message exceeds remaining %d", remain)
 	}
-	atts, stored, attBytes, err := snapshotAttachmentsAt(msg.Attachments, lim, remain-bodyBytes, depth+1, stack)
+	atts, stored, attBytes, err := s.snapshotAttachmentsAt(msg.Attachments, lim, remain-bodyBytes, depth+1, stack)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -581,21 +581,60 @@ func snapshotEmbedded(a AttachmentSpec, lim Limits, remain int64, depth int, sta
 	return pm, c, n, nil
 }
 
-// readBounded copies at most cap bytes. Reading cap+1 bytes is a limit error
-// so a huge/unbounded stream is not consumed to EOF.
-func readBounded(r io.Reader, capn int64) ([]byte, error) {
+// hashAttachmentBody hashes at most capn bytes without retaining the payload
+// in memory. Seekable readers are rewound; others are spooled to a temp file.
+// Reading capn+1 bytes is a limit error so a huge stream is not consumed to EOF.
+func (s *session) hashAttachmentBody(r io.Reader, capn int64) (string, int64, io.Reader, error) {
+	if r == nil {
+		return "", 0, nil, invalidArg("body", "nil Body")
+	}
 	if capn < 0 {
 		capn = 0
 	}
-	var buf bytes.Buffer
-	n, err := buf.ReadFrom(io.LimitReader(r, capn+1))
-	if err != nil {
-		return nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+	h := sha256.New()
+	limited := io.LimitReader(r, capn+1)
+	var n int64
+	var body io.Reader
+	if rs, ok := r.(io.ReadSeeker); ok {
+		copied, err := io.Copy(h, limited)
+		if err != nil {
+			return "", 0, nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+		}
+		n = copied
+		if n > capn {
+			return "", n, nil, limitErr("read", "payload exceeds %d bytes", capn)
+		}
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			return "", 0, nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+		}
+		body = rs
+	} else {
+		f, err := os.CreateTemp("", "pst-att-*.bin")
+		if err != nil {
+			return "", 0, nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+		}
+		copied, err := io.Copy(io.MultiWriter(f, h), limited)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return "", 0, nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+		}
+		n = copied
+		if n > capn {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return "", n, nil, limitErr("read", "payload exceeds %d bytes", capn)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+			return "", 0, nil, &Error{Code: CodeIO, Detail: err.Error(), Err: err}
+		}
+		s.spoolFiles = append(s.spoolFiles, f)
+		s.spools = append(s.spools, f.Name())
+		body = f
 	}
-	if n > capn {
-		return nil, limitErr("read", "payload exceeds %d bytes", capn)
-	}
-	return buf.Bytes(), nil
+	return fmt.Sprintf("%x", h.Sum(nil)), n, body, nil
 }
 
 func rejectUnsupportedMessage(msg MessageSpec) error {
@@ -660,6 +699,14 @@ func (s *session) Finalize(ctx context.Context) error {
 
 func (s *session) Close() error {
 	s.closed = true
+	for _, f := range s.spoolFiles {
+		_ = f.Close()
+	}
+	s.spoolFiles = nil
+	for _, pth := range s.spools {
+		_ = os.Remove(pth)
+	}
+	s.spools = nil
 	if s.opts.Sink != nil {
 		return s.opts.Sink.Close()
 	}

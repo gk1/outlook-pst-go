@@ -115,7 +115,7 @@ func messageSizeOf(w MessageWrite) int32 {
 		n += len(r.Name) + len(r.Email) + 64
 	}
 	for _, a := range w.Attachments {
-		n += len(a.Filename) + len(a.Data) + 64
+		n += len(a.Filename) + int(attachSizeOf(a)) + 64
 		if a.Embedded != nil {
 			n += int(messageSizeOf(*a.Embedded))
 		}
@@ -577,6 +577,11 @@ func plannedAttachments(plan []PlannedAttachment, stored []AttachmentContent) []
 			ContentID: stored[i].ContentID,
 			Inline:    stored[i].Inline,
 			Data:      stored[i].Bytes,
+			Body:      stored[i].Body,
+			Size:      stored[i].Size,
+		}
+		if a.Size == 0 && len(a.Data) > 0 {
+			a.Size = int64(len(a.Data))
 		}
 		if stored[i].Embedded != nil && plan[i].Embedded != nil {
 			nested := plannedToWrite(*plan[i].Embedded, *stored[i].Embedded)

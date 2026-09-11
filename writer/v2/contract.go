@@ -67,8 +67,9 @@ type Recipient struct {
 	Type  RecipType
 }
 
-// AttachmentSpec is a by-value attachment. Body is read once during CreateMessage
-// with a bounded LimitReader; bytes are retained for Finalize.
+// AttachmentSpec is a by-value attachment. Body is hashed with a bounded
+// LimitReader during CreateMessage and retained as a stream for Finalize
+// (seekable readers are rewound; others are spooled to a temp file).
 // Size, if > 0, is the expected byte count; a mismatch is ErrInvalidArg.
 type AttachmentSpec struct {
 	Filename  string
@@ -106,14 +107,17 @@ type MessageSpec struct {
 	Attachments       []AttachmentSpec
 }
 
-// AttachmentContent is the retained by-value payload for later codecs.
+// AttachmentContent is the hashed by-value payload for later codecs.
+// Bytes is unused; Body is the stream Finalize materializes through data trees.
 type AttachmentContent struct {
 	Filename  string
 	MIMEType  string
 	ContentID string
 	Inline    bool
 	SHA256    string
-	Bytes     []byte
+	Size      int64
+	Body      io.Reader
+	Bytes     []byte // kept for API compatibility; streaming leaves this nil
 	Embedded  *MessageContent
 }
 

@@ -390,6 +390,37 @@ func OpenTC(n *NDB, nid uint32) (*TCView, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openTCHeap(h, nid)
+}
+
+func openSubTC(n *NDB, parent, child uint32) (*TCView, error) {
+	e, ok := n.LookupNode(uint64(parent))
+	if !ok {
+		return nil, invalidArg("nid", "missing parent 0x%x", parent)
+	}
+	var found SLEntry
+	var okFound bool
+	err := n.WalkSubnodes(e.SubBID, func(s SLEntry) error {
+		if uint32(s.NID) == child {
+			found = s
+			okFound = true
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !okFound {
+		return nil, invalidArg("nid", "missing subnode 0x%x under 0x%x", child, parent)
+	}
+	h, err := openHeapBids(n, child, found.DataBID, found.SubBID)
+	if err != nil {
+		return nil, err
+	}
+	return openTCHeap(h, child)
+}
+
+func openTCHeap(h *HeapView, nid uint32) (*TCView, error) {
 	if h.ClientSig() != HeapSigTC {
 		return nil, invariant(SectionTCINFO, "bClientSig", "got 0x%02x want 0x%02x", h.ClientSig(), HeapSigTC)
 	}

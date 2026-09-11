@@ -85,9 +85,13 @@ func OpenHeap(n *NDB, nid uint32) (*HeapView, error) {
 	if !ok {
 		return nil, invalidArg("nid", "missing heap node 0x%x", nid)
 	}
-	h := &HeapView{n: n, nid: nid, dataBID: e.DataBID, subBID: e.SubBID}
+	return openHeapBids(n, nid, e.DataBID, e.SubBID)
+}
+
+func openHeapBids(n *NDB, nid uint32, dataBID, subBID uint64) (*HeapView, error) {
+	h := &HeapView{n: n, nid: nid, dataBID: dataBID, subBID: subBID}
 	var idx int
-	_, err := n.walkDataTree(e.DataBID, func(bid uint64, _ uint16) error {
+	_, err := n.walkDataTree(dataBID, func(bid uint64, _ uint16) error {
 		blk, ok := n.LookupBlock(bid)
 		if !ok {
 			return invariant(SectionHN, "page", "missing HN page BID 0x%x", bid)

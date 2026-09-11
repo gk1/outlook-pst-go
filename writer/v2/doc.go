@@ -65,10 +65,13 @@
 // flags, importance, timestamps, search/record keys, and a Recipient Table
 // subnode that exists even with zero rows. Contents-table rows and folder
 // content/unread counts stay coherent with the message node.
-// PST-014 writes the Attachment Table (including zero rows) and attachment
-// PCs: by-value binaries (large values as HNID data trees), Unicode/duplicate
-// names, inline MHTML flags, and ATTACH_EMBEDDED_MSG with bounded nesting
-// and cycle protection. Message flags, sizes, and HasAttachments stay coherent.
+// PST-014 writes the PST-wide Attachment Table Template at NID 0x671 and
+// per-message Attachment Tables (only when attachments exist; MS-PST 2.4.6)
+// whose columns include PidTagRenderingPosition. By-value binaries stream
+// through HNID data trees without retaining mailbox payloads in memory.
+// Unicode/duplicate names, inline MHTML flags, and ATTACH_EMBEDDED_MSG
+// with bounded nesting and cycle protection. Message flags, sizes, and
+// HasAttachments stay coherent.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only

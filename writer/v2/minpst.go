@@ -133,6 +133,9 @@ func WriteMinimum(n *NDB, spec MinimumSpec) error {
 	if err := writeEmptyTC(n, NIDSearchFolderTemplate, 0, hierarchyColumns()); err != nil {
 		return err
 	}
+	if err := writeEmptyTC(n, NIDAttachmentTable, 0, attachmentTemplateColumns()); err != nil {
+		return err
+	}
 	for _, nid := range []uint32{
 		NIDSearchManagementQueue,
 		NIDSearchActivityList,

@@ -3,7 +3,9 @@ package writer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -172,8 +174,18 @@ func TestMessageContentRetainedForFinalize(t *testing.T) {
 	if got.BodyText != "plain body" || got.BodyHTML != "<p>html</p>" || got.InternetHeaders != "X-Test: 1\r\n" {
 		t.Fatalf("content %+v", got)
 	}
-	if len(got.Attachments) != 1 || !bytes.Equal(got.Attachments[0].Bytes, payload) {
+	if len(got.Attachments) != 1 {
 		t.Fatalf("attachment %+v", got.Attachments)
+	}
+	if len(got.Attachments[0].Bytes) != 0 {
+		t.Fatalf("CreateMessage retained attachment bytes in memory: %d", len(got.Attachments[0].Bytes))
+	}
+	sum := sha256.Sum256(payload)
+	if got.Attachments[0].SHA256 != fmt.Sprintf("%x", sum[:]) {
+		t.Fatalf("sha %s", got.Attachments[0].SHA256)
+	}
+	if got.Attachments[0].Body == nil {
+		t.Fatal("missing streamed Body")
 	}
 	p := exp.Plan()
 	if p.Messages[0].BodyTextSHA256 == "" || p.Messages[0].HeadersSHA256 == "" {

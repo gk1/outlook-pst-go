@@ -20,6 +20,7 @@ func requiredNIDs(ipm, waste, finder uint32) []uint32 {
 		NIDNameToIDMap,
 		NIDNormalFolderTemplate,
 		NIDSearchFolderTemplate,
+		NIDAttachmentTable,
 		NIDRootFolder,
 		NIDSearchManagementQueue,
 		NIDSearchActivityList,

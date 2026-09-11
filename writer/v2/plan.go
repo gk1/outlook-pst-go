@@ -37,8 +37,8 @@ type PlannedRecipient struct {
 	Type  RecipType `json:"type"`
 }
 
-// PlannedAttachment is an attachment snapshot (content hashed, bytes retained
-// on the exporter until Finalize).
+// PlannedAttachment is an attachment snapshot (content hashed; the payload
+// stream is retained separately on MessageContent, not in the plan).
 type PlannedAttachment struct {
 	Filename  string          `json:"filename"`
 	MIMEType  string          `json:"mime_type"`

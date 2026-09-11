@@ -3,6 +3,7 @@ package writer
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"sort"
 )
 
@@ -162,6 +163,41 @@ func (h *Heap) Allocate(data []byte) (uint32, error) {
 	h.pages[i].allocs = append(h.pages[i].allocs, append([]byte(nil), data...))
 	h.pages[i].hids = append(h.pages[i].hids, hid)
 	return hid, nil
+}
+
+// AllocateStream places r as an HN allocation or a data-tree HNID.
+// Values larger than HeapMaxAlloc are streamed into the NDB immediately
+// and are not retained on the Heap.
+func (h *Heap) AllocateStream(r io.Reader, size int64) (uint32, error) {
+	if h == nil || h.n == nil {
+		return 0, invalidArg("heap", "nil heap")
+	}
+	if size < 0 {
+		return 0, invalidArg("size", "negative stream size %d", size)
+	}
+	if size <= int64(HeapMaxAlloc) {
+		buf := make([]byte, int(size))
+		if size > 0 {
+			if r == nil {
+				return 0, invalidArg("reader", "data tree reader is nil")
+			}
+			if _, err := io.ReadFull(r, buf); err != nil {
+				return 0, ioErr("reader", "heap stream: %v", err)
+			}
+		}
+		return h.Allocate(buf)
+	}
+	if r == nil {
+		return 0, invalidArg("reader", "data tree reader is nil")
+	}
+	blk, err := h.n.streamDataTree(io.LimitReader(r, size), size)
+	if err != nil {
+		return 0, err
+	}
+	nid := MakeNID(NIDTypeLTP, h.nextSub)
+	h.nextSub++
+	h.subs = append(h.subs, heapSub{nid: nid, dataBID: blk.BID})
+	return nid, nil
 }
 
 func (h *Heap) encodePages() ([][]byte, []byte, error) {

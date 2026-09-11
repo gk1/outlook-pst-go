@@ -1,6 +1,7 @@
 package writer
 
 import (
+	"io"
 	"path"
 	"strings"
 	"unicode"
@@ -8,13 +9,28 @@ import (
 )
 
 // AttachmentWrite is one by-value or embedded-message attachment.
+// Body, when set, is streamed into an HNID data tree; Data is the in-memory
+// alternative used by the FolderTree object-model API.
 type AttachmentWrite struct {
 	Filename  string
 	MIMEType  string
 	ContentID string
 	Inline    bool
 	Data      []byte
+	Body      io.Reader
+	Size      int64
 	Embedded  *MessageWrite
+}
+
+// attachmentTemplateColumns is the PST-wide Attachment Table Template
+// (MS-PST 2.4.6.1.1). PidTagLtpRowId / PidTagLtpRowVer are injected by NewTC.
+func attachmentTemplateColumns() []ColumnView {
+	return []ColumnView{
+		{PropType: PtypInteger32, PropID: PidTagAttachSize},
+		{PropType: PtypString, PropID: PidTagAttachFilename},
+		{PropType: PtypInteger32, PropID: PidTagAttachMethod},
+		{PropType: PtypInteger32, PropID: PidTagRenderingPosition},
+	}
 }
 
 func attachmentColumns() []ColumnView {
@@ -22,11 +38,19 @@ func attachmentColumns() []ColumnView {
 		{PropType: PtypInteger32, PropID: PidTagAttachNumber},
 		{PropType: PtypInteger32, PropID: PidTagAttachSize},
 		{PropType: PtypInteger32, PropID: PidTagAttachMethod},
+		{PropType: PtypInteger32, PropID: PidTagRenderingPosition},
 		{PropType: PtypString, PropID: PidTagAttachLongFilename},
 		{PropType: PtypString, PropID: PidTagAttachFilename},
 		{PropType: PtypString, PropID: PidTagAttachMimeTag},
 		{PropType: PtypString, PropID: PidTagAttachContentId},
 	}
+}
+
+func renderingPosition(a AttachmentWrite) int32 {
+	if a.Inline {
+		return 0
+	}
+	return RenderingPositionNone
 }
 
 func attachExtension(name string) string {
@@ -75,6 +99,9 @@ func attachSizeOf(a AttachmentWrite) int32 {
 	if a.Embedded != nil {
 		return messageSizeOf(*a.Embedded)
 	}
+	if a.Body != nil {
+		return int32(a.Size)
+	}
 	return int32(len(a.Data))
 }
 
@@ -88,13 +115,16 @@ func validateAttachmentTree(w MessageWrite, lim Limits, depth int, seen map[*Mes
 	for i := range w.Attachments {
 		a := &w.Attachments[i]
 		n := int64(len(a.Data))
+		if a.Body != nil {
+			n = a.Size
+		}
 		if n > lim.MaxAttachmentBytes {
 			return limitErr("MaxAttachmentBytes", "attachment %d is %d bytes, cap %d", i, n, lim.MaxAttachmentBytes)
 		}
 		if a.Embedded == nil {
 			continue
 		}
-		if len(a.Data) > 0 {
+		if len(a.Data) > 0 || a.Body != nil {
 			return invalidArg("body", "embedded attachment %d must not also have Data", i)
 		}
 		if depth+1 > lim.MaxEmbeddedDepth {
@@ -120,6 +150,12 @@ func validateAttachmentTree(w MessageWrite, lim Limits, depth int, seen map[*Mes
 }
 
 func (t *FolderTree) attachAttachments(parent *Heap, msgNID uint32, w MessageWrite, depth int, seen map[*MessageWrite]struct{}) error {
+	// MS-PST 2.4.6: the per-message Attachment Table exists only when the
+	// message has at least one Attachment object. The PST-wide empty
+	// template at NID_ATTACHMENT_TABLE (0x671) is the zero-row schema.
+	if len(w.Attachments) == 0 {
+		return nil
+	}
 	tc, err := NewTC(t.n, attachmentColumns())
 	if err != nil {
 		return err
@@ -160,6 +196,9 @@ func writeAttachmentRow(tc *TC, nid uint32, number int, a AttachmentWrite) error
 		return err
 	}
 	if err := tc.SetInt32(nid, PidTagAttachMethod, method); err != nil {
+		return err
+	}
+	if err := tc.SetInt32(nid, PidTagRenderingPosition, renderingPosition(a)); err != nil {
 		return err
 	}
 	if err := tc.SetString(nid, PidTagAttachLongFilename, name); err != nil {
@@ -236,6 +275,12 @@ func (t *FolderTree) buildAttachmentPC(nid uint32, number int, a AttachmentWrite
 			return nil, err
 		}
 		if err := pc.SetObjectNID(PidTagAttachDataBinary, embedNID); err != nil {
+			return nil, err
+		}
+		return pc, nil
+	}
+	if a.Body != nil {
+		if err := pc.SetBinaryStream(PidTagAttachDataBinary, a.Body, a.Size); err != nil {
 			return nil, err
 		}
 		return pc, nil
