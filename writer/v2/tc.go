@@ -250,23 +250,13 @@ func (t *TC) encodeRow(r tcRow) ([]byte, error) {
 	return row, nil
 }
 
-func packRowMatrix(rows [][]byte, rowSize int, blocked bool) []byte {
+func packRowMatrix(rows [][]byte, rowSize int) []byte {
 	if len(rows) == 0 {
 		return nil
 	}
-	if !blocked {
-		buf := make([]byte, len(rows)*rowSize)
-		for i, r := range rows {
-			copy(buf[i*rowSize:], r)
-		}
-		return buf
-	}
-	rpb := tableRowsPerBlock(rowSize)
-	nBlocks := (len(rows) + rpb - 1) / rpb
-	last := len(rows) - (nBlocks-1)*rpb
-	buf := make([]byte, (nBlocks-1)*MaxDataBlockCB+last*rowSize)
+	buf := make([]byte, len(rows)*rowSize)
 	for i, r := range rows {
-		copy(buf[tableRowOffset(i, rowSize, true):], r)
+		copy(buf[i*rowSize:], r)
 	}
 	return buf
 }
@@ -291,10 +281,19 @@ func (t *TC) Commit(nid uint32) error {
 	blocked := tight > HeapMaxAlloc
 	var matrixHNID uint32
 	if len(t.rows) > 0 {
-		var err error
-		matrixHNID, err = t.heap.Allocate(packRowMatrix(raws, rowSize, blocked))
-		if err != nil {
-			return err
+		packed := packRowMatrix(raws, rowSize)
+		if blocked {
+			leafCB := tableRowsPerBlock(rowSize) * rowSize
+			if leafCB < 1 {
+				return invariant(SectionRowMatrix, "cbRow", "row size %d exceeds data block %d (MS-PST %s)", rowSize, MaxDataBlockCB, SectionRowMatrix)
+			}
+			matrixHNID = t.heap.newSubChunked(packed, leafCB)
+		} else {
+			var err error
+			matrixHNID, err = t.heap.Allocate(packed)
+			if err != nil {
+				return err
+			}
 		}
 		if blocked && IsHID(matrixHNID) {
 			return invariant(SectionRowMatrix, "hnidRows", "blocked matrix stayed a HID 0x%x", matrixHNID)
@@ -397,15 +396,12 @@ func (v *TCView) inspectMatrixLeaves() error {
 		found = true
 		var i int
 		_, err := v.heap.n.walkDataTree(e.DataBID, func(_ uint64, cb uint16) error {
+			if rowSize > 0 && int(cb)%rowSize != 0 {
+				return invariant(SectionRowMatrix, "row", "leaf %d size %d splits a row of %d (MS-PST %s)", i, cb, rowSize, SectionRowMatrix)
+			}
 			n := int(cb) / rowSize
 			if n > rpb {
 				return invariant(SectionRowMatrix, "cb", "leaf %d holds %d rows, max %d (MS-PST %s)", i, n, rpb, SectionRowMatrix)
-			}
-			if n*rowSize > int(cb) {
-				return invariant(SectionRowMatrix, "row", "leaf %d size %d is not a row multiple", i, cb)
-			}
-			if int(cb)%rowSize != int(cb)-n*rowSize {
-				return invariant(SectionRowMatrix, "row", "leaf %d size %d splits a row of %d", i, cb, rowSize)
 			}
 			i++
 			return nil

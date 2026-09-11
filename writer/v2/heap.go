@@ -74,8 +74,9 @@ type hnPage struct {
 }
 
 type heapSub struct {
-	nid  uint32
-	data []byte
+	nid    uint32
+	data   []byte
+	leafCB int // 0 = MaxDataBlockCB; otherwise each data-tree leaf is at most leafCB
 }
 
 // Heap is a Unicode Heap-on-Node builder. See MS-PST 2.3.1.
@@ -98,9 +99,13 @@ func (h *Heap) SetRoot(hid uint32) { h.root = hid }
 func (h *Heap) Root() uint32 { return h.root }
 
 func (h *Heap) newSub(data []byte) uint32 {
+	return h.newSubChunked(data, 0)
+}
+
+func (h *Heap) newSubChunked(data []byte, leafCB int) uint32 {
 	nid := MakeNID(NIDTypeLTP, h.nextSub)
 	h.nextSub++
-	h.subs = append(h.subs, heapSub{nid: nid, data: append([]byte(nil), data...)})
+	h.subs = append(h.subs, heapSub{nid: nid, data: append([]byte(nil), data...), leafCB: leafCB})
 	return nid
 }
 
@@ -278,7 +283,13 @@ func (h *Heap) commitLocked(nid uint32) error {
 	if len(h.subs) > 0 {
 		ents := make([]SLEntry, len(h.subs))
 		for i, s := range h.subs {
-			blk, err := h.n.streamDataTree(bytes.NewReader(s.data), int64(len(s.data)))
+			var blk BBTEntry
+			var err error
+			if s.leafCB > 0 {
+				blk, err = putDataLeaves(h.n, s.data, s.leafCB)
+			} else {
+				blk, err = h.n.streamDataTree(bytes.NewReader(s.data), int64(len(s.data)))
+			}
 			if err != nil {
 				return err
 			}
@@ -290,6 +301,39 @@ func (h *Heap) commitLocked(nid uint32) error {
 		}
 	}
 	return h.n.PutNode(NBTEntry{NID: uint64(nid), DataBID: data.BID, SubBID: sub.BID})
+}
+
+// putDataLeaves writes data as a data tree whose leaves are at most leafCB
+// bytes. The last leaf may be shorter. leafCB must be in 1..MaxDataBlockCB.
+func putDataLeaves(n *NDB, data []byte, leafCB int) (BBTEntry, error) {
+	if n == nil {
+		return BBTEntry{}, invalidArg("ndb", "nil NDB")
+	}
+	if leafCB < 1 || leafCB > MaxDataBlockCB {
+		return BBTEntry{}, invalidArg("cb", "leaf size %d, want 1..%d", leafCB, MaxDataBlockCB)
+	}
+	if len(data) == 0 {
+		return BBTEntry{}, nil
+	}
+	var leaves []BBTEntry
+	var total uint32
+	for off := 0; off < len(data); {
+		ncb := leafCB
+		if off+ncb > len(data) {
+			ncb = len(data) - off
+		}
+		e, err := n.AllocBlock(uint16(ncb))
+		if err != nil {
+			return BBTEntry{}, err
+		}
+		if err := n.putPayload(e, data[off:off+ncb]); err != nil {
+			return BBTEntry{}, err
+		}
+		leaves = append(leaves, e)
+		total += uint32(ncb)
+		off += ncb
+	}
+	return n.buildDataTree(leaves, total)
 }
 
 // HNPageView is a decoded HN page. See MS-PST 2.3.1.2–2.3.1.5.

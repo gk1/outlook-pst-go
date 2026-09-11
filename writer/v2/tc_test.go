@@ -353,6 +353,84 @@ func TestTCObjectHNIDFileReopen(t *testing.T) {
 	}
 }
 
+func TestTCBlockedMatrixLeafSplitsRow(t *testing.T) {
+	n := NewNDB(nil)
+	tc, err := NewTC(n, []ColumnView{
+		{PropType: PtypInteger32, PropID: 0x0E07},
+		{PropType: PtypTime, PropID: 0x0039},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const nRow = 200
+	for i := 0; i < nRow; i++ {
+		id, err := tc.Add()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tc.SetInt32(id, 0x0E07, int32(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tc.SetInt64(id, 0x0039, int64(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	nid := MakeNID(NIDTypeInternal, 0x37)
+	if err := tc.Commit(nid); err != nil {
+		t.Fatal(err)
+	}
+	v, err := OpenTC(n, nid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !v.blocked {
+		t.Fatal("want blocked Row Matrix")
+	}
+	rowSize := tableRowSize(v.Info().RgIB)
+	var leaf uint64
+	err = n.WalkSubnodes(v.heap.subBID, func(e SLEntry) error {
+		if uint32(e.NID) != v.info.RowMatrix {
+			return nil
+		}
+		_, err := n.walkDataTree(e.DataBID, func(bid uint64, cb uint16) error {
+			if leaf == 0 {
+				if int(cb)%rowSize != 0 {
+					t.Fatalf("valid leaf cb %d not a multiple of row %d", cb, rowSize)
+				}
+				leaf = bid
+			}
+			return nil
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaf == 0 {
+		t.Fatal("no matrix leaf")
+	}
+	e, ok := n.LookupBlock(leaf)
+	if !ok {
+		t.Fatal("missing leaf")
+	}
+	e.CB = uint16(rowSize + 1)
+	n.blocks[leaf] = e
+	err = v.inspectMatrixLeaves()
+	if err == nil {
+		t.Fatal("expected split-row leaf to fail")
+	}
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("got %v", err)
+	}
+	_, err = OpenTC(n, nid)
+	if err == nil {
+		t.Fatal("OpenTC accepted split-row leaf")
+	}
+	if !errors.Is(err, ErrInvariant) {
+		t.Fatalf("OpenTC got %v", err)
+	}
+}
+
 func TestInspectTableRowsRejectsSpan(t *testing.T) {
 	n := NewNDB(nil)
 	tc, err := NewTC(n, []ColumnView{{PropType: PtypInteger32, PropID: 0x0E07}})

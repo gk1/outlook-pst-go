@@ -476,12 +476,14 @@ func tableRowOffset(idx, rowSize int, blocked bool) int {
 	if rpb < 1 {
 		return idx * rowSize
 	}
-	return (idx/rpb)*MaxDataBlockCB + (idx%rpb)*rowSize
+	leaf := rpb * rowSize
+	return (idx/rpb)*leaf + (idx%rpb)*rowSize
 }
 
 // InspectTableRows validates Row Matrix boundaries against the Row Index BTH.
-// HID matrices are tightly packed. Subnode matrices pad to MaxDataBlockCB so
-// a row never spans a data-tree leaf (MS-PST 2.3.4.4).
+// HID matrices are tightly packed. Subnode matrices store whole rows per
+// data-tree leaf: each leaf's cb is a multiple of cbRow and at most
+// Floor(MaxDataBlockCB/cbRow) rows (MS-PST 2.3.4.4).
 func InspectTableRows(tv *TableView, ents []bthKV, matrix []byte, blocked bool) error {
 	if tv == nil {
 		return invalidArg("tc", "nil TableView")
