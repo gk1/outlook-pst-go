@@ -77,6 +77,7 @@ type minFolder struct {
 	subfolders bool
 	content    int32
 	unread     int32
+	folderType int32
 }
 
 // WriteMinimum creates the MS-PST 2.4.1 / 2.7.1 nodes for a blank Unicode PST
@@ -107,7 +108,7 @@ func WriteMinimum(n *NDB, spec MinimumSpec) error {
 
 	ipm := ids.allocFolder(NIDTypeNormalFolder)
 	waste := ids.allocFolder(NIDTypeNormalFolder)
-	finder := ids.allocFolder(NIDTypeNormalFolder)
+	finder := ids.allocFolder(NIDTypeSearchFolder)
 
 	ipmEID := encodeEntryID(spec.RecordKey, ipm)
 	wasteEID := encodeEntryID(spec.RecordKey, waste)
@@ -169,7 +170,7 @@ func WriteMinimum(n *NDB, spec MinimumSpec) error {
 		{nid: NIDRootFolder, parent: 0, name: "", class: "IPF.Note", subfolders: true},
 		{nid: ipm, parent: NIDRootFolder, name: spec.DisplayName, class: "IPF.Note"},
 		{nid: waste, parent: NIDRootFolder, name: "Deleted Items", class: "IPF.Note"},
-		{nid: finder, parent: NIDRootFolder, name: "Search Root", class: "IPF.Note"},
+		{nid: finder, parent: NIDRootFolder, name: "Search Root", class: "IPF.Note", folderType: FolderTypeSearch},
 	}
 	for _, f := range folders {
 		eid := encodeEntryID(spec.RecordKey, f.nid)
@@ -285,7 +286,11 @@ func writeFolderPC(n *NDB, f minFolder, eid []byte, ft uint64) error {
 	if err := pc.SetString(PidTagContainerClass, f.class); err != nil {
 		return err
 	}
-	if err := pc.SetInt32(PidTagFolderType, FolderTypeGeneric); err != nil {
+	folderType := f.folderType
+	if folderType == 0 {
+		folderType = FolderTypeGeneric
+	}
+	if err := pc.SetInt32(PidTagFolderType, folderType); err != nil {
 		return err
 	}
 	if err := pc.SetTime(PidTagCreationTime, ft); err != nil {

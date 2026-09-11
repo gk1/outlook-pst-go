@@ -58,7 +58,10 @@ func TestMinimumPSTRequiredNodesAndRelatedIndex(t *testing.T) {
 	path, n := writeBlank(t, spec)
 	ipm := MakeNID(NIDTypeNormalFolder, NIDIndexDefault)
 	waste := MakeNID(NIDTypeNormalFolder, NIDIndexDefault+1)
-	finder := MakeNID(NIDTypeNormalFolder, NIDIndexDefault+2)
+	finder := MakeNID(NIDTypeSearchFolder, NIDIndexSearchFolder)
+	if NIDTypeOf(finder) != NIDTypeSearchFolder {
+		t.Fatalf("finder type 0x%x", NIDTypeOf(finder))
+	}
 	for _, nid := range requiredNIDs(ipm, waste, finder) {
 		if _, ok := n.LookupNode(uint64(nid)); !ok {
 			t.Fatalf("missing NID 0x%x", nid)
@@ -68,6 +71,12 @@ func TestMinimumPSTRequiredNodesAndRelatedIndex(t *testing.T) {
 		idx := NIDIndexOf(f)
 		if NIDIndexOf(RelatedNID(f, NIDTypeHierarchyTable)) != idx {
 			t.Fatalf("hierarchy nidIndex for 0x%x", f)
+		}
+		if NIDIndexOf(RelatedNID(f, NIDTypeContentsTable)) != idx {
+			t.Fatalf("contents nidIndex for 0x%x", f)
+		}
+		if NIDIndexOf(RelatedNID(f, NIDTypeAssocContentsTable)) != idx {
+			t.Fatalf("FAI nidIndex for 0x%x", f)
 		}
 		e, _ := n.LookupNode(uint64(RelatedNID(f, NIDTypeHierarchyTable)))
 		if e.ParentNID != f {
@@ -82,11 +91,14 @@ func TestMinimumPSTRequiredNodesAndRelatedIndex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if h.NIDs[NIDTypeNormalFolder] != NIDIndexDefault+3 {
-		t.Fatalf("rgnid folder %d want %d", h.NIDs[NIDTypeNormalFolder], NIDIndexDefault+3)
+	if h.NIDs[NIDTypeNormalFolder] != NIDIndexDefault+2 {
+		t.Fatalf("rgnid folder %d want %d", h.NIDs[NIDTypeNormalFolder], NIDIndexDefault+2)
 	}
-	if h.NIDs[NIDTypeHierarchyTable] != NIDIndexDefault+3 {
-		t.Fatalf("rgnid hierarchy %d", h.NIDs[NIDTypeHierarchyTable])
+	if h.NIDs[NIDTypeSearchFolder] != NIDIndexSearchFolder+1 {
+		t.Fatalf("rgnid search-folder %d want %d", h.NIDs[NIDTypeSearchFolder], NIDIndexSearchFolder+1)
+	}
+	if h.NIDs[NIDTypeHierarchyTable] != NIDIndexSearchFolder+1 {
+		t.Fatalf("rgnid hierarchy %d want %d", h.NIDs[NIDTypeHierarchyTable], NIDIndexSearchFolder+1)
 	}
 	if h.NIDs[NIDTypeNormalMessage] != NIDIndexNormalMessage {
 		t.Fatalf("rgnid message %d", h.NIDs[NIDTypeNormalMessage])
@@ -116,9 +128,17 @@ func TestMinimumPSTMessageStoreAndReaderHierarchy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waste := binary.LittleEndian.Uint32(wasteEID[20:])
+	if NIDTypeOf(waste) != NIDTypeNormalFolder {
+		t.Fatalf("waste nid 0x%x", waste)
+	}
 	_, finderEID, err := pc.Get(PidTagFinderEntryId)
 	if err != nil {
 		t.Fatal(err)
+	}
+	finder := binary.LittleEndian.Uint32(finderEID[20:])
+	if NIDTypeOf(finder) != NIDTypeSearchFolder || NIDIndexOf(finder) != NIDIndexSearchFolder {
+		t.Fatalf("finder nid 0x%x type 0x%x index 0x%x", finder, NIDTypeOf(finder), NIDIndexOf(finder))
 	}
 	if bytes.Equal(ipmEID, wasteEID) || bytes.Equal(ipmEID, finderEID) {
 		t.Fatal("EntryIDs must name distinct folders")
@@ -145,11 +165,19 @@ func TestMinimumPSTMessageStoreAndReaderHierarchy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := root.FindSubfolder("Deleted Items"); err != nil {
+	wasteF, err := root.FindSubfolder("Deleted Items")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := root.FindSubfolder("Search Root"); err != nil {
+	finderF, err := root.FindSubfolder("Search Root")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if ipmF.IsSearchFolder() || wasteF.IsSearchFolder() {
+		t.Fatal("IPM and Deleted Items must stay normal folders")
+	}
+	if !finderF.IsSearchFolder() {
+		t.Fatal("Search Root must be NIDTypeSearchFolder")
 	}
 	if _, err := ipmF.SubfolderCount(); err != nil {
 		t.Fatal(err)

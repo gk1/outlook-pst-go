@@ -307,6 +307,7 @@ const (
 	PidTagNameidStreamEntry     uint16 = 0x0003
 	PidTagNameidStreamString    uint16 = 0x0004
 	FolderTypeGeneric           int32  = 1
+	FolderTypeSearch            int32  = 2
 	StoreSupportMaskUnicode     int32  = 0x00040E79
 	EntryIDSize                        = 24
 )
