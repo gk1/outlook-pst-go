@@ -64,8 +64,11 @@
 // PST-013 writes IPM.Note messages: required PC properties, body variants,
 // flags, importance, timestamps, search/record keys, and a Recipient Table
 // subnode that exists even with zero rows. Contents-table rows and folder
-// content/unread counts stay coherent with the message node. Attachments
-// remain PST-014.
+// content/unread counts stay coherent with the message node.
+// PST-014 writes the Attachment Table (including zero rows) and attachment
+// PCs: by-value binaries (large values as HNID data trees), Unicode/duplicate
+// names, inline MHTML flags, and ATTACH_EMBEDDED_MSG with bounded nesting
+// and cycle protection. Message flags, sizes, and HasAttachments stay coherent.
 //
 // Target (locked by this package):
 //   - Unicode PST wVer 23, new-file creation only

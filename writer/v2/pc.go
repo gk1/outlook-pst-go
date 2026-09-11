@@ -17,6 +17,7 @@ type PC struct {
 type pcProp struct {
 	typ  uint16
 	data []byte
+	hnid uint32 // if set, used as dwValueHnid (PtypObject / pre-placed HNID)
 }
 
 func NewPC(n *NDB) *PC {
@@ -151,6 +152,22 @@ func (p *PC) SetObject(id uint16, data []byte) error {
 	return p.Set(id, PtypObject, data)
 }
 
+// SetObjectNID records a PtypObject whose dwValueHnid is an existing subnode
+// (embedded messages: NID_TYPE_NORMAL_MESSAGE sharing the attachment nidIndex).
+func (p *PC) SetObjectNID(id uint16, nid uint32) error {
+	if p == nil {
+		return invalidArg("pc", "nil PC")
+	}
+	if nid == 0 {
+		return invalidArg("nid", "PtypObject NID is 0")
+	}
+	if _, ok := p.props[id]; !ok {
+		p.order = append(p.order, id)
+	}
+	p.props[id] = pcProp{typ: PtypObject, hnid: nid}
+	return nil
+}
+
 func (p *PC) SetMVInt32(id uint16, vals []int32) error {
 	buf := make([]byte, 4+4*len(vals))
 	binary.LittleEndian.PutUint32(buf, uint32(len(vals)))
@@ -219,7 +236,11 @@ func decodeMVVar(b []byte) ([][]byte, error) {
 	return out, nil
 }
 
-func (p *PC) place(typ uint16, data []byte) (uint32, error) {
+func (p *PC) place(pr pcProp) (uint32, error) {
+	if pr.hnid != 0 {
+		return pr.hnid, nil
+	}
+	typ, data := pr.typ, pr.data
 	if typ == PtypObject {
 		// PtypObject dwValueHnid is the object subnode NID (NID_TYPE_LTP),
 		// not a HID wrapping a private {NID,size} record. See MS-PST 2.3.3.3.
@@ -247,6 +268,27 @@ func (p *PC) Commit(nid uint32) error {
 	if p == nil || p.n == nil {
 		return invalidArg("pc", "nil PC")
 	}
+	if err := p.build(); err != nil {
+		return err
+	}
+	return p.heap.Commit(nid)
+}
+
+// AttachTo writes this PC as a subnode of parent (attachment objects, MS-PST 2.4.6.1).
+func (p *PC) AttachTo(parent *Heap, nid uint32) error {
+	if p == nil || p.n == nil {
+		return invalidArg("pc", "nil PC")
+	}
+	if parent == nil {
+		return invalidArg("heap", "nil parent heap")
+	}
+	if err := p.build(); err != nil {
+		return err
+	}
+	return parent.AttachHeap(nid, p.heap)
+}
+
+func (p *PC) build() error {
 	ids := append([]uint16(nil), p.order...)
 	for i := 1; i < len(ids); i++ {
 		j := i
@@ -262,7 +304,7 @@ func (p *PC) Commit(nid uint32) error {
 	key := make([]byte, 2)
 	for _, id := range ids {
 		pr := p.props[id]
-		hnid, err := p.place(pr.typ, pr.data)
+		hnid, err := p.place(pr)
 		if err != nil {
 			return err
 		}
@@ -274,10 +316,8 @@ func (p *PC) Commit(nid uint32) error {
 			return err
 		}
 	}
-	if _, err := bth.Build(); err != nil {
-		return err
-	}
-	return p.heap.Commit(nid)
+	_, err = bth.Build()
+	return err
 }
 
 // PCView is a committed Property Context.

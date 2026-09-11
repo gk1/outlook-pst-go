@@ -142,6 +142,7 @@ type Limits struct {
 	MaxMessageBytes          int64
 	MaxAttachmentBytes       int64
 	MaxFileBytes             int64
+	MaxEmbeddedDepth         int
 }
 
 // DefaultLimits are conservative mailbox-export caps, not MS-PST maxima.
@@ -155,6 +156,7 @@ func DefaultLimits() Limits {
 		MaxMessageBytes:          256 << 20,
 		MaxAttachmentBytes:       128 << 20,
 		MaxFileBytes:             50 << 30,
+		MaxEmbeddedDepth:         MaxEmbeddedDepthDefault,
 	}
 }
 
@@ -183,6 +185,9 @@ func (l Limits) withDefaults() Limits {
 	}
 	if l.MaxFileBytes == 0 {
 		l.MaxFileBytes = d.MaxFileBytes
+	}
+	if l.MaxEmbeddedDepth == 0 {
+		l.MaxEmbeddedDepth = d.MaxEmbeddedDepth
 	}
 	return l
 }

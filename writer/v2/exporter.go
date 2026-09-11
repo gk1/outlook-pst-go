@@ -396,8 +396,15 @@ func validateSensitivity(v Sensitivity) error {
 }
 
 func snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]PlannedAttachment, []AttachmentContent, int64, error) {
+	return snapshotAttachmentsAt(in, lim, remain, 0, map[*MessageSpec]struct{}{})
+}
+
+func snapshotAttachmentsAt(in []AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) ([]PlannedAttachment, []AttachmentContent, int64, error) {
 	if len(in) == 0 {
 		return []PlannedAttachment{}, []AttachmentContent{}, 0, nil
+	}
+	if stack == nil {
+		stack = map[*MessageSpec]struct{}{}
 	}
 	out := make([]PlannedAttachment, 0, len(in))
 	stored := make([]AttachmentContent, 0, len(in))
@@ -407,7 +414,29 @@ func snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]Plann
 			return nil, nil, 0, unsupported(FeatureOLE, fmt.Sprintf("attachment %d", i))
 		}
 		if a.Embedded != nil {
-			return nil, nil, 0, unsupported(FeatureEmbeddedMessage, fmt.Sprintf("attachment %d", i))
+			pm, storedEmb, n, err := snapshotEmbedded(a, lim, remain-total, depth, stack)
+			if err != nil {
+				return nil, nil, 0, err
+			}
+			total += n
+			out = append(out, PlannedAttachment{
+				Filename:  a.Filename,
+				MIMEType:  a.MIMEType,
+				ContentID: a.ContentID,
+				Inline:    a.Inline,
+				Size:      n,
+				SHA256:    pm.BodyTextSHA256,
+				Embedded:  pm,
+			})
+			stored = append(stored, AttachmentContent{
+				Filename:  a.Filename,
+				MIMEType:  a.MIMEType,
+				ContentID: a.ContentID,
+				Inline:    a.Inline,
+				SHA256:    pm.BodyTextSHA256,
+				Embedded:  storedEmb,
+			})
+			continue
 		}
 		if a.Body == nil {
 			return nil, nil, 0, invalidArg("body", "attachment %d has nil Body", i)
@@ -467,6 +496,89 @@ func snapshotAttachments(in []AttachmentSpec, lim Limits, remain int64) ([]Plann
 		})
 	}
 	return out, stored, total, nil
+}
+
+func snapshotEmbedded(a AttachmentSpec, lim Limits, remain int64, depth int, stack map[*MessageSpec]struct{}) (*PlannedMessage, *MessageContent, int64, error) {
+	msg := a.Embedded
+	if msg == nil {
+		return nil, nil, 0, invalidArg("embedded", "nil MessageSpec")
+	}
+	if a.Body != nil {
+		return nil, nil, 0, invalidArg("body", "embedded attachment must not also have Body")
+	}
+	if depth+1 > lim.MaxEmbeddedDepth {
+		return nil, nil, 0, limitErr("MaxEmbeddedDepth", "embedded message depth %d exceeds %d", depth+1, lim.MaxEmbeddedDepth)
+	}
+	if _, ok := stack[msg]; ok {
+		return nil, nil, 0, invalidArg("embedded", "cycle in embedded messages")
+	}
+	stack[msg] = struct{}{}
+	defer delete(stack, msg)
+	class := msg.Class
+	if class == "" {
+		class = "IPM.Note"
+	}
+	if err := rejectUnsupportedMessage(*msg); err != nil {
+		return nil, nil, 0, err
+	}
+	if err := validateImportance(msg.Importance); err != nil {
+		return nil, nil, 0, err
+	}
+	if err := validateSensitivity(msg.Sensitivity); err != nil {
+		return nil, nil, 0, err
+	}
+	bodyBytes := int64(len(msg.BodyText) + len(msg.BodyHTML) + len(msg.InternetHeaders))
+	if bodyBytes > remain {
+		return nil, nil, 0, limitErr("MaxMessageBytes", "embedded message exceeds remaining %d", remain)
+	}
+	atts, stored, attBytes, err := snapshotAttachmentsAt(msg.Attachments, lim, remain-bodyBytes, depth+1, stack)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	n := bodyBytes + attBytes
+	pm := &PlannedMessage{
+		Subject:        msg.Subject,
+		Class:          class,
+		BodyTextLen:    len(msg.BodyText),
+		BodyHTMLLen:    len(msg.BodyHTML),
+		HeadersLen:     len(msg.InternetHeaders),
+		BodyTextSHA256: sha256Hex(msg.BodyText),
+		BodyHTMLSHA256: sha256Hex(msg.BodyHTML),
+		HeadersSHA256:  sha256Hex(msg.InternetHeaders),
+		From:           planRecip(msg.From),
+		To:             planRecips(msg.To),
+		Cc:             planRecips(msg.Cc),
+		Bcc:            planRecips(msg.Bcc),
+		SentNano:       msg.Sent.UTC().UnixNano(),
+		RecvNano:       msg.Received.UTC().UnixNano(),
+		CreatedNano:    msg.Created.UTC().UnixNano(),
+		ModifiedNano:   msg.Modified.UTC().UnixNano(),
+		Read:           msg.Read,
+		Draft:          msg.Draft,
+		Importance:     msg.Importance,
+		Sensitivity:    msg.Sensitivity,
+		InternetID:     msg.InternetMessageID,
+		Attachments:    atts,
+	}
+	if msg.Sent.IsZero() {
+		pm.SentNano = 0
+	}
+	if msg.Received.IsZero() {
+		pm.RecvNano = 0
+	}
+	if msg.Created.IsZero() {
+		pm.CreatedNano = 0
+	}
+	if msg.Modified.IsZero() {
+		pm.ModifiedNano = 0
+	}
+	c := &MessageContent{
+		BodyText:        msg.BodyText,
+		BodyHTML:        msg.BodyHTML,
+		InternetHeaders: msg.InternetHeaders,
+		Attachments:     stored,
+	}
+	return pm, c, n, nil
 }
 
 // readBounded copies at most cap bytes. Reading cap+1 bytes is a limit error

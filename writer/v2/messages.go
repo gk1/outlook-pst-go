@@ -30,6 +30,7 @@ type MessageWrite struct {
 	Sensitivity Sensitivity
 	SearchKey   []byte
 	RecordKey   []byte
+	Attachments []AttachmentWrite
 }
 
 func recipientColumns() []ColumnView {
@@ -85,6 +86,9 @@ func messageFlags(w MessageWrite) int32 {
 	} else {
 		f |= MsgFlagFromMe
 	}
+	if len(w.Attachments) > 0 {
+		f |= MsgFlagHasAttach
+	}
 	return f
 }
 
@@ -109,6 +113,12 @@ func messageSizeOf(w MessageWrite) int32 {
 	}
 	for _, r := range w.Bcc {
 		n += len(r.Name) + len(r.Email) + 64
+	}
+	for _, a := range w.Attachments {
+		n += len(a.Filename) + len(a.Data) + 64
+		if a.Embedded != nil {
+			n += int(messageSizeOf(*a.Embedded))
+		}
 	}
 	return int32(n)
 }
@@ -238,7 +248,7 @@ func writeContentsRow(tc *TC, nid uint32, w MessageWrite, flags int32, size int3
 	if err := tc.SetInt32(nid, PidTagMessageStatus, 0); err != nil {
 		return err
 	}
-	return tc.SetBool(nid, PidTagHasAttachments, false)
+	return tc.SetBool(nid, PidTagHasAttachments, len(w.Attachments) > 0)
 }
 
 func (t *FolderTree) writeMessagePC(nid, folder uint32, w MessageWrite, flags, size int32, sent, recv, created, modified uint64, search, record []byte) error {
@@ -297,7 +307,7 @@ func (t *FolderTree) writeMessagePC(nid, folder uint32, w MessageWrite, flags, s
 	if err := pc.SetInt32(PidTagMessageStatus, 0); err != nil {
 		return err
 	}
-	if err := pc.SetBool(PidTagHasAttachments, false); err != nil {
+	if err := pc.SetBool(PidTagHasAttachments, len(w.Attachments) > 0); err != nil {
 		return err
 	}
 	if err := pc.SetTime(PidTagClientSubmitTime, sent); err != nil {
@@ -367,6 +377,9 @@ func (t *FolderTree) writeMessagePC(nid, folder uint32, w MessageWrite, flags, s
 	if err := recip.AttachTo(pc.heap, RelatedNID(nid, NIDTypeRecipientTable)); err != nil {
 		return err
 	}
+	if err := t.attachAttachments(pc.heap, nid, w, 0, map[*MessageWrite]struct{}{}); err != nil {
+		return err
+	}
 	if err := pc.Commit(nid); err != nil {
 		return err
 	}
@@ -398,6 +411,9 @@ func (t *FolderTree) createMessageLocked(folder uint32, w MessageWrite) (uint32,
 	nRecip := len(w.To) + len(w.Cc) + len(w.Bcc)
 	if nRecip > t.limits.MaxRecipientsPerMessage {
 		return 0, limitErr("MaxRecipientsPerMessage", "%d recipients exceeds %d", nRecip, t.limits.MaxRecipientsPerMessage)
+	}
+	if err := validateAttachmentTree(w, t.limits, 0, map[*MessageWrite]struct{}{}); err != nil {
+		return 0, err
 	}
 	ids := t.n.ids
 	if ids == nil {
@@ -544,11 +560,35 @@ func plannedToWrite(pm PlannedMessage, c MessageContent) MessageWrite {
 		Sensitivity: pm.Sensitivity,
 		SearchKey:   decodePlanKey(pm.SearchKey),
 		RecordKey:   decodePlanKey(pm.RecordKey),
+		Attachments: plannedAttachments(pm.Attachments, c.Attachments),
 	}
 }
 
+func plannedAttachments(plan []PlannedAttachment, stored []AttachmentContent) []AttachmentWrite {
+	n := len(stored)
+	if len(plan) < n {
+		n = len(plan)
+	}
+	out := make([]AttachmentWrite, 0, n)
+	for i := 0; i < n; i++ {
+		a := AttachmentWrite{
+			Filename:  stored[i].Filename,
+			MIMEType:  stored[i].MIMEType,
+			ContentID: stored[i].ContentID,
+			Inline:    stored[i].Inline,
+			Data:      stored[i].Bytes,
+		}
+		if stored[i].Embedded != nil && plan[i].Embedded != nil {
+			nested := plannedToWrite(*plan[i].Embedded, *stored[i].Embedded)
+			a.Embedded = &nested
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 // CreateMessagesFromPlan writes planned messages into already-materialized
-// folders. Attachments are ignored until PST-014.
+// folders, including by-value and embedded attachments (MS-PST 2.4.6).
 func (t *FolderTree) CreateMessagesFromPlan(nids map[FolderRef]uint32, msgs []PlannedMessage, content map[MessageRef]MessageContent) error {
 	for _, pm := range msgs {
 		folder, ok := nids[pm.Folder]

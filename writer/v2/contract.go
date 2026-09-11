@@ -77,7 +77,7 @@ type AttachmentSpec struct {
 	Inline    bool
 	Size      int64
 	Body      io.Reader
-	// Embedded is reserved for PST-014. Non-nil is rejected as unsupported.
+	// Embedded is a nested IPM.Note (ATTACH_EMBEDDED_MSG). Body must be nil.
 	Embedded *MessageSpec
 	// OLE is reserved; true is rejected as unsupported.
 	OLE bool
@@ -114,6 +114,7 @@ type AttachmentContent struct {
 	Inline    bool
 	SHA256    string
 	Bytes     []byte
+	Embedded  *MessageContent
 }
 
 // MessageContent is the retained body/headers/attachments for a message.

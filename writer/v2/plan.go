@@ -40,12 +40,13 @@ type PlannedRecipient struct {
 // PlannedAttachment is an attachment snapshot (content hashed, bytes retained
 // on the exporter until Finalize).
 type PlannedAttachment struct {
-	Filename  string `json:"filename"`
-	MIMEType  string `json:"mime_type"`
-	ContentID string `json:"content_id,omitempty"`
-	Inline    bool   `json:"inline,omitempty"`
-	Size      int64  `json:"size"`
-	SHA256    string `json:"sha256"`
+	Filename  string          `json:"filename"`
+	MIMEType  string          `json:"mime_type"`
+	ContentID string          `json:"content_id,omitempty"`
+	Inline    bool            `json:"inline,omitempty"`
+	Size      int64           `json:"size"`
+	SHA256    string          `json:"sha256"`
+	Embedded  *PlannedMessage `json:"embedded,omitempty"`
 }
 
 // PlannedMessage is one message in the export plan.

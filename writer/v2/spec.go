@@ -2,49 +2,52 @@ package writer
 
 // MS-PST section citations used by the inspector and error taxonomy.
 const (
-	SectionANSICreate   = "1.3.2"
-	SectionNID          = "2.2.2.1"
-	SectionBID          = "2.2.2.2"
-	SectionRoot         = "2.2.2.5"
-	SectionHeader       = "2.2.2.6"
-	SectionPageTrailer  = "2.2.2.7.1"
-	SectionAMap         = "2.2.2.7.2"
-	SectionPMap         = "2.2.2.7.3"
-	SectionDList        = "2.2.2.7.4"
-	SectionFMap         = "2.2.2.7.5"
-	SectionFPMap        = "2.2.2.7.6"
-	SectionBTPAGE       = "2.2.2.7.7.1"
-	SectionBTENTRY      = "2.2.2.7.7.2"
-	SectionBBTENTRY     = "2.2.2.7.7.3"
-	SectionRefCount     = "2.2.2.7.7.3.1"
-	SectionNBTENTRY     = "2.2.2.7.7.4"
-	SectionGrow         = "2.6.1.1.2"
-	SectionAMapTxn      = "2.6.1.3.7"
-	SectionBlockTrailer = "2.2.2.8.1"
-	SectionBlockAlign   = "2.2.2.8"
-	SectionXBlock       = "2.2.2.8.3.1"
-	SectionXXBlock      = "2.2.2.8.3.2"
-	SectionSubnode      = "2.2.2.8.3.3"
-	SectionSLBlock      = "2.2.2.8.3.3.1"
-	SectionSIBlock      = "2.2.2.8.3.3.2"
-	SectionHN           = "2.3.1"
-	SectionBTH          = "2.3.2"
-	SectionPC           = "2.3.3"
-	SectionTCINFO       = "2.3.4.1"
-	SectionTCOLDESC     = "2.3.4.2"
-	SectionRowMatrix    = "2.3.4.4"
-	SectionTCRowID      = "2.3.4.4.1"
-	SectionFolder       = "2.4.4"
-	SectionFolderPC     = "2.4.4.1"
-	SectionHierarchyTbl = "2.4.4.4"
-	SectionContentsTbl  = "2.4.4.5"
-	SectionMessage      = "2.4.5"
-	SectionMessagePC    = "2.4.5.1"
-	SectionRecipientTbl = "2.4.5.3"
-	SectionMinPST       = "2.7.1"
-	SectionCRC          = "5.3"
-	SectionSignature    = "5.5"
-	SectionCrypt        = "5.1"
+	SectionANSICreate    = "1.3.2"
+	SectionNID           = "2.2.2.1"
+	SectionBID           = "2.2.2.2"
+	SectionRoot          = "2.2.2.5"
+	SectionHeader        = "2.2.2.6"
+	SectionPageTrailer   = "2.2.2.7.1"
+	SectionAMap          = "2.2.2.7.2"
+	SectionPMap          = "2.2.2.7.3"
+	SectionDList         = "2.2.2.7.4"
+	SectionFMap          = "2.2.2.7.5"
+	SectionFPMap         = "2.2.2.7.6"
+	SectionBTPAGE        = "2.2.2.7.7.1"
+	SectionBTENTRY       = "2.2.2.7.7.2"
+	SectionBBTENTRY      = "2.2.2.7.7.3"
+	SectionRefCount      = "2.2.2.7.7.3.1"
+	SectionNBTENTRY      = "2.2.2.7.7.4"
+	SectionGrow          = "2.6.1.1.2"
+	SectionAMapTxn       = "2.6.1.3.7"
+	SectionBlockTrailer  = "2.2.2.8.1"
+	SectionBlockAlign    = "2.2.2.8"
+	SectionXBlock        = "2.2.2.8.3.1"
+	SectionXXBlock       = "2.2.2.8.3.2"
+	SectionSubnode       = "2.2.2.8.3.3"
+	SectionSLBlock       = "2.2.2.8.3.3.1"
+	SectionSIBlock       = "2.2.2.8.3.3.2"
+	SectionHN            = "2.3.1"
+	SectionBTH           = "2.3.2"
+	SectionPC            = "2.3.3"
+	SectionTCINFO        = "2.3.4.1"
+	SectionTCOLDESC      = "2.3.4.2"
+	SectionRowMatrix     = "2.3.4.4"
+	SectionTCRowID       = "2.3.4.4.1"
+	SectionFolder        = "2.4.4"
+	SectionFolderPC      = "2.4.4.1"
+	SectionHierarchyTbl  = "2.4.4.4"
+	SectionContentsTbl   = "2.4.4.5"
+	SectionMessage       = "2.4.5"
+	SectionMessagePC     = "2.4.5.1"
+	SectionRecipientTbl  = "2.4.5.3"
+	SectionAttachment    = "2.4.6"
+	SectionAttachmentPC  = "2.4.6.1"
+	SectionAttachmentTbl = "2.4.6.2"
+	SectionMinPST        = "2.7.1"
+	SectionCRC           = "5.3"
+	SectionSignature     = "5.5"
+	SectionCrypt         = "5.1"
 )
 
 // Physical sizes for Unicode PST. ANSI is rejected by this writer.
@@ -321,6 +324,17 @@ const (
 	PidTagDisplayType                  uint16 = 0x3900
 	PidTagSmtpAddress                  uint16 = 0x39FE
 	PidTagRecipientDisplayName         uint16 = 0x5FF6
+	PidTagAttachSize                   uint16 = 0x0E20
+	PidTagAttachNumber                 uint16 = 0x0E21
+	PidTagAttachDataBinary             uint16 = 0x3701
+	PidTagAttachExtension              uint16 = 0x3703
+	PidTagAttachFilename               uint16 = 0x3704
+	PidTagAttachMethod                 uint16 = 0x3705
+	PidTagAttachLongFilename           uint16 = 0x3707
+	PidTagRenderingPosition            uint16 = 0x370B
+	PidTagAttachMimeTag                uint16 = 0x370E
+	PidTagAttachContentId              uint16 = 0x3712
+	PidTagAttachFlags                  uint16 = 0x3714
 	PidTagComment                      uint16 = 0x3004
 	PidTagCreationTime                 uint16 = 0x3007
 	PidTagLastModificationTime         uint16 = 0x3008
@@ -346,6 +360,12 @@ const (
 	MsgFlagUnsent                      int32  = 0x0008
 	MsgFlagHasAttach                   int32  = 0x0010
 	MsgFlagFromMe                      int32  = 0x0020
+	AttachMethodByValue                int32  = 1
+	AttachMethodEmbedded               int32  = 5
+	AttachMethodOLE                    int32  = 6
+	AttachFlagMHTMLRef                 int32  = 0x00000004
+	RenderingPositionNone              int32  = -1
+	MaxEmbeddedDepthDefault                   = 8
 )
 
 // MakeNID packs a type and index. See MS-PST 2.2.2.1.
