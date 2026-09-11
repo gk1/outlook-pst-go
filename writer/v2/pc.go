@@ -221,11 +221,9 @@ func decodeMVVar(b []byte) ([][]byte, error) {
 
 func (p *PC) place(typ uint16, data []byte) (uint32, error) {
 	if typ == PtypObject {
-		nid := p.heap.newSub(data)
-		hdr := make([]byte, 8)
-		binary.LittleEndian.PutUint32(hdr[0:4], nid)
-		binary.LittleEndian.PutUint32(hdr[4:8], uint32(len(data)))
-		return p.heap.Allocate(hdr)
+		// PtypObject dwValueHnid is the object subnode NID (NID_TYPE_LTP),
+		// not a HID wrapping a private {NID,size} record. See MS-PST 2.3.3.3.
+		return p.heap.newSub(data), nil
 	}
 	if ptypInline(typ) {
 		var v uint32
@@ -334,15 +332,10 @@ func (v *PCView) Get(id uint16) (typ uint16, data []byte, err error) {
 
 func (v *PCView) resolve(typ uint16, hnid uint32) ([]byte, error) {
 	if typ == PtypObject {
-		hdr, err := v.heap.Read(hnid)
-		if err != nil {
-			return nil, err
+		if IsHID(hnid) || NIDTypeOf(hnid) != NIDTypeLTP {
+			return nil, invariant(SectionPC, "dwValueHnid", "PtypObject HNID 0x%x must be NID_TYPE_LTP (MS-PST %s)", hnid, SectionPC)
 		}
-		if len(hdr) < 8 {
-			return nil, invariant(SectionPC, "PtypObject", "header %d bytes", len(hdr))
-		}
-		nid := binary.LittleEndian.Uint32(hdr[0:4])
-		return v.heap.Read(nid)
+		return v.heap.Read(hnid)
 	}
 	if ptypInline(typ) {
 		n := ptypFixedSize(typ)

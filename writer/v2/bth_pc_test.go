@@ -325,6 +325,61 @@ func TestPCTypesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPCObjectHNIDFileReopen(t *testing.T) {
+	n := NewNDB(nil)
+	pc := NewPC(n)
+	obj := bytes.Repeat([]byte("OBJ"), 80)
+	const propID uint16 = 0x0EA3
+	if err := pc.SetObject(propID, obj); err != nil {
+		t.Fatal(err)
+	}
+	nid := MakeNID(NIDTypeInternal, 0x27)
+	if err := pc.Commit(nid); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "pc-obj.pst")
+	if err := n.CommitFile(path); err != nil {
+		t.Fatal(err)
+	}
+	_ = n.Close()
+	n2, err := OpenNDBFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n2.Close()
+	v, err := OpenPC(n2, nid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := make([]byte, 2)
+	binary.LittleEndian.PutUint16(key, propID)
+	rec, err := v.bth.Lookup(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rec) < PCLeafValueSize {
+		t.Fatalf("PCBTH %d bytes", len(rec))
+	}
+	typ := binary.LittleEndian.Uint16(rec[0:2])
+	hnid := binary.LittleEndian.Uint32(rec[2:6])
+	if typ != PtypObject {
+		t.Fatalf("wPropType 0x%x", typ)
+	}
+	if IsHID(hnid) {
+		t.Fatalf("PtypObject dwValueHnid 0x%x is HID, want NID_TYPE_LTP", hnid)
+	}
+	if NIDTypeOf(hnid) != NIDTypeLTP {
+		t.Fatalf("PtypObject dwValueHnid 0x%x nidType 0x%x want NID_TYPE_LTP", hnid, NIDTypeOf(hnid))
+	}
+	gotTyp, data, err := v.Get(propID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTyp != PtypObject || !bytes.Equal(data, obj) {
+		t.Fatalf("object after reopen typ=0x%x len=%d", gotTyp, len(data))
+	}
+}
+
 func TestPCMultiLevelAndLarge(t *testing.T) {
 	n := NewNDB(nil)
 	pc := NewPC(n)

@@ -42,7 +42,8 @@
 // and lazy readback share one bounded XX->X->data walker.
 // PST-009 is BTH-on-HN plus Property Context: unique sorted keys, multi-level
 // index nodes, PC scalars/string/binary/MV/object, HID vs HNID-subnode
-// placement, unknown properties preserved on Load+Set. Transaction snapshots
+// placement (PtypObject dwValueHnid is the NID_TYPE_LTP subnode, not a HID
+// {NID,size} wrapper), unknown properties preserved on Load+Set. Transaction snapshots
 // clone storeState/catalogState. Stage/work/hold/adopt share one ioHandle
 // ownership boundary; cleanup uses explicit sinkOwn metadata, never Name()
 // path shape.
