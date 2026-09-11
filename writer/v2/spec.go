@@ -99,6 +99,8 @@ const (
 	HeapSigBTH                   = 0xB5
 	HeapSigPC                    = 0xBC
 	HeapMaxAlloc                 = 3580
+	HNMaxAllocsPerPage           = 2047   // hidIndex is 11-bit 1-based (MS-PST 2.3.1.1)
+	HNMaxBlockIndex              = 0xFFFF // hidBlockIndex is 16-bit (MS-PST 2.3.1.1)
 	HNHDRSize                    = 12
 	HNPAGEHDRSize                = 2
 	HNBITMAPHDRSize              = 66

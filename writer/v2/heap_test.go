@@ -312,3 +312,112 @@ func TestDataTreeWalkerShared(t *testing.T) {
 		}
 	})
 }
+
+func TestHNHIDIndexPageBoundary(t *testing.T) {
+	n := NewNDB(nil)
+	h := NewHeap(n, HeapSigPC)
+	nAlloc := HNMaxAllocsPerPage + 1 // 2048 one-byte values: last on page 0, first on page 1
+	hids := make([]uint32, 0, nAlloc)
+	for i := 0; i < nAlloc; i++ {
+		hid, err := h.Allocate([]byte{byte(i)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if HIDIndex(hid) == 0 {
+			t.Fatalf("allocation %d produced hidIndex 0 (wrap): 0x%x", i+1, hid)
+		}
+		hids = append(hids, hid)
+	}
+	lastOnPage0 := hids[HNMaxAllocsPerPage-1]
+	if HIDBlock(lastOnPage0) != 0 || HIDIndex(lastOnPage0) != uint16(HNMaxAllocsPerPage) {
+		t.Fatalf("HID 2047: block %d index %d", HIDBlock(lastOnPage0), HIDIndex(lastOnPage0))
+	}
+	firstOnPage1 := hids[HNMaxAllocsPerPage]
+	if HIDBlock(firstOnPage1) != 1 || HIDIndex(firstOnPage1) != 1 {
+		t.Fatalf("HID 2048: block %d index %d", HIDBlock(firstOnPage1), HIDIndex(firstOnPage1))
+	}
+	nid := MakeNID(NIDTypeInternal, 0x14)
+	h.SetRoot(hids[0])
+	if err := h.Commit(nid); err != nil {
+		t.Fatal(err)
+	}
+	v, err := OpenHeap(n, nid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Pages() != 2 {
+		t.Fatalf("pages %d want 2", v.Pages())
+	}
+	if v.pages[0].CAlloc != uint16(HNMaxAllocsPerPage) {
+		t.Fatalf("page 0 cAlloc %d want %d", v.pages[0].CAlloc, HNMaxAllocsPerPage)
+	}
+	if v.pages[1].CAlloc != 1 {
+		t.Fatalf("page 1 cAlloc %d", v.pages[1].CAlloc)
+	}
+	for i, hid := range hids {
+		got, err := v.Read(hid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []byte{byte(i)}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("hid %d (block %d index %d): %x want %x", i+1, HIDBlock(hid), HIDIndex(hid), got, want)
+		}
+	}
+
+	t.Run("zero-byte", func(t *testing.T) {
+		n := NewNDB(nil)
+		h := NewHeap(n, HeapSigTC)
+		var hids []uint32
+		for i := 0; i < HNMaxAllocsPerPage+1; i++ {
+			hid, err := h.Allocate(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hids = append(hids, hid)
+		}
+		if HIDBlock(hids[HNMaxAllocsPerPage-1]) != 0 || HIDIndex(hids[HNMaxAllocsPerPage-1]) != uint16(HNMaxAllocsPerPage) {
+			t.Fatalf("zero-byte HID 2047: block %d index %d", HIDBlock(hids[HNMaxAllocsPerPage-1]), HIDIndex(hids[HNMaxAllocsPerPage-1]))
+		}
+		if HIDBlock(hids[HNMaxAllocsPerPage]) != 1 || HIDIndex(hids[HNMaxAllocsPerPage]) != 1 {
+			t.Fatalf("zero-byte HID 2048: block %d index %d", HIDBlock(hids[HNMaxAllocsPerPage]), HIDIndex(hids[HNMaxAllocsPerPage]))
+		}
+		nid := MakeNID(NIDTypeInternal, 0x15)
+		h.SetRoot(hids[0])
+		if err := h.Commit(nid); err != nil {
+			t.Fatal(err)
+		}
+		v, err := OpenHeap(n, nid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := v.Read(hids[HNMaxAllocsPerPage-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("HID 2047: %d bytes", len(got))
+		}
+		got, err = v.Read(hids[HNMaxAllocsPerPage])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 0 {
+			t.Fatalf("HID 2048: %d bytes", len(got))
+		}
+	})
+}
+
+func TestHNRejectsHIDBlockOverflow(t *testing.T) {
+	n := NewNDB(nil)
+	h := NewHeap(n, HeapSigPC)
+	h.pages = make([]hnPage, HNMaxBlockIndex+1)
+	h.pages[HNMaxBlockIndex].allocs = make([][]byte, HNMaxAllocsPerPage)
+	_, err := h.Allocate([]byte{1})
+	if err == nil {
+		t.Fatal("expected hidBlockIndex overflow")
+	}
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("got %v", err)
+	}
+}

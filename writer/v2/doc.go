@@ -36,8 +36,9 @@
 // Close/remove failures after a successful dest sync return a cleanup error
 // without pointing NDB at a closed old source.
 // PST-008 is Heap-on-Node: first/normal/fill-level pages over a data tree,
-// HNPAGEMAP with cAlloc/cFree/offsets/fill levels, HID numbering, and oversized
-// values as HNID subnodes. Data-tree validation, reconstruction, flattening,
+// HNPAGEMAP with cAlloc/cFree/offsets/fill levels, HID numbering (hidIndex
+// 1..2047 per page; a new page is started before hidIndex or hidBlockIndex
+// overflow), and oversized values as HNID subnodes. Data-tree validation, reconstruction, flattening,
 // and lazy readback share one bounded XX->X->data walker.
 // Finalize currently returns ErrNotImplemented until later
 // NDB cards land.

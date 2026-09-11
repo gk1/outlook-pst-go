@@ -13,6 +13,7 @@ const (
 )
 
 // MakeHID packs hidBlockIndex and a 0-based allocation index into a HID.
+// alloc0 must be in [0, HNMaxAllocsPerPage). hidIndex is 11-bit and 1-based.
 func MakeHID(block, alloc0 uint16) uint32 {
 	return uint32(block)<<hidBlockShift | uint32(alloc0+1)<<hidIndexShift
 }
@@ -97,7 +98,11 @@ func (h *Heap) SetRoot(hid uint32) { h.root = hid }
 func (h *Heap) Root() uint32 { return h.root }
 
 func (h *Heap) fits(i int, size int) bool {
-	used := hnHeaderSize(i) + 4 + 2*(len(h.pages[i].allocs)+1)
+	nAlloc := len(h.pages[i].allocs)
+	if nAlloc >= HNMaxAllocsPerPage {
+		return false
+	}
+	used := hnHeaderSize(i) + 4 + 2*(nAlloc+1)
 	for _, a := range h.pages[i].allocs {
 		used += len(a)
 	}
@@ -125,14 +130,23 @@ func (h *Heap) Allocate(data []byte) (uint32, error) {
 		if len(h.pages[i].allocs) == 0 && len(data)+hnHeaderSize(i)+6 > MaxDataBlockCB {
 			return 0, limitErr("cb", "allocation %d does not fit an empty HN page (MS-PST %s)", len(data), SectionHN)
 		}
+		if i >= HNMaxBlockIndex {
+			return 0, limitErr("hidBlockIndex", "HN page index %d exceeds 16-bit hidBlockIndex (MS-PST %s)", i+1, SectionHN)
+		}
 		h.pages = append(h.pages, hnPage{})
 		i = len(h.pages) - 1
 		if !h.fits(i, len(data)) {
 			return 0, limitErr("cb", "allocation %d does not fit HN page %d (MS-PST %s)", len(data), i, SectionHN)
 		}
 	}
-	idx := uint16(len(h.pages[i].allocs))
-	hid := MakeHID(uint16(i), idx)
+	if i > HNMaxBlockIndex {
+		return 0, limitErr("hidBlockIndex", "HN page index %d exceeds 16-bit hidBlockIndex (MS-PST %s)", i, SectionHN)
+	}
+	nAlloc := len(h.pages[i].allocs)
+	if nAlloc >= HNMaxAllocsPerPage {
+		return 0, limitErr("hidIndex", "HN page %d already has %d allocations (MS-PST %s)", i, nAlloc, SectionHN)
+	}
+	hid := MakeHID(uint16(i), uint16(nAlloc))
 	h.pages[i].allocs = append(h.pages[i].allocs, append([]byte(nil), data...))
 	h.pages[i].hids = append(h.pages[i].hids, hid)
 	return hid, nil
